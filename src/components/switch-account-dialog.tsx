@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -95,6 +96,8 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [tab, setTab] = useState<"links" | "copy">("links");
   /** 关联会话区块上报的状态：tab 徽标与常驻提示用。 */
   const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
+  /** 工作记忆：把本机所有账号的 MEMORY.md 合并后分发回去（不给目标账号覆盖式写入）。 */
+  const [mergeMemory, setMergeMemory] = useState(false);
 
   const variant = accountVariant(account);
   const accountId = account?.id;
@@ -133,6 +136,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setSyncSelections([]);
     setSyncGroups([]);
     setLinksMeta(null);
+    setMergeMemory(false);
     setTab("links");
     setLoadingSessions(true);
     void api.listSessions(variant)
@@ -192,6 +196,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         copySessionIds: requestedCopy ? [...selected] : undefined,
         // 勾选绑定预览凭据；执行前后端会重新校验，版本变化则跳过该项。
         syncSelections: requestedSync ? syncSelections : undefined,
+        mergeMemory: mergeMemory || undefined,
       });
       const nickname = displayName(account);
       const parts: string[] = [];
@@ -263,6 +268,32 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       if (recoveryIssues.length > 0) {
         toast.error("有会话操作没有完成", {
           description: recoveryIssues.map((issue) => issue.reason).join("；"),
+        });
+      }
+      // 记忆合并：写入了哪些账号、备份在哪、哪些失败，必须逐项可见。
+      const memoryReport = res.memoryMerge;
+      if (memoryReport) {
+        const memoryIssues = [
+          ...memoryReport.errors.map((item) => `${item.label}：${item.error}`),
+          ...(memoryReport.persona?.errors ?? []).map(
+            (item) => `${item.label} / ${item.file}：${item.error}`,
+          ),
+        ];
+        if (memoryIssues.length > 0) {
+          toast.error("工作记忆没有全部合并", { description: memoryIssues.join("；") });
+        }
+        if (memoryReport.written.length > 0) {
+          toast.success(`工作记忆已合并并写入 ${memoryReport.written.length} 个账号`, {
+            description: `${memoryReport.sources.length} 份记忆合成 ${memoryReport.mergedChars} 字；被覆盖的原文已备份为 MEMORY.md.bak-时间戳`,
+          });
+        } else if (memoryReport.note) {
+          toast.info("工作记忆未合并", { description: memoryReport.note });
+        } else if (memoryReport.unchanged.length > 0) {
+          toast.info("工作记忆无需更新", { description: "所有账号的记忆内容已经一致。" });
+        }
+      } else if (mergeMemory) {
+        toast.warning("工作记忆未合并", {
+          description: "没有收到合并结果：当前版本可能不支持该功能，账号已切换，但记忆没有改动。",
         });
       }
       // 临时备份残留：待清理说明重试入口；待恢复说明必须保留材料并给出下一步。
@@ -570,6 +601,22 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
             <div className="min-h-0 space-y-2 overflow-y-auto">{copyTabContent}</div>
           )}
         </div>
+
+        <label className="flex shrink-0 cursor-pointer items-start gap-2 rounded-md border border-border px-3 py-2">
+          <Checkbox
+            checked={mergeMemory}
+            disabled={busy}
+            onCheckedChange={(value) => setMergeMemory(value === true)}
+            className="mt-0.5"
+          />
+          <div className="min-w-0 space-y-0.5">
+            <div className="text-sm font-medium">合并并分发工作记忆</div>
+            <div className="text-xs text-muted-foreground">
+              把本机所有账号的 MEMORY.md 合成一份写回每个账号（原文先备份）；SOUL / IDENTITY /
+              USER 只补全缺失的账号，不覆盖已有设定。
+            </div>
+          </div>
+        </label>
 
         <DialogFooter className="shrink-0 sm:justify-between">
           <div className="min-w-0 space-y-0.5">

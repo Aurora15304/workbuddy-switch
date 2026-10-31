@@ -546,6 +546,8 @@ export function switchAccount(args: {
   shareSessions?: boolean;
   copySessionIds?: string[];
   syncSelections?: SessionSyncSelection[];
+  /** 勾选后把本机所有账号的记忆合并成一份并分发回去。 */
+  mergeMemory?: boolean;
 }): Promise<SwitchResult> {
   return call("switch_account", args as unknown as Record<string, unknown>);
 }

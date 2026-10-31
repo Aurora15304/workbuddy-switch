@@ -430,6 +430,29 @@ export interface SwitchResult {
   /** 本次的会话同步报告（未勾选同步时不返回）；含跳过与失败原因，不只是成功数。 */
   sessionSync?: SessionSyncReport;
   sessionRecovery?: SessionRecoveryReport;
+  /** 本次的记忆合并与分发报告（未勾选合并时不返回）。 */
+  memoryMerge?: MemoryMergeReport;
+}
+
+/** 跨账号工作记忆合并结果：`MEMORY.md` 合并分发，人格文件只补全缺失项。 */
+export interface MemoryMergeReport {
+  /** 参与本次处理的账号数（含没有记忆文件的账号）。 */
+  accounts: number;
+  /** 实际贡献了记忆内容的账号及其字符数。 */
+  sources: { label: string; chars: number }[];
+  /** 合并后的记忆字符数。 */
+  mergedChars: number;
+  /** 本次写入的账号；`backup` 是被覆盖前的原文备份路径（原本无文件时为 null）。 */
+  written: { label: string; backup: string | null; hadContent: boolean }[];
+  /** 合并结果与现有内容一致、未写入的账号。 */
+  unchanged: { label: string }[];
+  persona: {
+    written: { label: string; file: string }[];
+    unchanged: { label: string; file: string }[];
+    errors: { label: string; file: string; error: string }[];
+  };
+  errors: { label: string; error: string }[];
+  note?: string;
 }
 
 export interface CheckinConfig {

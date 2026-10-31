@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::modules::account;
 use crate::modules::auth_file;
+use crate::modules::memory;
 use crate::modules::process::{close_workbuddy, launch_workbuddy};
 use crate::modules::session::{self, SessionPaths, SyncSelection};
 use crate::modules::session_link::{
@@ -145,6 +146,7 @@ pub fn switch_account(
     share_sessions: bool,
     copy_session_ids: &[String],
     sync_selections: &[SyncSelection],
+    merge_memory: bool,
 ) -> Result<Value, String> {
     let progress = |message: &str| {
         eprintln!("[switch] progress: {message}");
@@ -164,6 +166,7 @@ pub fn switch_account(
     let mut session_report: Option<Value> = None;
     let mut sync_report: Option<Value> = None;
     let mut recovery_report: Option<Value> = None;
+    let mut memory_report: Option<Value> = None;
     if restart {
         progress("正在关闭 WorkBuddy…");
         close_workbuddy(variant, 20)?;
@@ -270,6 +273,24 @@ pub fn switch_account(
         copy_report = copy;
         sync_report = sync;
     }
+    if merge_memory {
+        // 记忆是纯本地 Markdown 文件，与会话写入无关：不受 restart=false 限制，也不参与
+        // 「未完成会话写入」的暂停判定。必须在写认证之前执行——那时账号库与各账号的
+        // 人格目录都还是切换前的状态。
+        progress("正在合并并分发工作记忆…");
+        let accounts: Vec<(String, String)> = account::load_accounts()
+            .iter()
+            .map(|acc| {
+                let uid = acc
+                    .get("uid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                (uid, account::account_display_name(acc))
+            })
+            .collect();
+        memory_report = Some(memory::merge_and_distribute(&accounts));
+    }
     progress("正在写入认证文件…");
     auth_file::write_account_to_auth_file(&acc, variant)?;
     if restart {
@@ -295,6 +316,9 @@ pub fn switch_account(
     }
     if let Some(r) = recovery_report {
         result["sessionRecovery"] = r;
+    }
+    if let Some(m) = memory_report {
+        result["memoryMerge"] = m;
     }
     Ok(result)
 }
