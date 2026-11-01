@@ -626,7 +626,13 @@ fn insert_session_copy(
         let value = match col.as_str() {
             "id" => rusqlite::types::Value::Text(new_cid.to_string()),
             "user_id" => rusqlite::types::Value::Text(target_uid.to_string()),
-            "created_at" | "updated_at" => rusqlite::types::Value::Integer(now_ms()),
+            // 保留源会话的原始创建时间：批量复制历史会话时，创建日期全部塌成切号当天会
+            // 让按时间排序/统计失真（issue #204 第 2 点）。源值缺失时才退回当前时间。
+            "created_at" => match value {
+                rusqlite::types::Value::Null => rusqlite::types::Value::Integer(now_ms()),
+                other => other,
+            },
+            "updated_at" => rusqlite::types::Value::Integer(now_ms()),
             "deleted_at" => rusqlite::types::Value::Null,
             _ => value,
         };
@@ -1625,12 +1631,15 @@ pub const REASON_PREVIEW_STALE: &str = "previewStale";
 
 /// `sessions.status` 的归档取值。
 const SESSION_STATUS_ARCHIVED: &str = "archived";
-/// 允许被传导为归档的**目标终态**白名单。
+/// 允许被传导为归档的**目标状态**白名单。
 ///
-/// 只列非活跃终态：`active`（当前激活）与 `working`（生成中）必须排除，避免把正在
-/// 使用的会话收进归档。精确匹配而非「非 active/working 即允许」——NULL、未知值与
-/// 缺列都不授予归档权限（真实库存在 `Pending` 这类合法但语义未定的默认值）。
-const ARCHIVE_TARGET_TERMINAL_STATUSES: [&str; 3] = ["completed", "error", "terminated"];
+/// `active` 也在名单内：目标侧因历史中断停在 `active` 但早已没有后台进程运行时，
+/// 不放行会让这类会话永远留在主列表（issue #204）。安全性由写入侧三重防线保证：
+/// 应用在跑且目标是当前登录账号时整体拒绝写、正文模式下写前重读目标状态、
+/// 归档副作用走事务内条件 UPDATE。
+///
+/// `working`（生成中）与 NULL、未知值、缺列一律排除——精确匹配而非「非 working 即允许」。
+const ARCHIVE_TARGET_TERMINAL_STATUSES: [&str; 4] = ["completed", "error", "terminated", "active"];
 /// 预览项与预览绑定里的归档动作取值。
 const ARCHIVE_ACTION_STATUS_ONLY: &str = "statusOnly";
 
@@ -8781,10 +8790,12 @@ mod tests {
         assert_eq!(env.body_files().len(), 2, "不得产生第二份正文");
     }
 
-    /// 终态白名单：completed / error / terminated 可归档；活跃态与未知值一律不授权。
+    /// 白名单：completed / error / terminated / active 可归档；working 与未知值一律不授权。
+    ///
+    /// `active` 是历史中断留下的陈旧态，不放行会让这类会话永远留在主列表（issue #204）。
     #[test]
     fn status_sync_accepts_only_terminal_target_statuses() {
-        for allowed in ["completed", "error", "terminated"] {
+        for allowed in ["completed", "error", "terminated", "active"] {
             let env = ready_env_with_status(&format!("status-allow-{allowed}"));
             let (group_id, token, target_id) = archive_scene(&env, allowed);
             let report = sync(
@@ -8803,7 +8814,7 @@ mod tests {
                 "{allowed}"
             );
         }
-        for denied in ["active", "working", "Pending", "unknown-value"] {
+        for denied in ["working", "Pending", "unknown-value"] {
             let env = ready_env_with_status(&format!("status-deny-{denied}"));
             let (_, target_id) = archive_row_scene(&env, denied);
             let preview_report = preview(&env, "uid-b");
