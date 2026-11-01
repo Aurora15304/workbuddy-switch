@@ -128,23 +128,23 @@ fn merge_documents(sources: &[MemorySource]) -> String {
     if normalized.iter().all(|text| text.trim() == first) {
         return normalized[0].clone();
     }
-    let mut prelude: Vec<String> = Vec::new();
-    // 章节标题 -> 该章节内去重后的段落；另用 Vec 维持首次出现顺序。
+    let mut prelude: Vec<Block> = Vec::new();
+    // 章节标题 -> 该章节内去重后的块；另用 Vec 维持首次出现顺序。
     let mut order: Vec<String> = Vec::new();
-    let mut sections: HashMap<String, Vec<String>> = HashMap::new();
+    let mut sections: HashMap<String, Vec<Block>> = HashMap::new();
 
     for source in sources {
         let (source_prelude, source_sections) = split_sections(&source.text);
-        for para in source_prelude {
-            push_unique(&mut prelude, &para);
+        for block in source_prelude {
+            push_unique(&mut prelude, block);
         }
         for (title, body) in source_sections {
             if !sections.contains_key(&title) {
                 order.push(title.clone());
             }
             let bucket = sections.entry(title).or_default();
-            for para in body {
-                push_unique(bucket, &para);
+            for block in body {
+                push_unique(bucket, block);
             }
         }
     }
@@ -152,32 +152,116 @@ fn merge_documents(sources: &[MemorySource]) -> String {
     let labels: Vec<String> = sources.iter().map(|s| s.label.clone()).collect();
     let mut out = String::new();
     out.push_str(&format!(
-        "<!-- 由 workbuddy-switch 合并生成：{} 个账号（{}）。原文逐段保留，仅去除完全重复的段落。 -->\n",
+        "<!-- 由 workbuddy-switch 合并生成：{} 个账号（{}）。原文逐段保留，仅去除完全重复的段落与列表项。 -->\n",
         sources.len(),
         labels.join("、")
     ));
-    for para in prelude {
-        out.push_str(&para);
-        out.push_str("\n\n");
-    }
+    render_blocks(&prelude, &mut out);
     for title in order {
         out.push_str(&title);
         out.push('\n');
-        if let Some(paras) = sections.get(&title) {
-            for para in paras {
-                out.push_str(para);
-                out.push_str("\n\n");
-            }
+        if let Some(blocks) = sections.get(&title) {
+            render_blocks(blocks, &mut out);
         }
     }
     out.trim_end().to_string()
 }
 
-/// 以 `## ` 为界切出前言与章节；章节正文按空行切段并归一化空白。
-fn split_sections(text: &str) -> (Vec<String>, Vec<(String, Vec<String>)>) {
+/// 合并的最小单元：普通段落整段比对，列表项逐项比对。
+///
+/// 按空行整段比对时，一份 20 行的清单会和另一份只差一行的清单被当成两个不同的段，
+/// 结果两份都留、内容重复。拆成列表项后只留下真正不同的条目。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Block {
+    /// 普通段落：前后各留一个空行。
+    Para(String),
+    /// 列表项：与相邻列表项之间只换行，保持列表紧凑。
+    Item(String),
+}
+
+/// 把一个章节的正文切成块：列表块按行拆成条目，其余整段保留。
+fn split_blocks(text: &str) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    for para in text.split("\n\n") {
+        let lines: Vec<&str> = para
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        if lines.is_empty() {
+            continue;
+        }
+        if lines.iter().all(|line| is_list_line(line)) {
+            blocks.extend(
+                lines
+                    .into_iter()
+                    .map(|line| Block::Item(line.trim_end().to_string())),
+            );
+        } else {
+            blocks.push(Block::Para(para.trim_matches('\n').trim_end().to_string()));
+        }
+    }
+    blocks
+}
+
+/// 列表行：`- ` / `* ` / `+ ` 开头，或「数字. 」开头的有序列表。缩进子项一并算。
+fn is_list_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return true;
+    }
+    match trimmed.split_once(". ") {
+        Some((prefix, _)) => !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+fn block_key(block: &Block) -> String {
+    match block {
+        Block::Para(text) => normalize_key(text),
+        // 列表项按「去首尾空白的整行」比对：缩进差异不该让同一条被当成两条，
+        // 但条目内部的空格（如 `- 用 VS Code`）必须保留，否则会误判成不同项。
+        Block::Item(text) => text.trim().to_string(),
+    }
+}
+
+fn push_unique(target: &mut Vec<Block>, block: Block) {
+    let key = block_key(&block);
+    if key.is_empty() {
+        return;
+    }
+    if target.iter().any(|existing| block_key(existing) == key) {
+        return;
+    }
+    target.push(block);
+}
+
+/// 输出：列表项之间单换行、列表结束后留空行，普通段落之间空行。
+fn render_blocks(blocks: &[Block], out: &mut String) {
+    let mut prev_was_item = false;
+    for block in blocks {
+        match block {
+            Block::Item(text) => {
+                out.push_str(text);
+                out.push('\n');
+                prev_was_item = true;
+            }
+            Block::Para(text) => {
+                if prev_was_item {
+                    out.push('\n');
+                }
+                out.push_str(text);
+                out.push_str("\n\n");
+                prev_was_item = false;
+            }
+        }
+    }
+}
+
+/// 以 `## ` 为界切出前言与章节；章节正文切成段落/列表项块。
+fn split_sections(text: &str) -> (Vec<Block>, Vec<(String, Vec<Block>)>) {
     let normalized = text.replace("\r\n", "\n");
-    let mut prelude: Vec<String> = Vec::new();
-    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    let mut prelude: Vec<Block> = Vec::new();
+    let mut sections: Vec<(String, Vec<Block>)> = Vec::new();
     let mut buffer: Vec<&str> = Vec::new();
     let mut in_prelude = true;
 
@@ -198,38 +282,19 @@ fn split_sections(text: &str) -> (Vec<String>, Vec<(String, Vec<String>)>) {
 
 fn flush_body(
     buffer: &mut Vec<&str>,
-    prelude: &mut Vec<String>,
-    sections: &mut Vec<(String, Vec<String>)>,
+    prelude: &mut Vec<Block>,
+    sections: &mut Vec<(String, Vec<Block>)>,
     is_prelude: bool,
 ) {
     let text = buffer.join("\n");
     buffer.clear();
-    for para in split_paragraphs(&text) {
+    for block in split_blocks(&text) {
         if is_prelude {
-            prelude.push(para);
+            prelude.push(block);
         } else if let Some(entry) = sections.last_mut() {
-            entry.1.push(para);
+            entry.1.push(block);
         }
     }
-}
-
-/// 空行切段；段内多行保留，段首尾空白归一。
-fn split_paragraphs(text: &str) -> Vec<String> {
-    text.split("\n\n")
-        .map(|para| para.trim_matches('\n').trim_end().to_string())
-        .filter(|para| !para.trim().is_empty())
-        .collect()
-}
-
-fn push_unique(target: &mut Vec<String>, para: &str) {
-    let key = normalize_key(para);
-    if key.is_empty() {
-        return;
-    }
-    if target.iter().any(|existing| normalize_key(existing) == key) {
-        return;
-    }
-    target.push(para.to_string());
 }
 
 /// 去重键：忽略行内多余空白与缩进差异，避免同一段因空格不同被当成两段。
@@ -434,6 +499,30 @@ mod tests {
         assert!(merged.contains("- HomeCLOUD"), "{merged}");
         assert!(merged.contains("- Debian 13"), "{merged}");
         assert_eq!(dir.read("b", MEMORY_FILE).unwrap(), merged);
+    }
+
+    #[test]
+    fn list_items_are_deduped_one_by_one() {
+        let dir = TempDir::new("list-merge");
+        dir.write(
+            "a",
+            MEMORY_FILE,
+            "## 环境\n\n- Windows 11\n- Debian 13\n- 只用简体中文\n",
+        );
+        dir.write(
+            "b",
+            MEMORY_FILE,
+            "## 环境\n\n- Windows 11\n- macOS 15\n- 只用简体中文\n",
+        );
+        merge_and_distribute_at(dir.path(), &[pair("a"), pair("b")]);
+        let merged = dir.read("a", MEMORY_FILE).unwrap();
+        // 重复条目只留一条，独有条目都要保留。
+        assert_eq!(merged.matches("- Windows 11").count(), 1, "{merged}");
+        assert_eq!(merged.matches("- 只用简体中文").count(), 1, "{merged}");
+        assert!(merged.contains("- Debian 13"), "{merged}");
+        assert!(merged.contains("- macOS 15"), "{merged}");
+        // 列表项之间保持紧凑，不被空行拆成多个列表。
+        assert!(merged.contains("- Debian 13\n- 只用简体中文"), "{merged}");
     }
 
     #[test]
