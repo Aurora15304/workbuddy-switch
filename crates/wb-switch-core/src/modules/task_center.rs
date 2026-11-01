@@ -240,33 +240,105 @@ pub async fn list_tasks(account: &Value) -> Value {
     })
 }
 
-/// 一键接受：对还没接受的任务批量提交。接口幂等，重复接受不会出错。
+/// 未接受的任务才需要提交 accept。
+///
+/// 上游真实取值是 `not_accepted`；早期实现按「状态为空」判断，导致批量接受永远
+/// 挑不到任务、直接返回「没有需要接受的任务」。空串保留为兼容。
+fn needs_accept(status: &str) -> bool {
+    status.is_empty() || status == "not_accepted"
+}
+
+/// 解析 accept 回包，返回（成功码，失败项）。
+///
+/// 上游对不存在的任务返回 `status: "error"` 但外层 `code: 0`、HTTP 200，
+/// 只看信封会把失败当成功。回包里没有 `results` 时才按整批成功处理。
+fn parse_accept_results(data: &Value, submitted: &[String]) -> (Vec<String>, Vec<Value>) {
+    let mut accepted = Vec::new();
+    let mut failed = Vec::new();
+    match data.get("results").and_then(Value::as_array) {
+        Some(items) => {
+            for item in items {
+                let code = item
+                    .get("task_code")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let status = item
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if status == "accepted" || status == "already_accepted" {
+                    accepted.push(code.to_string());
+                } else {
+                    let reason = item
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or(status);
+                    failed.push(json!({ "code": code, "reason": reason }));
+                }
+            }
+        }
+        None => accepted.extend(submitted.iter().cloned()),
+    }
+    (accepted, failed)
+}
+
+/// 一键接受：两个口径分别提交，逐条核对结果。
+///
+/// 不能把合并后的任务码一次性发给小程序端点：web 独有的任务（实测 `playbook_prompt`）
+/// 会被判 `task not found`，而外层信封仍是 `code: 0`、HTTP 200——只看信封就会误报
+/// 「全部成功」。这里按口径各拉一次列表、各自接受，再按 `results[].status` 记账。
 pub async fn accept_tasks(account: &Value) -> Value {
     if let Some(error) = envelope_token_error(account) {
-        return json!({ "accepted": [], "error": error });
+        return json!({ "accepted": [], "failed": [], "error": error });
     }
-    let listing = list_tasks(account).await;
-    if let Some(error) = listing.get("error").and_then(Value::as_str) {
-        return json!({ "accepted": [], "error": error });
+    let mut accepted: Vec<String> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+
+    for mp in [false, true] {
+        let label = if mp { "小程序" } else { "默认" };
+        let listing = match growth_json(account, "GET", TASKS_PATH, None, mp).await {
+            Ok(data) => parse_tasks(&data),
+            Err(error) => {
+                notes.push(format!("{label}口径列表未取到：{error}"));
+                continue;
+            }
+        };
+        let codes: Vec<String> = listing
+            .iter()
+            .filter(|t| needs_accept(&t.accept_status) && !t.claimed)
+            .map(|t| t.code.clone())
+            .collect();
+        if codes.is_empty() {
+            continue;
+        }
+        match growth_json(
+            account,
+            "POST",
+            TASKS_ACCEPT_PATH,
+            Some(json!({ "task_codes": codes })),
+            mp,
+        )
+        .await
+        {
+            Ok(data) => {
+                let (ok, bad) = parse_accept_results(&data, &codes);
+                accepted.extend(ok);
+                failed.extend(bad);
+            }
+            Err(error) => notes.push(format!("{label}口径接受失败：{error}")),
+        }
     }
-    let codes: Vec<String> = listing["tasks"]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                .filter(|t| t["acceptStatus"].as_str().unwrap_or("").is_empty())
-                .filter(|t| t["claimed"].as_bool() != Some(true))
-                .filter_map(|t| t["code"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    if codes.is_empty() {
-        return json!({ "accepted": [], "note": "没有需要接受的任务" });
+
+    let mut out = json!({ "accepted": accepted, "failed": failed });
+    if !notes.is_empty() {
+        out["note"] = json!(notes.join("；"));
+    } else if out["accepted"].as_array().map_or(true, |v| v.is_empty())
+        && out["failed"].as_array().map_or(true, |v| v.is_empty())
+    {
+        out["note"] = json!("没有需要接受的任务");
     }
-    let body = json!({ "task_codes": codes });
-    match growth_json(account, "POST", TASKS_ACCEPT_PATH, Some(body), true).await {
-        Ok(_) => json!({ "accepted": codes }),
-        Err(error) => json!({ "accepted": [], "error": error }),
-    }
+    out
 }
 
 /// 一键领取：逐个领可达标的奖励，单条失败不影响其余。
@@ -290,8 +362,10 @@ pub async fn claim_rewards(account: &Value) -> Value {
             // 未达标或已领取：给出原因，不当成失败。
             let reason = if task["claimed"].as_bool().unwrap_or(false) {
                 "已领取"
+            } else if needs_accept(task["acceptStatus"].as_str().unwrap_or("")) {
+                "未接受，先点「一键接受任务」"
             } else if !task["progressKnown"].as_bool().unwrap_or(false) {
-                "上游未下发进度"
+                "上游暂无进度数据"
             } else {
                 "需真实行为达标"
             };
@@ -369,6 +443,38 @@ mod tests {
 
     fn task(extra: Value) -> Value {
         json!(extra)
+    }
+
+    #[test]
+    fn accept_results_report_per_task_errors() {
+        // 实测：web 独有的任务用小程序口径提交会返回 status=error，但外层 code=0。
+        let data = json!({ "results": [
+            { "task_code": "chat_5", "status": "accepted" },
+            { "task_code": "playbook_prompt", "status": "error", "message": "task not found" }
+        ]});
+        let (ok, bad) = parse_accept_results(&data, &[]);
+        assert_eq!(ok, vec!["chat_5".to_string()]);
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0]["code"], "playbook_prompt");
+        assert_eq!(bad[0]["reason"], "task not found");
+    }
+
+    #[test]
+    fn accept_results_without_results_trust_submitted() {
+        let submitted = vec!["a".to_string(), "b".to_string()];
+        let (ok, bad) = parse_accept_results(&json!({}), &submitted);
+        assert_eq!(ok, submitted);
+        assert!(bad.is_empty());
+    }
+
+    #[test]
+    fn accepts_not_accepted_status() {
+        // 上游真实取值是 `not_accepted`。按「状态为空」判断会让批量接受永远空转。
+        assert!(needs_accept("not_accepted"));
+        assert!(needs_accept(""));
+        assert!(!needs_accept("accepted"));
+        assert!(!needs_accept("claimed"));
+        assert!(!needs_accept("completed"));
     }
 
     #[test]

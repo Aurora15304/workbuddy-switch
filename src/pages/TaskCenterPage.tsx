@@ -66,10 +66,16 @@ export default function TaskCenterPage() {
     setBusy(true);
     try {
       const res = await api.acceptTaskCenter(accountId);
+      const failed = res.failed ?? [];
       if (res.error) {
         toast.error("接受任务失败", { description: res.error });
       } else if (res.accepted.length === 0) {
         toast.info(res.note ?? "没有需要接受的任务");
+      } else if (failed.length > 0) {
+        // 外层成功但个别任务被判 not found，必须如实说明，不能报「全部成功」。
+        toast.success(`已接受 ${res.accepted.length} 个，${failed.length} 个被上游拒绝`, {
+          description: failed.map((f) => `${f.code}：${f.reason}`).join("；"),
+        });
       } else {
         toast.success(`已接受 ${res.accepted.length} 个任务`);
       }
@@ -188,7 +194,7 @@ export default function TaskCenterPage() {
         <CardHeader>
           <CardTitle className="text-base">任务列表</CardTitle>
           <CardDescription>
-            共 {tasks.length} 项，可领取 {claimable} 项。国际版账号的部分任务上游不下发进度，显示为「未知」。
+            共 {tasks.length} 项，可领取 {claimable} 项。未接受的任务上游不返回进度——先点「一键接受任务」，之后才会开始计数。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-1">
@@ -211,14 +217,17 @@ export default function TaskCenterPage() {
 }
 
 function TaskRow({ task }: { task: TaskCenterItem }) {
-  const progress = task.progressKnown ? `${task.current}/${task.target}` : "未知";
+  const notAccepted = task.acceptStatus === "not_accepted" || task.acceptStatus === "";
+  const progress = task.progressKnown ? `${task.current}/${task.target}` : "—";
   const state = task.claimed
     ? "已领取"
     : task.claimable
       ? "可领取"
-      : task.progressKnown
-        ? "进行中"
-        : "上游未下发进度";
+      : notAccepted
+        ? "未接受"
+        : task.progressKnown
+          ? "进行中"
+          : "暂无进度";
 
   return (
     <div className="flex items-start justify-between gap-3 rounded-md px-2 py-2 hover:bg-foreground/[0.03]">

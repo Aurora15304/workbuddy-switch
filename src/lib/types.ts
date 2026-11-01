@@ -1126,6 +1126,8 @@ export interface TaskCenterList {
 
 export interface TaskAcceptResult {
   accepted: string[];
+  /** 上游逐个任务返回的失败项（例如 task not found），外层成功也要看这里。 */
+  failed?: { code: string; reason: string }[];
   note?: string;
   error?: string;
 }
