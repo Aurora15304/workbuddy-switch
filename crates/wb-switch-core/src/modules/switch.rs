@@ -148,6 +148,9 @@ pub fn switch_account(
     sync_selections: &[SyncSelection],
     merge_memory: bool,
 ) -> Result<Value, String> {
+    // 快照与导出必须和令牌刷新处在同一个事务里：在任何备份、进程管理之前取锁，
+    // 这样一次失败的切换不会留下副作用。
+    let auth_guard = crate::modules::auth_transaction::try_auth().map_err(|e| e.to_string())?;
     let progress = |message: &str| {
         eprintln!("[switch] progress: {message}");
         if let Some(p) = progress_fn {
@@ -293,6 +296,8 @@ pub fn switch_account(
     }
     progress("正在写入认证文件…");
     auth_file::write_account_to_auth_file(&acc, variant)?;
+    // 启动客户端可能要几十秒，且新客户端可能立刻发起刷新，锁必须在这里放掉。
+    drop(auth_guard);
     if restart {
         progress("正在启动 WorkBuddy…");
         launch_workbuddy(variant, Some(&progress))?;
