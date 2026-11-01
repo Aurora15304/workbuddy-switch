@@ -53,8 +53,30 @@ case "${1:-}" in
     cargo build --release --manifest-path src-tauri/Cargo.toml
     echo "[ok] $REPO_DIR/target/release/wb-switch-rust.exe"
     ;;
+  installer)
+    # 本机没有更新签名私钥，打包前临时关掉签名产物与前端重建；
+    # 配置用 trap 保证无论成败都还原，避免把临时改动带进提交。
+    restore_conf() {
+      [ -f src-tauri/tauri.conf.json.buildbak ] &&
+        mv -f src-tauri/tauri.conf.json.buildbak src-tauri/tauri.conf.json
+    }
+    trap restore_conf EXIT
+    npm run build
+    cargo build --release --manifest-path src-tauri/Cargo.toml
+    cp src-tauri/tauri.conf.json src-tauri/tauri.conf.json.buildbak
+    python - <<'PY'
+import json
+p = 'src-tauri/tauri.conf.json'
+c = json.load(open(p, encoding='utf-8'))
+c['build']['beforeBuildCommand'] = ''
+c['bundle']['createUpdaterArtifacts'] = False
+json.dump(c, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+PY
+    npx tauri build --bundles nsis
+    echo "[ok] $REPO_DIR/target/release/bundle/nsis/"
+    ;;
   *)
-    echo "usage: build.sh check|test|build" >&2
+    echo "usage: build.sh check|test|build|installer" >&2
     exit 1
     ;;
 esac
