@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
@@ -60,6 +60,26 @@ export default function TaskCenterPage() {
   useEffect(() => {
     if (accountId) void load(accountId);
   }, [accountId, load]);
+
+  // 打开面板即把已达标的奖励领掉：只领该领的、幂等，不产生任何上报数据。
+  // 同一账号每次进入只自动领一次，避免反复请求；失败不打扰用户，仍可用按钮手动领。
+  const autoClaimed = useRef("");
+  useEffect(() => {
+    if (!accountId || !list || (list.claimable ?? 0) === 0) return;
+    if (autoClaimed.current === accountId) return;
+    autoClaimed.current = accountId;
+    void (async () => {
+      try {
+        const res = await api.claimTaskCenter(accountId);
+        if (res.error || res.claimed.length === 0) return;
+        const total = res.creditTotal ?? 0;
+        toast.success(`自动领取 ${res.claimed.length} 项${total > 0 ? `，+${total} 积分` : ""}`);
+        await load(accountId);
+      } catch {
+        // 自动领取失败不影响浏览，手动按钮仍在。
+      }
+    })();
+  }, [accountId, list, load]);
 
   async function acceptAll() {
     if (!accountId) return;
@@ -194,7 +214,8 @@ export default function TaskCenterPage() {
         <CardHeader>
           <CardTitle className="text-base">任务列表</CardTitle>
           <CardDescription>
-            共 {tasks.length} 项，可领取 {claimable} 项。未接受的任务上游不返回进度——先点「一键接受任务」，之后才会开始计数。
+            共 {tasks.length} 项，可领取 {claimable} 项。打开本页会自动领掉已达标的奖励；
+            未接受的任务上游不返回进度——先点「一键接受任务」，之后才会开始计数。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-1">
