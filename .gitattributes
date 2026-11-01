@@ -7,3 +7,8 @@
 # picking either side (task state lives in task.json, not index.md). See
 # .trellis/spec/cli/backend/directory-structure.md for details.
 .trellis/workspace/*/journal-*.md merge=union
+
+# Shell 脚本必须保持 LF：CRLF 会让 shebang 变成 `bash\r`，报 "\r: command not found"。
+*.sh text eol=lf
+# Windows 批处理反过来必须是 CRLF，否则 cmd 解析 goto/label 会出错。
+*.bat text eol=crlf
