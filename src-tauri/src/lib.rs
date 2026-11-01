@@ -267,6 +267,7 @@ pub fn run() {
             commands::list_task_center,
             commands::accept_task_center,
             commands::claim_task_center,
+            commands::run_growth_auto,
             commands::get_credit_statistics,
             commands::get_token_statistics,
             commands::get_rate_limits,

@@ -48,6 +48,11 @@ case "${1:-}" in
   test)
     cargo test -p wb-switch-core --lib
     ;;
+  live)
+    # 真实端到端验证：会真的调上游（上报事件、发对话、领奖）。
+    # 用法：./build.sh live [测试名过滤]
+    cargo test -p wb-switch-core --lib growth_live -- --ignored --nocapture ${2:+--exact}
+    ;;
   build)
     npm run build
     cargo build --release --manifest-path src-tauri/Cargo.toml

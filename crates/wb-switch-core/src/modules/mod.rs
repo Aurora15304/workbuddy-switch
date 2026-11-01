@@ -12,6 +12,10 @@ pub mod credit_usage;
 pub mod credits;
 pub mod error_log;
 pub mod export_import;
+pub mod growth_auto;
+#[cfg(test)]
+mod growth_live_test;
+pub mod growth_tasks;
 pub mod jetbrains;
 pub mod limits;
 #[cfg(target_os = "linux")]

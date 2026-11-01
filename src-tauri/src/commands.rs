@@ -10,9 +10,10 @@ use tauri::Emitter;
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, credit_usage, credits, error_log,
-    export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, rotate, session, session_groups, switch, task_center, token_stats,
-    travel, update, variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
+    export_import, growth_tasks, jetbrains, limits, notifications, oauth, process,
+    rate_limit_events, rate_limit_hook, refresh, rotate, session, session_groups, switch,
+    task_center, token_stats, travel, update, variant::WbVariant, vscode_ext, vscode_session,
+    vscode_session_sync,
 };
 
 #[derive(Serialize)]
@@ -1038,6 +1039,16 @@ pub async fn accept_task_center(account_id: String) -> Result<Value, String> {
 pub async fn claim_task_center(account_id: String) -> Result<Value, String> {
     let acc = account::find_account(&account_id).ok_or("账号不存在")?;
     Ok(task_center::claim_rewards(&acc).await)
+}
+
+/// POST /api/task-center/auto —— 一键完成当前账号的成长任务。
+///
+/// 每个任务走「接受 → 触发行为 → 回读进度 → 领奖」闭环，单条失败不影响其余。
+/// 耗时较长（真实对话 + 小程序节奏间隔），前端应给出进度提示。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn run_growth_auto(account_id: String) -> Result<Value, String> {
+    let acc = account::find_account(&account_id).ok_or("账号不存在")?;
+    Ok(growth_tasks::run_all(&acc).await)
 }
 
 #[tauri::command]

@@ -1140,3 +1140,22 @@ export interface TaskClaimResult {
   creditTotal?: number;
   error?: string;
 }
+
+/** 一键完成里单个任务的执行结果。 */
+export interface GrowthAutoItem {
+  code: string;
+  title: string;
+  /** done=已领到奖励；progressed=行为已触发但进度未落账；skipped=无需动作；failed=失败。 */
+  status: "done" | "progressed" | "skipped" | "failed";
+  message: string;
+  credit: number;
+}
+
+export interface GrowthAutoResult {
+  results: GrowthAutoItem[];
+  /** 本次到账积分合计。 */
+  creditTotal?: number;
+  /** 非致命提示（例如补领阶段的失败项）。 */
+  note?: string;
+  error?: string;
+}

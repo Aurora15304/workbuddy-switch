@@ -43,6 +43,7 @@ import type {
   TaskAcceptResult,
   TaskCenterList,
   TaskClaimResult,
+  GrowthAutoResult,
   TravelConfig,
   TravelStatus,
   UpdateInfo,
@@ -856,6 +857,16 @@ export function acceptTaskCenter(accountId: string): Promise<TaskAcceptResult> {
 /** 逐个领取达标奖励，单条失败不影响其余。 */
 export function claimTaskCenter(accountId: string): Promise<TaskClaimResult> {
   return call("claim_task_center", { accountId });
+}
+
+/**
+ * 一键完成当前账号的成长任务。
+ *
+ * 每个任务走「接受 → 触发行为 → 回读进度 → 领奖」闭环。会发真实对话、
+ * 按真人节奏间隔上报，耗时较长（数分钟），调用方需给出等待提示。
+ */
+export function runGrowthAuto(accountId: string): Promise<GrowthAutoResult> {
+  return call("run_growth_auto", { accountId });
 }
 
 export function getCreditStatistics(refresh = false): Promise<CreditStatistics> {
