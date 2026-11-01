@@ -40,6 +40,9 @@ import type {
   SessionGroupPairPreview,
   SessionGroupActionReport,
   SwitchResult,
+  TaskAcceptResult,
+  TaskCenterList,
+  TaskClaimResult,
   TravelConfig,
   TravelStatus,
   UpdateInfo,
@@ -834,6 +837,25 @@ export async function getCheckinStatus(accountId: string): Promise<{
 
 export function getCreditExpiry(accountId: string): Promise<CreditExpiry> {
   return call("get_credit_expiry", { accountId });
+}
+
+// ---------------------------------------------------------------------------
+// 成长中心任务（beta）
+// ---------------------------------------------------------------------------
+
+/** 列出单账号的成长任务（两个口径合并去重）。 */
+export function listTaskCenter(accountId: string): Promise<TaskCenterList> {
+  return call("list_task_center", { accountId });
+}
+
+/** 批量接受尚未接受的任务；接口幂等，重复调用安全。 */
+export function acceptTaskCenter(accountId: string): Promise<TaskAcceptResult> {
+  return call("accept_task_center", { accountId });
+}
+
+/** 逐个领取达标奖励，单条失败不影响其余。 */
+export function claimTaskCenter(accountId: string): Promise<TaskClaimResult> {
+  return call("claim_task_center", { accountId });
 }
 
 export function getCreditStatistics(refresh = false): Promise<CreditStatistics> {

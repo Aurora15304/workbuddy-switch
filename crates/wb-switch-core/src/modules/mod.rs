@@ -31,6 +31,7 @@ pub mod session_groups;
 pub mod session_link;
 pub mod session_pinned;
 pub mod switch;
+pub mod task_center;
 pub mod token_stats;
 pub mod travel;
 pub mod update;

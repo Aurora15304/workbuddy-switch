@@ -1093,3 +1093,48 @@ export interface VscodeSessionList {
    */
   dataRoot?: string | null;
 }
+
+// ---------------------------------------------------------------------------
+// 成长中心任务（beta）
+// ---------------------------------------------------------------------------
+
+/** 一条成长任务。`progressKnown` 为 false 时上游没有下发进度，进度值不可信。 */
+export interface TaskCenterItem {
+  code: string;
+  title: string;
+  /** 达成条件或操作指引，可能为空串。 */
+  hint: string;
+  current: number;
+  target: number;
+  progressKnown: boolean;
+  credit: number;
+  energy: number;
+  acceptStatus: string;
+  claimed: boolean;
+  claimable: boolean;
+}
+
+export interface TaskCenterList {
+  tasks: TaskCenterItem[];
+  /** 非致命错误（例如小程序口径拉取失败），主列表仍然可用。 */
+  errors?: string[];
+  claimable?: number;
+  acceptable?: number;
+  /** 整份列表取不到时的致命错误。 */
+  error?: string;
+}
+
+export interface TaskAcceptResult {
+  accepted: string[];
+  note?: string;
+  error?: string;
+}
+
+export interface TaskClaimResult {
+  claimed: { code: string; title?: string; credit: number }[];
+  /** 未领取的原因：已领取 / 上游未下发进度 / 需真实行为达标。 */
+  skipped: { code: string; title?: string; reason: string }[];
+  errors: { code: string; title?: string; error: string }[];
+  creditTotal?: number;
+  error?: string;
+}
