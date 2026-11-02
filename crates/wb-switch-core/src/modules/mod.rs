@@ -11,6 +11,7 @@ pub mod config;
 pub mod credit_usage;
 pub mod credits;
 pub mod error_log;
+pub mod experts;
 pub mod export_import;
 pub mod growth_auto;
 #[cfg(test)]

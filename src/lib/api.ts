@@ -552,6 +552,8 @@ export function switchAccount(args: {
   syncSelections?: SessionSyncSelection[];
   /** 勾选后把本机所有账号的记忆合并成一份并分发回去。 */
   mergeMemory?: boolean;
+  /** 勾选后把本机各账号已添加的专家团汇总成一份，写回每个账号。 */
+  mergeExperts?: boolean;
 }): Promise<SwitchResult> {
   return call("switch_account", args as unknown as Record<string, unknown>);
 }

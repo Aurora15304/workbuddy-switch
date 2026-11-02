@@ -451,6 +451,24 @@ export interface SwitchResult {
   sessionRecovery?: SessionRecoveryReport;
   /** 本次的记忆合并与分发报告（未勾选合并时不返回）。 */
   memoryMerge?: MemoryMergeReport;
+  /** 本次的专家团清单同步报告（未勾选同步时不返回）。 */
+  expertsMerge?: ExpertsMergeReport;
+}
+
+/** 跨账号专家团清单同步结果：各账号的名单取并集后写回每个账号。 */
+export interface ExpertsMergeReport {
+  /** 参与本次处理的账号数（含没有 experts.json 的账号）。 */
+  accounts: number;
+  /** 合并后的专家团名字（已去重、已排序）。 */
+  mergedExperts: string[];
+  /** 合并后的专家团数量。 */
+  mergedCount: number;
+  /** 本次写入的账号；`backup` 是被覆盖前的原文备份路径（原本无文件时为 null）。 */
+  written: { label: string; backup: string | null; hadContent: boolean }[];
+  /** 合并结果与现有清单一致（集合相同）、未写入的账号。 */
+  unchanged: { label: string }[];
+  errors: { label: string; error: string }[];
+  note?: string;
 }
 
 /** 跨账号工作记忆合并结果：`MEMORY.md` 合并分发，人格文件只补全缺失项。 */

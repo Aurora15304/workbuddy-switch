@@ -580,6 +580,7 @@ pub async fn switch_account(
     copy_session_ids: Option<Vec<String>>,
     sync_selections: Option<Value>,
     merge_memory: Option<bool>,
+    merge_experts: Option<bool>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
@@ -587,6 +588,7 @@ pub async fn switch_account(
     let restart = restart.unwrap_or(true);
     let share_sessions = share_sessions.unwrap_or(false);
     let merge_memory = merge_memory.unwrap_or(false);
+    let merge_experts = merge_experts.unwrap_or(false);
     let copy_ids = copy_session_ids.unwrap_or_default();
     // 入参形状由 core 校验（缺 groupId / previewToken / mode 一律拒绝）；这里只做透传，
     // 不在命令层做业务判定。
@@ -603,6 +605,7 @@ pub async fn switch_account(
             &copy_ids,
             &sync_selections,
             merge_memory,
+            merge_experts,
         )
     })
     .await

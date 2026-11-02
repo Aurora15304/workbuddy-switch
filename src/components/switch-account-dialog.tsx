@@ -98,6 +98,8 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
   /** 工作记忆：把本机所有账号的 MEMORY.md 合并后分发回去（不给目标账号覆盖式写入）。 */
   const [mergeMemory, setMergeMemory] = useState(false);
+  /** 专家团：把本机各账号已添加的专家团汇总成一份写回每个账号（只增不减）。 */
+  const [mergeExperts, setMergeExperts] = useState(false);
 
   const variant = accountVariant(account);
   const accountId = account?.id;
@@ -137,6 +139,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setSyncGroups([]);
     setLinksMeta(null);
     setMergeMemory(false);
+    setMergeExperts(false);
     setTab("links");
     setLoadingSessions(true);
     void api.listSessions(variant)
@@ -197,6 +200,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         // 勾选绑定预览凭据；执行前后端会重新校验，版本变化则跳过该项。
         syncSelections: requestedSync ? syncSelections : undefined,
         mergeMemory: mergeMemory || undefined,
+        mergeExperts: mergeExperts || undefined,
       });
       const nickname = displayName(account);
       const parts: string[] = [];
@@ -215,6 +219,17 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       if (skippedItems.length > 0) parts.push(`跳过 ${skippedItems.length} 个会话`);
       if (syncErrors.length > 0) parts.push(`会话同步失败 ${syncErrors.length} 个`);
       if (res.backup) parts.push(`备份: ${res.backup}`);
+      // 专家团与工作记忆属于「切号时顺带同步的资产」：成功量并入同一条汇总，失败另开
+      // error toast（分级不能丢）。只报数量，不列名单。
+      const expertsReport = res.expertsMerge;
+      if (expertsReport && expertsReport.written.length > 0) {
+        const backedUp = expertsReport.written.some((item) => item.backup);
+        parts.push(
+          `专家团已同步到 ${expertsReport.written.length} 个账号（共 ${expertsReport.mergedCount} 个）${
+            backedUp ? "，原有清单已备份" : ""
+          }`,
+        );
+      }
       // 成功清理：临时备份已回收，不再展示可还原路径；待清理项单独提示，不写进成功文案。
       toast.success(`已切换至「${nickname}」`, {
         description: parts.length ? parts.join("；") : `${variantAppName(accountVariant(account))} 已重启为目标账号。`,
@@ -286,14 +301,32 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           toast.success(`工作记忆已合并并写入 ${memoryReport.written.length} 个账号`, {
             description: `${memoryReport.sources.length} 份记忆合成 ${memoryReport.mergedChars} 字；被覆盖的原文已备份为 MEMORY.md.bak-时间戳`,
           });
-        } else if (memoryReport.note) {
+        } else if (memoryIssues.length === 0 && memoryReport.note) {
           toast.info("工作记忆未合并", { description: memoryReport.note });
-        } else if (memoryReport.unchanged.length > 0) {
+        } else if (memoryIssues.length === 0 && memoryReport.unchanged.length > 0) {
           toast.info("工作记忆无需更新", { description: "所有账号的记忆内容已经一致。" });
         }
       } else if (mergeMemory) {
         toast.warning("工作记忆未合并", {
           description: "没有收到合并结果：当前版本可能不支持该功能，账号已切换，但记忆没有改动。",
+        });
+      }
+      // 专家团同步：失败必须独立提示；成功量已并入上面的汇总，不重复弹第二条成功 toast。
+      if (expertsReport) {
+        if (expertsReport.errors.length > 0) {
+          toast.error("专家团没有全部同步", {
+            description: expertsReport.errors
+              .map((item) => `${item.label}：${item.error}`)
+              .join("；"),
+          });
+        } else if (expertsReport.written.length === 0 && expertsReport.note) {
+          toast.info("专家团未同步", { description: expertsReport.note });
+        } else if (expertsReport.written.length === 0 && expertsReport.unchanged.length > 0) {
+          toast.info("专家团无需更新", { description: "所有账号的专家团清单已经一致。" });
+        }
+      } else if (mergeExperts) {
+        toast.warning("专家团未同步", {
+          description: "没有收到同步结果：当前版本可能不支持该功能，账号已切换，但专家团没有改动。",
         });
       }
       // 临时备份残留：待清理说明重试入口；待恢复说明必须保留材料并给出下一步。
@@ -393,19 +426,40 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   /** 覆盖项数量：底部摘要据此提示风险。 */
   const overwriteCount = syncSelections.filter((item) => item.mode === "overwrite").length;
   const linksAvailable = linksMeta?.available ?? true;
-  const summaryMain =
+  /**
+   * 切号时顺带同步的资产（记忆 / 专家团）：摘要与勾选说明共用一处措辞，
+   * 避免「只勾资产」时摘要还写「仅切换账号」。
+   */
+  const assetLabel =
+    mergeExperts && mergeMemory
+      ? "专家团与工作记忆"
+      : mergeExperts
+        ? "专家团"
+        : mergeMemory
+          ? "工作记忆"
+          : null;
+  const sessionSummary =
     copyCount > 0 && syncCount > 0
       ? `将复制 ${copyCount} 个、同步 ${syncCount} 个关联会话`
       : copyCount > 0
         ? `将复制 ${copyCount} 个会话`
         : syncCount > 0
           ? `将同步 ${syncCount} 个关联会话`
-          : "本次仅切换账号";
+          : "";
+  const summaryMain = sessionSummary
+    ? assetLabel
+      ? `${sessionSummary}，并同步${assetLabel}`
+      : sessionSummary
+    : assetLabel
+      ? `切换账号并同步${assetLabel}`
+      : "本次仅切换账号";
   const summarySub =
     overwriteCount > 0
       ? `其中 ${overwriteCount} 个会替换目标账号的完整内容`
       : copyCount === 0 && syncCount === 0
-        ? "未选择复制或同步会话"
+        ? assetLabel
+          ? `不复制、不同步会话，但会把${assetLabel}同步到所有账号`
+          : "未选择复制或同步会话"
         : copyCount === 0
           ? "未选择复制会话"
           : syncCount === 0
@@ -614,6 +668,21 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
             <div className="text-xs text-muted-foreground">
               把本机所有账号的 MEMORY.md 合成一份写回每个账号（原文先备份）；SOUL / IDENTITY /
               USER 只补全缺失的账号，不覆盖已有设定。
+            </div>
+          </div>
+        </label>
+
+        <label className="flex shrink-0 cursor-pointer items-start gap-2 rounded-md border border-border px-3 py-2">
+          <Checkbox
+            checked={mergeExperts}
+            disabled={busy}
+            onCheckedChange={(value) => setMergeExperts(value === true)}
+            className="mt-0.5"
+          />
+          <div className="min-w-0 space-y-0.5">
+            <div className="text-sm font-medium">同步专家团到所有账号</div>
+            <div className="text-xs text-muted-foreground">
+              把本机各账号添加过的专家团合并成一份，同步给每个账号（只增不减，原有清单先备份）。
             </div>
           </div>
         </label>

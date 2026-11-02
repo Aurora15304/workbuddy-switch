@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::modules::account;
 use crate::modules::auth_file;
+use crate::modules::experts;
 use crate::modules::memory;
 use crate::modules::process::{close_workbuddy, launch_workbuddy};
 use crate::modules::session::{self, SessionPaths, SyncSelection};
@@ -134,6 +135,23 @@ fn reject_session_writes_without_restart(
     (copy, sync)
 }
 
+/// 账号库到 `[(uid, label)]` 的投影：记忆合并与专家团同步共用同一份形状。
+///
+/// 缺 uid 的账号照样保留（uid 为空串），由各自的模块决定怎么报告——这里不做静默丢弃。
+fn account_pairs() -> Vec<(String, String)> {
+    account::load_accounts()
+        .iter()
+        .map(|acc| {
+            let uid = acc
+                .get("uid")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            (uid, account::account_display_name(acc))
+        })
+        .collect()
+}
+
 /// 切换账号。
 ///
 /// `copy_session_ids` 非空时按路径 B 复制勾选会话（新 id，云端可同步）；
@@ -147,6 +165,7 @@ pub fn switch_account(
     copy_session_ids: &[String],
     sync_selections: &[SyncSelection],
     merge_memory: bool,
+    merge_experts: bool,
 ) -> Result<Value, String> {
     // 快照与导出必须和令牌刷新处在同一个事务里：在任何备份、进程管理之前取锁，
     // 这样一次失败的切换不会留下副作用。
@@ -170,6 +189,7 @@ pub fn switch_account(
     let mut sync_report: Option<Value> = None;
     let mut recovery_report: Option<Value> = None;
     let mut memory_report: Option<Value> = None;
+    let mut experts_report: Option<Value> = None;
     if restart {
         progress("正在关闭 WorkBuddy…");
         close_workbuddy(variant, 20)?;
@@ -281,18 +301,14 @@ pub fn switch_account(
         // 「未完成会话写入」的暂停判定。必须在写认证之前执行——那时账号库与各账号的
         // 人格目录都还是切换前的状态。
         progress("正在合并并分发工作记忆…");
-        let accounts: Vec<(String, String)> = account::load_accounts()
-            .iter()
-            .map(|acc| {
-                let uid = acc
-                    .get("uid")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                (uid, account::account_display_name(acc))
-            })
-            .collect();
-        memory_report = Some(memory::merge_and_distribute(&accounts));
+        memory_report = Some(memory::merge_and_distribute(&account_pairs()));
+    }
+    if merge_experts {
+        // 专家团清单也是纯本地 JSON 文件（`{home}/.workbuddy/experts/custom/<uid>/experts.json`），
+        // 与会话写入无关，同样不受 restart=false 限制。位置必须在写认证之前、并且在
+        // restart=true 的 close_workbuddy 之后：留给 App 的写回窗口越小，清单越不会被覆盖。
+        progress("正在同步专家团…");
+        experts_report = Some(experts::merge_and_distribute(&account_pairs()));
     }
     progress("正在写入认证文件…");
     auth_file::write_account_to_auth_file(&acc, variant)?;
@@ -324,6 +340,9 @@ pub fn switch_account(
     }
     if let Some(m) = memory_report {
         result["memoryMerge"] = m;
+    }
+    if let Some(e) = experts_report {
+        result["expertsMerge"] = e;
     }
     Ok(result)
 }

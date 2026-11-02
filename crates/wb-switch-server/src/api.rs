@@ -824,6 +824,10 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
         .get("mergeMemory")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let merge_experts = body
+        .get("mergeExperts")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let copy_ids: Vec<String> = body
         .get("copySessionIds")
         .and_then(|v| v.as_array())
@@ -861,6 +865,7 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
             &copy_ids,
             &sync_selections,
             merge_memory,
+            merge_experts,
         )
     })
     .await;

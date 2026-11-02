@@ -70,6 +70,14 @@ pub fn store_dir() -> PathBuf {
     home_dir().join(".wb-switch")
 }
 
+/// WorkBuddy 自己的数据根（`{home}/.workbuddy`），与档位无关。
+///
+/// 与 `variant::data_root()` / `session_groups::data_root()` 区分：那两个按「国内版 / 国际版」
+/// 挑目录，这里只有一个目录，跨档位共用（工作记忆、自定义专家团清单都在它下面）。
+pub fn wb_data_root() -> PathBuf {
+    home_dir().join(".workbuddy")
+}
+
 pub fn accounts_file() -> PathBuf {
     store_dir().join("accounts.json")
 }

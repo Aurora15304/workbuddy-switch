@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::modules::config::{atomic_write, home_dir, now_ms};
+use crate::modules::config::{atomic_write, now_ms, wb_data_root};
 
 /// 长期记忆文件名：唯一参与合并的文件。
 const MEMORY_FILE: &str = "MEMORY.md";
@@ -29,11 +29,6 @@ const PERSONA_FILES: [&str; 3] = ["SOUL.md", "IDENTITY.md", "USER.md"];
 /// WorkBuddy 数据根下的账号目录前缀。
 const PERSONAL_PREFIX: &str = "user-";
 const PERSONAL_SUFFIX: &str = "-personal";
-
-/// WorkBuddy 数据根（`{home}/.workbuddy`）。
-pub fn data_root() -> PathBuf {
-    home_dir().join(".workbuddy")
-}
 
 /// 指定 uid 的人格目录：`{root}/user-{uid}-personal`。
 pub fn personal_dir_at(root: &Path, uid: &str) -> PathBuf {
@@ -45,7 +40,7 @@ pub fn personal_dir_at(root: &Path, uid: &str) -> PathBuf {
 /// `accounts` 是 `[{"uid": "...", "label": "..."}]` 的形状（调用方从账号库投影），
 /// 缺 uid 的账号会被跳过——uid 是目录名的唯一依据，猜不出来。
 pub fn merge_and_distribute(accounts: &[(String, String)]) -> Value {
-    merge_and_distribute_at(&data_root(), accounts)
+    merge_and_distribute_at(&wb_data_root(), accounts)
 }
 
 fn merge_and_distribute_at(root: &Path, accounts: &[(String, String)]) -> Value {
