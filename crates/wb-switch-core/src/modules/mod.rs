@@ -35,6 +35,7 @@ pub mod session_backup;
 pub mod session_groups;
 pub mod session_link;
 pub mod session_pinned;
+pub mod session_sidecar;
 pub mod switch;
 pub mod task_center;
 pub mod token_stats;

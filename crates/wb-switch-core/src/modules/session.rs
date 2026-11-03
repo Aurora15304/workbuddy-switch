@@ -49,6 +49,7 @@ use crate::modules::session_link::{
     SyncVerdict, NORMALIZATION_VERSION, OPERATION_VERSION,
 };
 use crate::modules::session_pinned;
+use crate::modules::session_sidecar::{self, SidecarOutcome};
 use crate::modules::variant::WbVariant;
 
 /// 关联存储的命名空间：决定关联表 / 基线 / 预览凭据 / 存储锁的名字。
@@ -1023,6 +1024,7 @@ fn run_copy(
                     backup,
                     cleanup_state,
                     cleanup_error,
+                    sidecar,
                 }) => {
                     let mut item = json!({
                         "id": cid,
@@ -1033,6 +1035,12 @@ fn run_copy(
                     });
                     if let Some(error) = cleanup_error {
                         item["cleanupError"] = json!(error);
+                    }
+                    // 附属目录只在真的有内容或失败时呈现，避免给正常报告添噪音。
+                    if let Some(sidecar) = sidecar {
+                        if sidecar.source_present || sidecar.has_errors() {
+                            item["sidecar"] = json!(sidecar);
+                        }
                     }
                     copied.push(item);
                 }
@@ -1121,6 +1129,11 @@ enum CopyOutcome {
         backup: Option<String>,
         cleanup_state: String,
         cleanup_error: Option<String>,
+        /// 附属目录（子 agent / 工具结果）复制结果；正文此前已写成时为 None。
+        ///
+        /// 附属目录缺失不影响副本可用性，因此它**不**参与复制成败判定，
+        /// 只在这里如实呈现（失败项见 `SidecarOutcome::errors`）。
+        sidecar: Option<SidecarOutcome>,
     },
     AlreadyLinked {
         session_id: String,
@@ -1369,7 +1382,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
     };
     session_link::save_operation(paths, &operation)?;
 
-    if let Err(error) = finish_copy_from_body(
+    let sidecar = match finish_copy_from_body(
         paths,
         context.variant,
         context.source_paths,
@@ -1377,9 +1390,12 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         &snapshot,
         Some(&source_path),
     ) {
-        fail_operation(paths, &mut operation, &error);
-        return Err(error);
-    }
+        Ok(sidecar) => sidecar,
+        Err(error) => {
+            fail_operation(paths, &mut operation, &error);
+            return Err(error);
+        }
+    };
     let _ = session_link::prune_operations(
         paths,
         context.variant,
@@ -1394,6 +1410,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         backup,
         cleanup_state: cleanup_state.to_string(),
         cleanup_error,
+        sidecar,
     })
 }
 
@@ -1463,6 +1480,9 @@ fn report_cleanup(
 /// `body_source` 为 `Some(source_path)` 时先写正文；为 `None` 表示正文此前已写成
 /// （恢复场景），直接继续数据库行与关联。源行读取与目标行写入的档位经
 /// `source_paths` 分离（跨档复制时与 `paths` 不同，同档时相同）。
+///
+/// 返回值里的 [`SidecarOutcome`] 是本次附属目录复制的结果（正文此前已写成时为
+/// `None`）：附属目录的成败不影响本函数的成功判定。
 fn finish_copy_from_body(
     paths: &SessionPaths,
     variant: WbVariant,
@@ -1470,9 +1490,10 @@ fn finish_copy_from_body(
     operation: &mut Operation,
     snapshot: &ContentSnapshot,
     body_source: Option<&Path>,
-) -> Result<(), String> {
+) -> Result<Option<SidecarOutcome>, String> {
+    let mut sidecar = None;
     if let Some(source_path) = body_source {
-        write_copy_body(
+        let dest = write_copy_body(
             snapshot,
             source_path,
             source_paths,
@@ -1480,6 +1501,15 @@ fn finish_copy_from_body(
             &operation.source.session_id,
             &operation.target.session_id,
         )?;
+        // 附属目录紧跟正文写入：客户端渲染子 agent 面板依赖
+        // `{工作区}/{会话id}/subagents/{storeId}.jsonl`，正文里的绝对路径也指向
+        // `{工作区}/{新会话id}/tool-results/`，因此附属目录必须按**新**会话 id 建。
+        sidecar = Some(session_sidecar::copy_sidecar_best_effort(
+            source_path,
+            &dest,
+            &operation.source.session_id,
+            &operation.target.session_id,
+        ));
         advance_operation(paths, operation, OpPhase::BodyWritten)?;
     }
 
@@ -1510,7 +1540,7 @@ fn finish_copy_from_body(
     operation.group_id = group_id;
     advance_operation(paths, operation, OpPhase::LinksCommitted)?;
     advance_operation(paths, operation, OpPhase::Completed)?;
-    Ok(())
+    Ok(sidecar)
 }
 
 /// 推进操作阶段。阶段只能前进：已经走到更靠后的阶段时不回写（恢复路径不得把
@@ -3759,27 +3789,53 @@ fn run_status_only_phases(
     Ok(())
 }
 
+/// 同步路径的附属目录同步：目标正文 = 来源正文（替换 id 后），附属目录同规则同步。
+///
+/// 语义与复制路径一致：目录按**目标**会话 id 建，内容做来源 id → 目标 id 替换，
+/// 目标已有文件一律跳过（目标侧自己产生的子 agent 记录不能被覆盖）。
+///
+/// 失败只记录不阻断同步：同步的判定依据是正文，附属目录缺失不影响主会话可用性。
+fn sync_sidecar(
+    paths: &SessionPaths,
+    source_paths: &SessionPaths,
+    operation: &Operation,
+    manifest: &SyncBackupManifest,
+) -> Option<SidecarOutcome> {
+    let target_body = validated_target_body_path(paths, manifest).ok()?;
+    let source_body = find_project_jsonl(source_paths, &operation.source.session_id)?;
+    Some(session_sidecar::copy_sidecar_best_effort(
+        &source_body,
+        &target_body,
+        &operation.source.session_id,
+        &operation.target.session_id,
+    ))
+}
+
 /// 阶段化写入：正文 → 数据库 → 组表 → completed；每步先落阶段再推进，可恢复。
 ///
 /// 正常执行与恢复共用同一段代码：阶段只前进不回退，已越过的阶段不重放（只核验产物），
 /// 因此恢复不会产生第二份写入。仅同步归档走 [`run_status_only_phases`]，不进正文分支。
+///
+/// 返回值里的 [`SidecarOutcome`] 是本次附属目录同步的结果（仅同步归档时为 None）：
+/// 附属目录不是同步的判定依据（正文才是），失败只记录、不阻断同步。
 fn run_sync_phases(
     paths: &SessionPaths,
+    source_paths: &SessionPaths,
     operation: &mut Operation,
     backup_dir: &Path,
     manifest: &SyncBackupManifest,
     body: SyncBodyState,
-) -> Result<(), String> {
+) -> Result<Option<SidecarOutcome>, String> {
     // 仅同步归档：正文零写入，也不提交新基线。必须在这里分流——复用正文分支时
     // `Gone` 会把备份里的目标原文写回业务正文，等于补写正文。
     if manifest.mode == SyncMode::StatusOnly {
-        return run_status_only_phases(paths, operation, manifest, body);
+        return run_status_only_phases(paths, operation, manifest, body).map(|()| None);
     }
-    let normalized = match body {
+    let (normalized, sidecar) = match body {
         // 已写入：只核验现场，不重写。
         SyncBodyState::Ours => {
             let target_body_path = validated_target_body_path(paths, manifest)?;
-            match session_link::read_content_snapshot(
+            let normalized = match session_link::read_content_snapshot(
                 &target_body_path,
                 &manifest.target.session_id,
             ) {
@@ -3795,7 +3851,9 @@ fn run_sync_phases(
                 ContentState::Unavailable(reason) => {
                     return Err(format!("目标内容无法验证（{reason}），已停止恢复"))
                 }
-            }
+            };
+            // 正文已是本次写入的内容：附属目录同样补齐（幂等：已存在的文件跳过）。
+            (normalized, sync_sidecar(paths, source_paths, operation, manifest))
         }
         SyncBodyState::PreSync | SyncBodyState::Gone => {
             let normalized = apply_sync_body(
@@ -3804,8 +3862,11 @@ fn run_sync_phases(
                 manifest,
                 &operation.expected_content_digest,
             )?;
+            // 正文写入成功之后才同步附属目录：同步的备份契约只覆盖正文，
+            // 附属目录是纯增量（目标已有文件一律跳过），不参与「备份完备才写」。
+            let sidecar = sync_sidecar(paths, source_paths, operation, manifest);
             advance_operation(paths, operation, OpPhase::BodyWritten)?;
-            normalized
+            (normalized, sidecar)
         }
         SyncBodyState::Unknown(reason) => return Err(reason),
     };
@@ -3844,7 +3905,7 @@ fn run_sync_phases(
         verify_sync_baseline_committed(paths, manifest)?;
     }
     advance_operation(paths, operation, OpPhase::Completed)?;
-    Ok(())
+    Ok(sidecar)
 }
 
 /// 执行单条同步：备份 → 阶段化写入 → completed。
@@ -3946,11 +4007,20 @@ fn execute_sync_item(
         &plan.target_snapshot.full_digest,
         &operation.expected_content_digest,
     );
-    if let Err(error) = run_sync_phases(paths, &mut operation, &backup.dir, &backup.manifest, body)
-    {
-        fail_operation(paths, &mut operation, &error);
-        return Err(error);
-    }
+    let sidecar = match run_sync_phases(
+        paths,
+        context.source_paths,
+        &mut operation,
+        &backup.dir,
+        &backup.manifest,
+        body,
+    ) {
+        Ok(sidecar) => sidecar,
+        Err(error) => {
+            fail_operation(paths, &mut operation, &error);
+            return Err(error);
+        }
+    };
     let _ = session_link::prune_operations(
         paths,
         context.variant,
@@ -3982,6 +4052,12 @@ fn execute_sync_item(
     });
     if let Some(error) = cleanup_error {
         item["cleanupError"] = json!(error);
+    }
+    // 附属目录只在真的有内容或失败时呈现，避免给正常报告添噪音。
+    if let Some(sidecar) = sidecar {
+        if sidecar.source_present || sidecar.has_errors() {
+            item["sidecar"] = json!(sidecar);
+        }
     }
     Ok(item)
 }
@@ -4136,7 +4212,7 @@ fn recover_operation(
     source_paths: Option<&SessionPaths>,
 ) -> RecoverOutcome {
     if operation.kind == OPERATION_KIND_SYNC {
-        return recover_sync_operation(paths, operation);
+        return recover_sync_operation(paths, operation, source_paths);
     }
     recover_copy_operation(paths, variant, operation, source_paths)
 }
@@ -4146,7 +4222,15 @@ fn recover_operation(
 /// 顺序：备份必须完好 → 目标正文只能是「本次写入的」或「覆盖前的」→ 目标行归属与
 /// 更新时间必须可安全识别 → 复用同一段阶段代码补完。任一项不满足即停止并上报
 /// needsRecovery（阻断启动，宿主必须等待恢复一致后才能启动 App）。
-fn recover_sync_operation(paths: &SessionPaths, mut operation: Operation) -> RecoverOutcome {
+///
+/// `source_paths` 是**源档**数据根（跨档同步时与目标档不同）：附属目录同步需要
+/// 从源会话的附属目录取文件。同档与旧记录用目标档（`None`）。
+fn recover_sync_operation(
+    paths: &SessionPaths,
+    mut operation: Operation,
+    source_paths: Option<&SessionPaths>,
+) -> RecoverOutcome {
+    let read_paths = source_paths.unwrap_or(paths);
     let operation_id = operation.operation_id.clone();
     let needs = |reason: String, retryable: bool| RecoverOutcome::NeedsRecovery {
         id: operation_id.clone(),
@@ -4278,14 +4362,39 @@ fn recover_sync_operation(paths: &SessionPaths, mut operation: Operation) -> Rec
     }
 
     // 4) 复用同一段阶段代码补完（阶段只前进，已越过的阶段只核验不重放）。
-    match run_sync_phases(paths, &mut operation, &backup_dir, &manifest, body) {
-        Ok(()) => RecoverOutcome::Recovered(operation_id),
+    match run_sync_phases(paths, read_paths, &mut operation, &backup_dir, &manifest, body) {
+        Ok(_) => RecoverOutcome::Recovered(operation_id),
         Err(error) => {
             fail_operation(paths, &mut operation, &error);
             // Retry may succeed later, but the unfinished sync must block startup now.
             needs(error, false)
         }
     }
+}
+
+/// 恢复路径的附属目录补齐：源/目标正文路径都已定位时复制。
+///
+/// 失败只记录不阻断恢复：附属目录缺失只让子 agent 面板空白，主会话已经可用；
+/// 把它升级成 `needsRecovery` 会让整个 App 卡在启动门禁上，代价远大于收益。
+/// 恢复报告里没有「非阻断提示」的位置，因此失败详情不进入恢复报告。
+fn recover_sidecar_at(operation: &Operation, source_body: &Path, target_body: &Path) {
+    session_sidecar::copy_sidecar_best_effort(
+        source_body,
+        target_body,
+        &operation.source.session_id,
+        &operation.target.session_id,
+    );
+}
+
+/// 恢复路径的附属目录补齐：源/目标正文都能定位时才做。
+fn recover_sidecar(paths: &SessionPaths, source_paths: &SessionPaths, operation: &Operation) {
+    let Some(source_body) = find_project_jsonl(source_paths, &operation.source.session_id) else {
+        return;
+    };
+    let Some(target_body) = find_project_jsonl(paths, &operation.target.session_id) else {
+        return;
+    };
+    recover_sidecar_at(operation, &source_body, &target_body);
 }
 
 /// 恢复一次复制（第一步的原有逻辑，保持不变）。
@@ -4306,7 +4415,13 @@ fn recover_copy_operation(
 
     // 1) 目标正文：已写成则直接复用；未写成则用当前源内容补写；被改动则停止。
     let normalized = match check_target_body(paths, &operation) {
-        BodyCheck::Verified(normalized) => normalized,
+        BodyCheck::Verified(normalized) => {
+            // 正文已写成：补做附属目录复制。「正文写成功但附属目录复制失败/未做」
+            // 正是这里要补的场景（客户端按 `{会话id}/subagents/{storeId}.jsonl`
+            // 找子 agent transcript，缺了就只剩空白面板）。
+            recover_sidecar(paths, read_paths, &operation);
+            normalized
+        }
         BodyCheck::NeedsRecovery(reason) => return needs(reason, false),
         BodyCheck::Absent => {
             let Some(source_path) = find_project_jsonl(read_paths, &operation.source.session_id)
@@ -4329,7 +4444,7 @@ fn recover_copy_operation(
                 operation.expected_content_digest = source.normalized.total_digest.clone();
                 operation.expected_record_count = source.normalized.record_count;
             }
-            if let Err(error) = write_copy_body(
+            let target_body = match write_copy_body(
                 &source,
                 &source_path,
                 read_paths,
@@ -4337,9 +4452,14 @@ fn recover_copy_operation(
                 &operation.source.session_id,
                 &operation.target.session_id,
             ) {
-                fail_operation(paths, &mut operation, &error);
-                return needs(error, true);
-            }
+                Ok(path) => path,
+                Err(error) => {
+                    fail_operation(paths, &mut operation, &error);
+                    return needs(error, true);
+                }
+            };
+            // 正文补写成功后同样补齐附属目录（与正常复制路径同规则）。
+            recover_sidecar_at(&operation, &source_path, &target_body);
             if let Err(error) = advance_operation(paths, &mut operation, OpPhase::BodyWritten) {
                 return needs(error, true);
             }
@@ -4576,6 +4696,24 @@ mod tests {
                 .projects_dir()
                 .join("ws-a")
                 .join(format!("{cid}.jsonl"))
+        }
+
+        /// 某会话的附属目录（与主正文同级、以会话 id 命名）。
+        fn sidecar_dir(&self, cid: &str) -> PathBuf {
+            self.paths.projects_dir().join("ws-a").join(cid)
+        }
+
+        /// 写会话附属目录里的一个文件（相对附属目录根）。
+        fn add_sidecar(&self, cid: &str, relative: &str, content: &str) -> PathBuf {
+            let path = self.sidecar_dir(cid).join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content).unwrap();
+            path
+        }
+
+        /// 读会话附属目录里的一个文件（相对附属目录根）。
+        fn read_sidecar(&self, cid: &str, relative: &str) -> String {
+            std::fs::read_to_string(self.sidecar_dir(cid).join(relative)).unwrap()
         }
 
         fn delete_row(&self, id: &str) {
@@ -5299,6 +5437,51 @@ mod tests {
         assert!(session_backup::scan_lifecycle(&env.paths)
             .records
             .is_empty());
+    }
+
+    /// 复制会话时一并复制附属目录：客户端渲染子 agent 面板依赖
+    /// `{会话id}/subagents/{storeId}.jsonl`，正文里的绝对路径也指向
+    /// `{会话id}/tool-results/`，因此附属目录必须按**新**会话 id 建并替换内容里的 id。
+    #[test]
+    fn copy_also_copies_sidecar_directory() {
+        let env = ready_env("copy-sidecar");
+        env.add_sidecar(
+            "sess-1",
+            "subagents/agent-x.jsonl",
+            "{\"rootSessionId\":\"sess-1\"}\n",
+        );
+        env.add_sidecar("sess-1", "subagents/agent-x/tool-results/out.txt", "render");
+        env.add_sidecar("sess-1", "tool-results/call_1-render.txt", "{\"content\":\"x\"}");
+
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        assert_eq!(report["copied"].as_array().unwrap().len(), 1, "{report}");
+        let new_id = env.first_copy_id(&report);
+
+        // 附属目录按新会话 id 建：真实落盘内容里主会话 id 已替换。
+        let agent = env.read_sidecar(&new_id, "subagents/agent-x.jsonl");
+        assert!(agent.contains(&new_id), "附属文件里的主会话 id 必须替换成新 id");
+        assert!(!agent.contains("sess-1"), "附属文件里不得残留源会话 id");
+        assert_eq!(
+            env.read_sidecar(&new_id, "subagents/agent-x/tool-results/out.txt"),
+            "render"
+        );
+        assert_eq!(
+            env.read_sidecar(&new_id, "tool-results/call_1-render.txt"),
+            "{\"content\":\"x\"}"
+        );
+
+        // 源侧原样保留。
+        assert_eq!(
+            env.read_sidecar("sess-1", "subagents/agent-x.jsonl"),
+            "{\"rootSessionId\":\"sess-1\"}\n"
+        );
+
+        // 报告如实呈现附属目录复制结果。
+        let sidecar = &report["copied"][0]["sidecar"];
+        assert_eq!(sidecar["sourcePresent"], true, "{report}");
+        assert_eq!(sidecar["agentsCopied"], 1, "{report}");
+        assert_eq!(sidecar["toolResultsCopied"], 2, "{report}");
+        assert_eq!(sidecar["errors"].as_array().unwrap().len(), 0, "{report}");
     }
 
     /// 批量复制逐项清理：进入下一项之前，上一成功项的临时目录已经消失（不累积备份）。
@@ -6187,6 +6370,42 @@ mod tests {
         assert_eq!(env.body_files().len(), 2, "不得产生第二个副本");
         assert_eq!(env.rows_for("uid-b"), vec![new_id]);
         assert!(session_link::pending_operations(&paths, WbVariant::Cn).is_empty());
+    }
+
+    /// 恢复时补齐附属目录：正文已写成但附属目录缺失（复制中断在这两步之间），
+    /// 恢复必须把它补上——否则子 agent 面板永远是空白。
+    #[test]
+    fn recovery_backfills_sidecar_directory() {
+        let env = ready_env("recover-sidecar");
+        env.add_sidecar(
+            "sess-1",
+            "subagents/agent-x.jsonl",
+            "{\"rootSessionId\":\"sess-1\"}\n",
+        );
+        let first = copy(&env, "uid-b", &["sess-1"]);
+        let new_id = env.first_copy_id(&first);
+        let paths = env.paths();
+
+        // 模拟「正文写成功、附属目录复制没做」：删掉附属目录并把操作阶段回退。
+        std::fs::remove_dir_all(env.sidecar_dir(&new_id)).unwrap();
+        assert!(!env.sidecar_dir(&new_id).exists());
+        let mut operation = session_link::scan_operations(&paths)
+            .operations
+            .into_iter()
+            .find(|operation| operation.target.session_id == new_id)
+            .expect("应能找到该副本的操作记录");
+        operation.phase = OpPhase::BodyWritten;
+        session_link::save_operation(&paths, &operation).unwrap();
+
+        let report = recover_pending_session_operations_at(&paths, WbVariant::Cn);
+        assert!(report.is_clean(), "{:?}", report.needs_recovery);
+
+        // 附属目录被补齐，且内容里的主会话 id 已替换成副本 id。
+        let agent = env.read_sidecar(&new_id, "subagents/agent-x.jsonl");
+        assert!(agent.contains(&new_id), "补齐的附属文件必须用副本 id");
+        assert!(!agent.contains("sess-1"));
+        // 正文不受影响。
+        assert_eq!(env.body_files().len(), 2, "不得产生第二个副本");
     }
 
     /// phase 已是 LinksCommitted，但关联主文件被删：不得跳过核验后标 Completed。
@@ -8601,6 +8820,68 @@ mod tests {
         assert_eq!(operations[0].phase, OpPhase::Completed);
         assert_eq!(operations[0].target.session_id, target_id);
         assert!(session_link::pending_operations(&env.paths, WbVariant::Cn).is_empty());
+    }
+
+    /// 同步正文时一并同步附属目录：同步的语义是「目标正文 = 来源正文（替换 id 后）」，
+    /// 附属目录按同一套规则同步过去（目录按目标 id 建、内容替换 id、已有文件不覆盖）。
+    #[test]
+    fn sync_also_copies_sidecar_directory() {
+        let env = ready_env("sync-sidecar");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        // 来源侧在复制之后才产生的附属材料：副本侧还没有。
+        env.add_sidecar(
+            "sess-1",
+            "subagents/agent-y.jsonl",
+            "{\"rootSessionId\":\"sess-1\"}\n",
+        );
+        env.add_sidecar("sess-1", "tool-results/call_2-render.txt", "tool-output");
+        assert!(!env.sidecar_dir(&target_id).exists());
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        let synced = report["synced"].as_array().unwrap();
+        assert_eq!(synced.len(), 1, "{report}");
+
+        // 附属目录按目标会话 id 建，内容里的主会话 id 已替换。
+        let agent = env.read_sidecar(&target_id, "subagents/agent-y.jsonl");
+        assert!(agent.contains(&target_id), "同步的附属文件必须用目标 id");
+        assert!(!agent.contains("sess-1"));
+        assert_eq!(
+            env.read_sidecar(&target_id, "tool-results/call_2-render.txt"),
+            "tool-output"
+        );
+        // 报告如实呈现。
+        assert_eq!(synced[0]["sidecar"]["agentsCopied"], 1, "{report}");
+        assert_eq!(synced[0]["sidecar"]["toolResultsCopied"], 1, "{report}");
+    }
+
+    /// 同步不得覆盖目标侧自己的附属文件：目标已有同名文件一律跳过。
+    #[test]
+    fn sync_never_overwrites_existing_sidecar_file() {
+        let env = ready_env("sync-sidecar-keep");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        env.add_sidecar(
+            "sess-1",
+            "subagents/agent-y.jsonl",
+            "{\"rootSessionId\":\"sess-1\"}\n",
+        );
+        env.add_sidecar(&target_id, "subagents/agent-y.jsonl", "target-own");
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(
+            env.read_sidecar(&target_id, "subagents/agent-y.jsonl"),
+            "target-own",
+            "同步不得覆盖目标侧已有的附属文件"
+        );
     }
 
     /// 故障状态下的备份必须保持完整可核验：清单、一致性快照、覆盖前/待写入正文与摘要
