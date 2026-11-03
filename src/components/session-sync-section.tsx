@@ -124,7 +124,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
   const selectedSyncableCount = syncable.filter((group) => checked.has(group.groupId)).length;
   const allSyncableSelected = syncable.length > 0 && selectedSyncableCount === syncable.length;
 
-  /** 全选/取消全选：只作用于可直接同步的会话；覆盖项必须单独勾选。 */
+  /** 全选/取消全选：涵盖正文快进与仅同步归档；覆盖项必须单独勾选。 */
   function toggleAllSyncable() {
     const updated = new Set(checked);
     if (allSyncableSelected) syncable.forEach((group) => updated.delete(group.groupId));
@@ -218,9 +218,9 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
               checked={allSyncableSelected ? true : selectedSyncableCount > 0 ? "indeterminate" : false}
               disabled={disabled || syncable.length === 0}
               onCheckedChange={() => toggleAllSyncable()}
-              aria-label="全选可直接同步的会话"
+              aria-label="全选可同步的会话"
             />
-            <span className="min-w-0 flex-1 text-sm font-medium">全选可直接同步的会话</span>
+            <span className="min-w-0 flex-1 text-sm font-medium">全选可同步的会话</span>
             <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
               {`已选 ${selectedCount} / ${groups.length}`}
             </span>
@@ -242,7 +242,9 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
               />
             ))}
           </div>
-          <p className="px-1 text-xs text-muted-foreground">全选仅包含可直接同步的会话，覆盖需单独勾选。</p>
+          <p className="px-1 text-xs text-muted-foreground">
+            全选包含正文同步与仅同步归档，覆盖需单独勾选。
+          </p>
         </div>
       )}
     </section>

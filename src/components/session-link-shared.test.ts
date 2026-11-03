@@ -99,16 +99,38 @@ describe("模式优先级与全选口径不变", () => {
     expect(primaryMode(group({ availableModes: ["overwrite"] }))).toBe("overwrite");
   });
 
-  it("全选仍只作用于 fastForward", () => {
+  it("全选包含正文快进与仅同步归档，覆盖仍须单独勾选", () => {
     expect(isDirectlySyncable(group({ availableModes: ["fastForward"], previewToken: "t" }))).toBe(
       true,
     );
+    // 纯归档项没有正文模式，逐条勾选在批量归档时不可用，必须能被全选覆盖。
     expect(
       isDirectlySyncable(group({ availableModes: [], archiveAction: "statusOnly", previewToken: "t" })),
-    ).toBe(false);
+    ).toBe(true);
     expect(isDirectlySyncable(group({ availableModes: ["overwrite"], previewToken: "t" }))).toBe(
       false,
     );
+  });
+
+  it("全选不会收录没有凭据或没有动作的项", () => {
+    expect(
+      isDirectlySyncable(group({ availableModes: [], archiveAction: "statusOnly" })),
+    ).toBe(false);
+    expect(isDirectlySyncable(group({ availableModes: [] }))).toBe(false);
+  });
+
+  it("全选后提交的是正文快进 + 仅归档，覆盖仍被排除", () => {
+    const groups = [
+      group({ groupId: "ff", availableModes: ["fastForward"], previewToken: "t1" }),
+      group({ groupId: "arch", archiveAction: "statusOnly", previewToken: "t2" }),
+      group({ groupId: "ow", availableModes: ["overwrite"], previewToken: "t3" }),
+    ];
+    const checked = new Set(groups.filter(isDirectlySyncable).map((item) => item.groupId));
+    expect(checked).toEqual(new Set(["ff", "arch"]));
+    expect(buildSelections(groups, checked)).toEqual([
+      { groupId: "ff", previewToken: "t1", mode: "fastForward" },
+      { groupId: "arch", previewToken: "t2", mode: "statusOnly" },
+    ]);
   });
 });
 

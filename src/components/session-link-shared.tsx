@@ -109,9 +109,15 @@ export function isActionable(group: SessionLinkPreviewGroup): boolean {
   return primaryMode(group) !== null || archiveOnly(group);
 }
 
-/** 可直接同步项：全选只作用于这类会话，覆盖必须单独勾选。 */
+/**
+ * 全选口径：正文可快进，或仅同步归档。
+ *
+ * 纯归档项必须进全选——它没有正文模式，逐条勾选在批量归档（一次上百个）时不可用，
+ * 导致源账号已归档的会话在目标账号里一直显示为进行中。覆盖（overwrite）仍排除在外：
+ * 那是唯一会改写目标正文的动作，必须逐条显式授权。
+ */
 export function isDirectlySyncable(group: SessionLinkPreviewGroup): boolean {
-  return isActionable(group) && primaryMode(group) === "fastForward";
+  return isActionable(group) && primaryMode(group) !== "overwrite";
 }
 
 /**
