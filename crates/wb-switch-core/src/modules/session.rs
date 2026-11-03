@@ -635,6 +635,23 @@ fn insert_session_copy(
             },
             "updated_at" => rusqlite::types::Value::Integer(now_ms()),
             "deleted_at" => rusqlite::types::Value::Null,
+            // 项目归属不能跨账号继承：本地库没有 projects 表，目标账号也没有这个项目，
+            // 客户端按项目分组渲染时会**整组丢弃**（既不在任务也不在空间）。副本一律
+            // 落到「无项目」，让它进默认本地任务列表（issue #200）。
+            "project_id" => rusqlite::types::Value::Null,
+            // 副本不是运行中的实例：`working` / `planning` 等运行态原样继承会永远卡在
+            // 「生成中」，而客户端默认列表只取 idle 组，等于复制完看不见。
+            "status" => match value {
+                rusqlite::types::Value::Text(state) if is_in_flight_status(&state) => {
+                    rusqlite::types::Value::Text(SESSION_STATUS_COMPLETED.to_string())
+                }
+                other => other,
+            },
+            // 列表排序键是 `COALESCE(last_activity_at, created_at)`，空值会让副本沉底。
+            "last_activity_at" => match value {
+                rusqlite::types::Value::Null => rusqlite::types::Value::Integer(now_ms()),
+                other => other,
+            },
             _ => value,
         };
         cols.push(col.clone());
@@ -1703,6 +1720,23 @@ pub const REASON_PREVIEW_STALE: &str = "previewStale";
 
 /// `sessions.status` 的归档取值。
 const SESSION_STATUS_ARCHIVED: &str = "archived";
+/// 副本的落点状态：既不在运行、也不该被当成归档。
+const SESSION_STATUS_COMPLETED: &str = "completed";
+/// 「会话仍在运行」的状态取值：副本继承这些状态会永远卡在生成中且默认列表不显示。
+const IN_FLIGHT_SESSION_STATUSES: [&str; 7] = [
+    "working",
+    "planning",
+    "pending",
+    "waiting_permission",
+    "waiting_question",
+    "paused",
+    "streaming",
+];
+
+/// 该状态是否表示「有进程正在跑」。仅用于复制时的状态归一。
+fn is_in_flight_status(status: &str) -> bool {
+    IN_FLIGHT_SESSION_STATUSES.contains(&status)
+}
 /// 允许被传导为归档的**目标状态**白名单。
 ///
 /// `active` 也在名单内：目标侧因历史中断停在 `active` 但早已没有后台进程运行时，
@@ -6324,6 +6358,71 @@ mod tests {
         assert_eq!(title, "旧标题"); // 普通列原样保留
         assert_eq!(deleted_at, None);
         assert_eq!(is_playground, 0);
+    }
+
+    /// #200 / #199 回归：副本必须落在目标账号本地列表可渲染的形态。
+    ///
+    /// 项目归属跨账号无效（客户端 `projectId` 非空即不进侧栏）；运行态继承会让副本
+    /// 永远显示生成中；排序键为空会让副本沉底。归档状态反过来必须原样保留。
+    #[test]
+    fn insert_session_copy_normalizes_project_and_in_flight_status() {
+        let env = ready_env("insert-normalize");
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        for sql in [
+            "ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'Pending'",
+            "ALTER TABLE sessions ADD COLUMN project_id TEXT",
+            "ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER",
+            "ALTER TABLE sessions ADD COLUMN source_mode TEXT",
+        ] {
+            conn.execute(sql, []).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sessions (id, user_id, title, cwd, status, project_id, last_activity_at,
+                                   source_mode, created_at, updated_at, deleted_at, is_playground)
+             VALUES ('src-working', 'uid-a', '跑着的会话', '/ws', 'working', 'p_123', NULL,
+                     NULL, 1000, 2000, NULL, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, user_id, title, cwd, status, project_id, last_activity_at,
+                                   source_mode, created_at, updated_at, deleted_at, is_playground)
+             VALUES ('src-archived', 'uid-a', '已归档的会话', '/ws', 'archived', 'p_456', 1500,
+                     'craft', 1000, 2000, NULL, 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        for (src, dst) in [
+            ("src-working", "copy-working"),
+            ("src-archived", "copy-archived"),
+        ] {
+            insert_session_copy(&env.paths(), &env.paths(), dst, src, "uid-a", "uid-b").unwrap();
+        }
+
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        let (status, project, activity): (String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT status, project_id, last_activity_at FROM sessions WHERE id = 'copy-working'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "completed", "运行态副本不能继承 working");
+        assert_eq!(project, None, "项目归属不能跨账号继承（#200）");
+        assert!(activity.is_some(), "排序键不能为空");
+
+        let (status, project, activity): (String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT status, project_id, last_activity_at FROM sessions WHERE id = 'copy-archived'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "archived", "归档状态必须原样保留，否则归档同步会失效");
+        assert_eq!(project, None, "归档副本同样不能继承项目归属");
+        assert_eq!(activity, Some(1500), "已有排序键不得被改写");
     }
 
     #[test]

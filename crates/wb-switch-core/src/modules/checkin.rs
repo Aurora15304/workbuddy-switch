@@ -691,6 +691,14 @@ fn write_window_receipt(win: (u32, u32), account: &Value) {
     }));
 }
 
+/// 相邻两个账号之间的签到间隔（毫秒）：3–8 秒。
+///
+/// 用毫秒时间做抖动源，不引入随机数依赖；调用方把账号序号叠加进 `seed`，
+/// 避免同一毫秒内读到相同值导致每个间隔都一样。
+fn checkin_gap_ms(seed: u64) -> u64 {
+    3_000 + seed % 5_000
+}
+
 /// 执行一轮自动签到。启动与周期轮次均逐账号查询服务端状态。
 ///
 /// 只遍历支持签到且允许自动签到的账号。并发锁防止与
@@ -724,7 +732,13 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
     }
     let mut summary = json!({"status": "ok", "accounts": []});
     let mut had_errors = false;
-    for acc in accounts {
+    for (index, acc) in accounts.into_iter().enumerate() {
+        // 账号之间拉开 3–8 秒：零间隔串行连发是典型的自动化指纹（#199）。
+        // 第一个账号不等待，避免无事发生时也要空转。
+        if index > 0 {
+            let gap = checkin_gap_ms((now_ms() as u64).wrapping_add(index as u64 * 7919));
+            tokio::time::sleep(Duration::from_millis(gap)).await;
+        }
         let result = checkin_account(&acc).await;
         let outcome = result.get("result").and_then(Value::as_str);
         if outcome == Some("error") {
@@ -1838,5 +1852,18 @@ mod tests {
         record_cycle_health(false);
         assert!(!LAST_CYCLE_HAD_ERRORS.load(Ordering::Relaxed));
         assert_eq!(FAST_RETRY_BUDGET.load(Ordering::Relaxed), FAST_RETRY_MAX);
+    }
+
+    /// #199：账号之间必须有 3–8 秒抖动，否则启动瞬间就是一串连发请求。
+    #[test]
+    fn checkin_gap_stays_between_three_and_eight_seconds() {
+        for seed in [0u64, 1, 2_999, 3_000, 4_999, 8_000, 12_345, 1_793_000_000_000] {
+            let gap = checkin_gap_ms(seed);
+            assert!((3_000..8_000).contains(&gap), "seed {seed} -> {gap}");
+        }
+        // 相邻序号必须给出不同间隔：同一毫秒读数不能让整轮间隔完全一致。
+        let base = 1_793_000_000_000u64;
+        let gaps: Vec<u64> = (0..5).map(|i| checkin_gap_ms(base + i * 7919)).collect();
+        assert!(gaps.windows(2).any(|w| w[0] != w[1]), "{gaps:?}");
     }
 }
