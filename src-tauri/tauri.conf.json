@@ -44,11 +44,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/agent-studio-runtime"]
+    "externalBin": [
+      "binaries/agent-studio-runtime"
+    ]
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYwNEU4RkQ5OEZCN0FGRApSV1Q5ZXZ1WS9lZ0VEd1VuVFpOYjU1OGJGd1NmMVhaWHJTSEdnNVRSSEcweUxWR05TN0h2WnloSwo=",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc2QkZFQUUwRDkwNzRCOUEKUldTYVN3Zlo0T3EvZGtVdlREaXBleVIxVnpTeUxMWlIwMUt6cG9nUEpmVG9rL2ZxZ3lqVW9PODkK",
       "endpoints": [
         "https://github.com/Binbin-miao/workbuddy-switch-binbinbin/releases/latest/download/latest.json",
         "https://github.com/Binbin-miao/workbuddy-switch-binbinbin/releases/latest/download/latest-{{target}}-{{arch}}.json",
