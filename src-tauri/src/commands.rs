@@ -708,6 +708,7 @@ pub async fn copy_sessions_cross(
 /// 同一档位内比较（与 `copy_sessions` 的档位约定一致）。与 `POST /api/session-links/preview` 同形。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn session_links_preview(
+    app: tauri::AppHandle,
     target_account_id: String,
     variant: Option<String>,
 ) -> Result<Value, String> {
@@ -720,7 +721,14 @@ pub async fn session_links_preview(
             .as_deref()
             .map(|raw| WbVariant::parse(Some(raw)))
             .unwrap_or_else(|| account::variant_of(&target));
-        session::session_links_preview(variant, &target)
+        // 逐组核对是真 IO，进度就是真进度；前端拿到分母才画确定态进度条。
+        let emit_progress = |done: usize, total: usize| {
+            let _ = app.emit(
+                "session-links-progress",
+                json!({ "done": done, "total": total }),
+            );
+        };
+        session::session_links_preview_with_progress(variant, &target, Some(&emit_progress))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -731,6 +739,7 @@ pub async fn session_links_preview(
 /// 与 `session_links_preview` 同形，多一个 `sourceAccountId`；成员内容按成员自身档位读取。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn session_links_preview_cross(
+    app: tauri::AppHandle,
     source_account_id: String,
     target_account_id: String,
 ) -> Result<Value, String> {
@@ -743,7 +752,13 @@ pub async fn session_links_preview_cross(
     tauri::async_runtime::spawn_blocking(move || {
         let source = account::find_account(&source_account_id).ok_or("源账号不存在")?;
         let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
-        session::session_links_preview_cross(&source, &target)
+        let emit_progress = |done: usize, total: usize| {
+            let _ = app.emit(
+                "session-links-progress",
+                json!({ "done": done, "total": total }),
+            );
+        };
+        session::session_links_preview_cross_with_progress(&source, &target, Some(&emit_progress))
     })
     .await
     .map_err(|e| e.to_string())?

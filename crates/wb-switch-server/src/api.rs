@@ -56,6 +56,9 @@ struct Assets;
 /// 切换进度缓存：webui 通过 GET /api/switch/progress 轮询。
 static SWITCH_PROGRESS: Mutex<Option<String>> = Mutex::new(None);
 static SWITCH_RUNNING: Mutex<bool> = Mutex::new(false);
+/// 关联会话预览进度：`(已核对组数, 待核对总组数)`。webui 通过
+/// GET /api/session-links/progress 轮询；`None` 表示当前没有在跑的预览。
+static LINKS_PREVIEW_PROGRESS: Mutex<Option<(usize, usize)>> = Mutex::new(None);
 
 pub fn router() -> Router {
     Router::new()
@@ -137,6 +140,10 @@ pub fn router() -> Router {
         .route(
             "/api/session-links/preview",
             post(api_session_links_preview),
+        )
+        .route(
+            "/api/session-links/progress",
+            get(api_session_links_progress),
         )
         .route(
             "/api/session-links/preview-cross",
@@ -1031,9 +1038,29 @@ async fn api_session_links_preview(Json(body): Json<Value>) -> Response {
         Some(raw) => WbVariant::parse(Some(raw)),
         None => account::variant_of(&target),
     };
-    match session::session_links_preview(variant, &target) {
+    // 预览逐组核对是真 IO：把进度写进轮询缓存，前端据此画确定态进度条。
+    // 无论成功失败都清空，避免前端把上一轮的残留值当成实时进度。
+    let report_progress = |done: usize, total: usize| {
+        *LINKS_PREVIEW_PROGRESS.lock().unwrap() = Some((done, total));
+    };
+    let result = session::session_links_preview_with_progress(
+        variant,
+        &target,
+        Some(&report_progress),
+    );
+    *LINKS_PREVIEW_PROGRESS.lock().unwrap() = None;
+    match result {
         Ok(report) => json_ok(report),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/session-links/progress —— 关联会话预览的逐组进度（webui 轮询用）。
+async fn api_session_links_progress() -> Response {
+    let progress = *LINKS_PREVIEW_PROGRESS.lock().unwrap();
+    match progress {
+        Some((done, total)) => json_ok(json!({ "running": true, "done": done, "total": total })),
+        None => json_ok(json!({ "running": false, "done": 0, "total": 0 })),
     }
 }
 
@@ -1061,7 +1088,13 @@ async fn api_session_links_preview_cross(Json(body): Json<Value>) -> Response {
     let Some(target) = account::find_account(&target_account_id) else {
         return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
     };
-    match session::session_links_preview_cross(&source, &target) {
+    let report_progress = |done: usize, total: usize| {
+        *LINKS_PREVIEW_PROGRESS.lock().unwrap() = Some((done, total));
+    };
+    let result =
+        session::session_links_preview_cross_with_progress(&source, &target, Some(&report_progress));
+    *LINKS_PREVIEW_PROGRESS.lock().unwrap() = None;
+    match result {
         Ok(report) => json_ok(report),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }

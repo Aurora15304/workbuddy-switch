@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useState } from "react";
 import { Link2, RotateCw } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
 
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -54,6 +55,8 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [preview, setPreview] = useState<SessionLinksPreview | null>(null);
+  /** 预览逐组进度；`total` 由后端给，没有分母就不画进度条（不猜百分比）。 */
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   /** 用户逐项勾选状态；仅在可勾选项上生效。 */
   const [checked, setChecked] = useState<Set<string>>(new Set());
   /** 手动重试计数：用于「重新检查」。 */
@@ -69,6 +72,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
     setLoading(true);
     setError("");
     setPreview(null);
+    setProgress(null);
     setChecked(new Set());
     onChange({ selections: [], groups: [] });
     api
@@ -119,6 +123,36 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
     // onMetaChange 只做状态回写，不进依赖。
   }, [unsupported, groups.length, error, preview?.storeStatus, preview?.storeError]);
 
+  // 预览进度：桌面端订阅后端事件，webui 轮询。只在预览未落定时挂载，避免空转。
+  // 分母（待核对组数）由后端给，前端不按时间估算百分比。
+  useEffect(() => {
+    if (!open || preview || error) return;
+    if (api.isWebui()) {
+      const timer = setInterval(() => {
+        void api
+          .sessionLinksProgress()
+          .then((state) => {
+            if (state.running && state.total > 0) {
+              setProgress({ done: state.done, total: state.total });
+            }
+          })
+          .catch(() => {
+            /* 进度是尽力而为：拿不到就退回骨架，不影响预览本身 */
+          });
+      }, 400);
+      return () => clearInterval(timer);
+    }
+    let unlisten: (() => void) | undefined;
+    void listen<{ done: number; total: number }>("session-links-progress", (event) => {
+      setProgress(event.payload);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [open, preview, error]);
+
   const syncable = groups.filter(isDirectlySyncable);
   const selectedCount = groups.filter((group) => isActionable(group) && checked.has(group.groupId)).length;
   const selectedSyncableCount = syncable.filter((group) => checked.has(group.groupId)).length;
@@ -160,7 +194,31 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
         </div>
       </div>
 
-      {pending && <LinksSkeleton />}
+      {pending && (
+        <div className="space-y-2">
+          {progress && progress.total > 0 && (
+            <div className="space-y-1">
+              <div
+                className="h-1 overflow-hidden rounded-full bg-muted"
+                role="progressbar"
+                aria-label="正在核对关联会话"
+                aria-valuemin={0}
+                aria-valuemax={progress.total}
+                aria-valuenow={progress.done}
+              >
+                <div
+                  className="h-full rounded-full bg-primary transition-[width] duration-150 ease-out"
+                  style={{ width: `${Math.round((progress.done / progress.total) * 100)}%` }}
+                />
+              </div>
+              <p className="text-[11px] tabular-nums text-muted-foreground">
+                正在核对会话 {progress.done}/{progress.total}
+              </p>
+            </div>
+          )}
+          <LinksSkeleton />
+        </div>
+      )}
 
       {!pending && (error || storeUnavailable) && (
         <div

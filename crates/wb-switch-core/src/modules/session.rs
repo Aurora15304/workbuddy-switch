@@ -2053,10 +2053,39 @@ pub fn session_links_preview(variant: WbVariant, target_acc: &Value) -> Result<V
     session_links_preview_at(&SessionPaths::for_variant(variant), variant, target_acc)
 }
 
+/// 预览进度上报：`(已核对组数, 待核对总组数)`。
+///
+/// 组数是预览里唯一真实的分母——逐组核对正文摘要与判定结果，没有可预估的
+/// 字节数或百分比。调用方只能据此画进度，不得自行推算。
+pub type PreviewProgressFn<'a> = &'a dyn Fn(usize, usize);
+
+/// 与 [`session_links_preview`] 同形，额外逐组回报进度（桌面端据此画进度条）。
+pub fn session_links_preview_with_progress(
+    variant: WbVariant,
+    target_acc: &Value,
+    progress: Option<PreviewProgressFn<'_>>,
+) -> Result<Value, String> {
+    session_links_preview_at_with_progress(
+        &SessionPaths::for_variant(variant),
+        variant,
+        target_acc,
+        progress,
+    )
+}
+
 fn session_links_preview_at(
     paths: &SessionPaths,
     variant: WbVariant,
     target_acc: &Value,
+) -> Result<Value, String> {
+    session_links_preview_at_with_progress(paths, variant, target_acc, None)
+}
+
+fn session_links_preview_at_with_progress(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    target_acc: &Value,
+    progress: Option<PreviewProgressFn<'_>>,
 ) -> Result<Value, String> {
     let target_uid = account_uid(target_acc);
     if target_uid.is_empty() {
@@ -2088,7 +2117,7 @@ fn session_links_preview_at(
         }
         StoreState::Ready(store) => {
             report["storeStatus"] = json!("ready");
-            let groups: Vec<Value> = store
+            let candidates: Vec<&LinkGroup> = store
                 .groups
                 .iter()
                 .filter(|group| {
@@ -2096,12 +2125,15 @@ fn session_links_preview_at(
                         && has_member_for(group, &source_uid)
                         && has_member_for(group, &target_uid)
                 })
-                .map(|group| {
-                    let fixed_paths = |_: &LinkGroup, _: &LinkMember| paths.clone();
-                    preview_group_item(paths, &fixed_paths, group, &source_uid, &target_uid)
-                })
                 .collect();
-            report["groups"] = json!(groups);
+            report["groups"] = json!(preview_groups_with_progress(
+                paths,
+                &|_: &LinkGroup, _: &LinkMember| paths.clone(),
+                &candidates,
+                &source_uid,
+                &target_uid,
+                progress,
+            ));
         }
     }
     Ok(report)
@@ -2129,6 +2161,26 @@ pub fn session_links_preview_cross(
     )
 }
 
+/// 与 [`session_links_preview_cross`] 同形，额外逐组回报进度。
+pub fn session_links_preview_cross_with_progress(
+    source_acc: &Value,
+    target_acc: &Value,
+    progress: Option<PreviewProgressFn<'_>>,
+) -> Result<Value, String> {
+    let source_variant = account::variant_of(source_acc);
+    let target_variant = account::variant_of(target_acc);
+    session_links_preview_cross_at_with_progress(
+        &SessionPaths::for_variant(source_variant),
+        source_variant,
+        source_acc,
+        &SessionPaths::for_variant(target_variant),
+        target_variant,
+        target_acc,
+        SessionPaths::for_variant,
+        progress,
+    )
+}
+
 /// [`session_links_preview_cross`] 的可注入版本（单测注入临时双档目录与解析器）。
 fn session_links_preview_cross_at(
     source_paths: &SessionPaths,
@@ -2138,6 +2190,28 @@ fn session_links_preview_cross_at(
     target_variant: WbVariant,
     target_acc: &Value,
     resolve_source_paths: impl Fn(WbVariant) -> SessionPaths,
+) -> Result<Value, String> {
+    session_links_preview_cross_at_with_progress(
+        source_paths,
+        source_variant,
+        source_acc,
+        target_paths,
+        target_variant,
+        target_acc,
+        resolve_source_paths,
+        None,
+    )
+}
+
+fn session_links_preview_cross_at_with_progress(
+    source_paths: &SessionPaths,
+    source_variant: WbVariant,
+    source_acc: &Value,
+    target_paths: &SessionPaths,
+    target_variant: WbVariant,
+    target_acc: &Value,
+    resolve_source_paths: impl Fn(WbVariant) -> SessionPaths,
+    progress: Option<PreviewProgressFn<'_>>,
 ) -> Result<Value, String> {
     let source_uid = account_uid(source_acc);
     if source_uid.is_empty() {
@@ -2197,20 +2271,56 @@ fn session_links_preview_cross_at(
                     resolve_source_paths(variant)
                 }
             };
-            let groups: Vec<Value> = store
+            let candidates: Vec<&LinkGroup> = store
                 .groups
                 .iter()
                 .filter(|group| {
                     has_member_for(group, &source_uid) && has_member_for(group, &target_uid)
                 })
-                .map(|group| {
-                    preview_group_item(target_paths, &member_paths, group, &source_uid, &target_uid)
-                })
                 .collect();
-            report["groups"] = json!(groups);
+            report["groups"] = json!(preview_groups_with_progress(
+                target_paths,
+                &member_paths,
+                &candidates,
+                &source_uid,
+                &target_uid,
+                progress,
+            ));
         }
     }
     Ok(report)
+}
+
+/// 逐组生成预览项，并把「已核对组数 / 待核对总组数」回报给调用方。
+///
+/// 每一组都要真实读正文摘要并跑一次判定，所以这里的进度是真进度，不是定时器
+/// 装的。先报 `(0, total)`，前端拿到分母就能画确定态进度条。
+fn preview_groups_with_progress(
+    store_paths: &SessionPaths,
+    member_paths: &dyn Fn(&LinkGroup, &LinkMember) -> SessionPaths,
+    groups: &[&LinkGroup],
+    source_uid: &str,
+    target_uid: &str,
+    progress: Option<PreviewProgressFn<'_>>,
+) -> Vec<Value> {
+    let total = groups.len();
+    if let Some(report) = progress {
+        report(0, total);
+    }
+    let mut items = Vec::with_capacity(total);
+    for (index, group) in groups.iter().enumerate() {
+        items.push(preview_group_item(
+            store_paths,
+            member_paths,
+            group,
+            source_uid,
+            target_uid,
+        ));
+        if let Some(report) = progress {
+            report(index + 1, total);
+        }
+    }
+    items
 }
 
 /// 单个关联组的预览项。
@@ -8572,6 +8682,32 @@ mod tests {
             .unwrap()
             .last_synced_at
             .is_some());
+    }
+
+    /// 进度必须是真进度：首帧给出分母，每组核对完 +1，末帧必须报满。
+    ///
+    /// 这条锁的是「分母来自真实待核对组数」——前端据此画确定态进度条，
+    /// 一旦有人把总组数写成估算值或提前报满，这里会红。
+    #[test]
+    fn preview_reports_progress_for_every_group() {
+        let env = ready_env("preview-progress");
+        fast_forward_scene(&env);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let report = session_links_preview_at_with_progress(
+            &env.paths(),
+            WbVariant::Cn,
+            &env.target("uid-b"),
+            Some(&|done: usize, total: usize| {
+                seen.borrow_mut().push((done, total))
+            }),
+        )
+        .unwrap();
+        let total = report["groups"].as_array().unwrap().len();
+        assert!(total > 0, "夹具应至少产生一组：{report}");
+        let calls = seen.into_inner();
+        assert_eq!(calls.first(), Some(&(0, total)), "首帧必须给出分母");
+        assert_eq!(calls.last(), Some(&(total, total)), "末帧必须报满");
+        assert_eq!(calls.len(), total + 1, "每组一次，外加首帧");
     }
 
     fn member_id_of(group: &LinkGroup, uid: &str) -> String {

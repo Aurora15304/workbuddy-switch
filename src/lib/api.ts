@@ -152,6 +152,7 @@ const ROUTES: Record<string, Route> = {
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },
   copy_sessions_cross: { method: "POST", path: "/api/sessions/copy-cross" },
   session_links_preview: { method: "POST", path: "/api/session-links/preview" },
+  session_links_progress: { method: "GET", path: "/api/session-links/progress" },
   session_links_preview_cross: { method: "POST", path: "/api/session-links/preview-cross" },
   session_sync_cross: { method: "POST", path: "/api/session-sync/cross" },
   list_session_groups: { method: "POST", path: "/api/session-groups/list" },
@@ -619,6 +620,20 @@ export function sessionLinksPreview(
   const args: Record<string, unknown> = { targetAccountId };
   if (variant === "ai") args.variant = variant;
   return call("session_links_preview", args);
+}
+
+/**
+ * 关联会话预览的逐组进度（webui 轮询用；桌面端由 `session-links-progress` 事件推送）。
+ *
+ * `total` 是本次预览待核对的组数，`done` 是已核对组数——这是唯一真实的分母，
+ * 前端不得按时间或其他估算伪造百分比。
+ */
+export function sessionLinksProgress(): Promise<{
+  running: boolean;
+  done: number;
+  total: number;
+}> {
+  return call("session_links_progress");
 }
 
 /**
