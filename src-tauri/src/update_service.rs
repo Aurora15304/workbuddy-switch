@@ -23,6 +23,7 @@ use tauri_plugin_updater::UpdaterExt;
 
 use wb_switch_core::modules::config::now_secs;
 use wb_switch_core::modules::update;
+use wb_switch_core::modules::update_download;
 
 /// 后台首次检查延迟：启动 15 秒后（替代前端 30 分钟轮询的首屏延迟）。
 pub const FIRST_CHECK_DELAY: Duration = Duration::from_secs(15);
@@ -437,10 +438,11 @@ pub fn spawn_periodic_check(app: AppHandle) {
 async fn download_package<R: Runtime>(
     app: &AppHandle<R>,
 ) -> Result<Option<DownloadedPackage>, String> {
+    let proxy = configured_proxy();
     let builder = app.updater_builder();
-    let builder = match configured_proxy() {
+    let builder = match proxy.as_deref() {
         Some(proxy) => builder.proxy(
-            tauri::Url::parse(&proxy).map_err(|error| format!("更新代理地址无效：{error}"))?,
+            tauri::Url::parse(proxy).map_err(|error| format!("更新代理地址无效：{error}"))?,
         ),
         None => builder,
     };
@@ -456,24 +458,92 @@ async fn download_package<R: Runtime>(
     };
 
     let version = update.version.clone();
+    let pubkey = updater_pubkey(app)?;
     set_phase(app, begin_download(&version));
-    let progress_app = app.clone();
-    let mut downloaded: u64 = 0;
-    let bytes = update
-        .download(
-            move |chunk_length, total| {
-                downloaded = downloaded.saturating_add(chunk_length as u64);
-                on_download_chunk(&progress_app, downloaded, total);
-            },
-            || {},
-        )
-        .await
-        .map_err(|error| format!("下载更新包失败：{error}"))?;
+
+    let progress: update_download::Progress = {
+        let app = app.clone();
+        std::sync::Arc::new(move |downloaded, total| {
+            on_download_chunk(&app, downloaded, total)
+        })
+    };
+    let bytes = download_verified(&update, proxy.as_deref(), &pubkey, &progress).await?;
     Ok(Some(DownloadedPackage {
         version,
         bytes,
         update,
     }))
+}
+
+/// 依次尝试「内置镜像 → GitHub 直连」，每个候选都验签，任一成功即返回。
+///
+/// 镜像只负责「把字节搬快」，可信度由 `verify_signature` 兜底：任何一个镜像返回
+/// 脏数据或半截文件都会在这里被拒，然后自动换下一个通道。
+async fn download_verified(
+    update: &tauri_plugin_updater::Update,
+    proxy: Option<&str>,
+    pubkey: &str,
+    progress: &update_download::Progress,
+) -> Result<Vec<u8>, String> {
+    let candidates = update_download::download_candidates(update.download_url.as_str());
+    let mut failures: Vec<String> = Vec::new();
+    for candidate in candidates {
+        let label = source_label(&candidate);
+        eprintln!("[更新] 下载尝试：{label}");
+        match update_download::fetch(&candidate, proxy, std::sync::Arc::clone(progress)).await {
+            Ok(bytes) => {
+                match update_download::verify_signature(&bytes, &update.signature, pubkey) {
+                    Ok(()) => {
+                        eprintln!("[更新] 下载完成并验签通过：{label}（{} 字节）", bytes.len());
+                        return Ok(bytes);
+                    }
+                    Err(error) => {
+                        eprintln!("[更新] {label} 验签失败：{error}");
+                        failures.push(format!("{label}：{error}"));
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("[更新] {label} 下载失败：{error}");
+                failures.push(format!("{label}：{error}"));
+            }
+        }
+    }
+    Err(format!("所有下载通道都失败了（{}）", failures.join("；")))
+}
+
+/// 下载通道的人类可读标签，用于日志与失败文案。
+fn source_label(url: &str) -> String {
+    let host = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .filter(|host| !host.is_empty())
+        .unwrap_or(url);
+    let is_mirror = update_download::MIRROR_PREFIXES
+        .iter()
+        .any(|prefix| url.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/')));
+    if is_mirror {
+        format!("镜像 {host}")
+    } else {
+        "GitHub 直连".to_string()
+    }
+}
+
+/// 读取 `tauri.conf.json → plugins.updater.pubkey`，与插件共用同一份配置。
+///
+/// 自己下载意味着要自己验签，公钥绝不能在这里写死第二份。
+fn updater_pubkey<R: Runtime>(app: &AppHandle<R>) -> Result<String, String> {
+    app.config()
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|value| value.get("pubkey"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "缺少更新公钥配置（tauri.conf.json → plugins.updater.pubkey）".to_string())
 }
 
 /// 单个下载分包的回调：tooltip 实时更新；快照与事件按整数百分比；菜单跨 10% 才重建。

@@ -11,7 +11,9 @@ serde_json = "1"
 # `default-features = false` 会把它一并关掉，导致只认进程环境变量（GUI 启动时为空），
 # 开了系统代理的用户也会直连失败。显式 `.proxy(..)` 仍优先（reqwest 会自动置
 # auto_sys_proxy=false），所以「设置页填的代理」语义不变。
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy", "stream"] }
+# 更新包验签与 tauri-plugin-updater 同一套算法（minisign），版本对齐插件依赖，不引入新树。
+minisign-verify = "0.2"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"

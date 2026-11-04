@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use crate::modules::config::{
     atomic_write, http_request_raw, http_request_with_proxy, now_secs, store_dir,
 };
+use crate::modules::update_download::{mirror_url, MIRROR_PREFIXES};
 
 /// 应用当前版本（来自 Cargo.toml package.version）。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -131,21 +132,33 @@ pub fn compare_versions(a: &str, b: &str) -> i64 {
 /// 1. 合并后的 `latest.json`（含各平台）；
 /// 2. 当前系统的 `latest-<os>-<arch>.json`；
 /// 3. 兼容旧 Windows 安装包：它们仍请求 `latest-macos-<arch>.json`。
+///
+/// 每个地址都先走内置镜像、再走直连：manifest 只有 1 KB 出头，但 github.com 被墙时
+/// 直连会直接失败，用户连「有新版本」都发现不了。镜像报错就换下一个，不会卡住。
 pub fn updater_manifest_urls(owner: &str, repo: &str, os: &str, arch: &str) -> Vec<String> {
     let os_slug = match os {
         "macos" | "darwin" => "macos",
         other => other,
     };
-    let mut urls = vec![format!(
+    let mut github_urls = vec![format!(
         "https://github.com/{owner}/{repo}/releases/latest/download/latest.json"
     )];
-    urls.push(format!(
+    github_urls.push(format!(
         "https://github.com/{owner}/{repo}/releases/latest/download/latest-{os_slug}-{arch}.json"
     ));
     if os_slug != "macos" {
-        urls.push(format!(
+        github_urls.push(format!(
             "https://github.com/{owner}/{repo}/releases/latest/download/latest-macos-{arch}.json"
         ));
+    }
+    github_urls.dedup();
+
+    let mut urls = Vec::with_capacity(github_urls.len() * (MIRROR_PREFIXES.len() + 1));
+    for url in &github_urls {
+        for prefix in MIRROR_PREFIXES {
+            urls.push(mirror_url(url, prefix));
+        }
+        urls.push(url.clone());
     }
     urls.dedup();
     urls
@@ -397,36 +410,47 @@ mod tests {
 
     #[test]
     fn updater_manifest_urls_macos_skips_duplicate_fallback() {
-        let urls = updater_manifest_urls(
-            "Binbin-miao",
-            "workbuddy-switch-binbinbin",
-            "macos",
-            "aarch64",
+        let urls = updater_manifest_urls("Binbin-miao", "workbuddy-switch-binbinbin", "macos", "aarch64");
+        // 两个 github 地址（latest.json + latest-macos-aarch64.json），各自 2 镜像 + 1 直连。
+        assert_eq!(urls.len(), 6);
+        assert_eq!(
+            urls.iter().filter(|url| url.ends_with("/latest.json")).count(),
+            3
         );
         assert_eq!(
-            urls,
-            vec![
-                "https://github.com/Binbin-miao/workbuddy-switch-binbinbin/releases/latest/download/latest.json",
-                "https://github.com/Binbin-miao/workbuddy-switch-binbinbin/releases/latest/download/latest-macos-aarch64.json",
-            ]
+            urls.iter()
+                .filter(|url| url.ends_with("/latest-macos-aarch64.json"))
+                .count(),
+            3
+        );
+        // 直连必须排在镜像之后，且是最后一个候选。
+        assert_eq!(
+            urls.last().map(String::as_str),
+            Some("https://github.com/Binbin-miao/workbuddy-switch-binbinbin/releases/latest/download/latest-macos-aarch64.json")
         );
     }
 
     #[test]
     fn updater_manifest_urls_windows_keeps_macos_compat() {
-        let urls = updater_manifest_urls(
-            "Binbin-miao",
-            "workbuddy-switch-binbinbin",
-            "windows",
-            "x86_64",
+        let urls = updater_manifest_urls("Binbin-miao", "workbuddy-switch-binbinbin", "windows", "x86_64");
+        // 三个 github 地址（latest / windows / macos 兼容），各自 2 镜像 + 1 直连。
+        assert_eq!(urls.len(), 9);
+        assert_eq!(
+            urls.iter()
+                .filter(|url| url.ends_with("/latest-macos-x86_64.json"))
+                .count(),
+            3
         );
         assert_eq!(
-            urls,
-            vec![
-                "https://github.com/Binbin-miao/workbuddy-switch-binbinbin/releases/latest/download/latest.json",
-                "https://github.com/Binbin-miao/workbuddy-switch-binbinbin/releases/latest/download/latest-windows-x86_64.json",
-                "https://github.com/Binbin-miao/workbuddy-switch-binbinbin/releases/latest/download/latest-macos-x86_64.json",
-            ]
+            urls[0],
+            format!(
+                "{}/https://github.com/Binbin-miao/workbuddy-switch-binbinbin/releases/latest/download/latest.json",
+                MIRROR_PREFIXES[0]
+            )
+        );
+        assert_eq!(
+            urls[2],
+            "https://github.com/Binbin-miao/workbuddy-switch-binbinbin/releases/latest/download/latest.json"
         );
     }
 

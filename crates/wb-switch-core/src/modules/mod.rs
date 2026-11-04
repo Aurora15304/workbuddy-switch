@@ -41,6 +41,7 @@ pub mod task_center;
 pub mod token_stats;
 pub mod travel;
 pub mod update;
+pub mod update_download;
 pub mod variant;
 pub mod vscode_cn_inject;
 pub mod vscode_ext;
