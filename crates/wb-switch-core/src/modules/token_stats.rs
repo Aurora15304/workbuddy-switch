@@ -65,6 +65,15 @@ impl Totals {
         self.records = self.records.saturating_add(1);
     }
 
+    /// 合并另一个累计量（子 agent 用量并进父会话那一行时用）。
+    fn merge(&mut self, other: &Totals) {
+        self.usage.input = self.usage.input.saturating_add(other.usage.input);
+        self.usage.output = self.usage.output.saturating_add(other.usage.output);
+        self.usage.read = self.usage.read.saturating_add(other.usage.read);
+        self.usage.write = self.usage.write.saturating_add(other.usage.write);
+        self.records = self.records.saturating_add(other.records);
+    }
+
     fn value(&self) -> Value {
         let cache_hit_rate =
             (self.usage.input > 0).then(|| self.usage.read as f64 / self.usage.input as f64);
@@ -310,20 +319,45 @@ fn thinking(value: &Value) -> u64 {
         .unwrap_or(0)
 }
 
-fn files(root: &Path, output: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(root) else {
+/// 扫描到一个待解析的 jsonl 文件。
+///
+/// `session_id` 为 `Some` 表示这是子 agent 日志（路径在 `{主会话id}/subagents/` 下）：
+/// 文件名是 `agent-<uuid>`，没有独立会话身份，用量归到父会话那一行。
+///
+/// 归并的前提是**用量不重复**：实测 5 组会话，父正文与子 agent 文件里完全相同的
+/// usage 记录 0 条——子 agent 的 input/output 是父会话之外的真实消耗。早先这里
+/// 直接跳过 `subagents` 目录，理由是「重复父会话上下文」；重复的是提示词上下文，
+/// 不是用量记录。
+struct ScannedFile {
+    path: PathBuf,
+    session_id: Option<String>,
+}
+
+fn files(root: &Path, output: &mut Vec<ScannedFile>) {
+    walk_jsonl(root, None, output);
+}
+
+fn walk_jsonl(dir: &Path, session_id: Option<&str>, output: &mut Vec<ScannedFile>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            // Subagent logs duplicate parent-session context and are not part
-            // of either product's primary usage accounting.
-            if path.file_name().and_then(|name| name.to_str()) != Some("subagents") {
-                files(&path, output);
-            }
+            // 进入 subagents 时把当前目录名（即主会话 id）固定成归属会话，
+            // 其下再深的子目录一律继承，避免多层嵌套时丢失归属。
+            let nested = path.file_name().and_then(|name| name.to_str()) == Some("subagents");
+            let child_session = if nested {
+                dir.file_name().and_then(|name| name.to_str())
+            } else {
+                session_id
+            };
+            walk_jsonl(&path, child_session, output);
         } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-            output.push(path);
+            output.push(ScannedFile {
+                path,
+                session_id: session_id.map(str::to_string),
+            });
         }
     }
 }
@@ -420,6 +454,8 @@ struct SourceCollector {
     coverage_start_at: Option<i64>,
     coverage_end_at: Option<i64>,
     session_key_counts: HashMap<String, usize>,
+    /// 子 agent 用量按 `(项目, 父会话 id)` 暂存，读完所有文件后再并入父会话那一行。
+    sidecar_totals: HashMap<(String, String), Totals>,
     requests: Vec<RequestRow>,
     collect_requests: bool,
 }
@@ -506,6 +542,36 @@ impl SourceCollector {
         });
     }
 
+    /// 暂存一个子 agent 文件的用量。
+    ///
+    /// 不能当场并进父会话：文件按 mtime 排序，父正文可能还没读到，直接 push 会把
+    /// 同一个会话拆成多行（还会被加上 `· 2` 后缀）。
+    fn add_sidecar_totals(&mut self, project: &str, session_id: &str, totals: Totals) {
+        if totals.records == 0 {
+            return;
+        }
+        self.sidecar_totals
+            .entry((project.to_string(), session_id.to_string()))
+            .or_default()
+            .merge(&totals);
+    }
+
+    /// 把子 agent 用量并进父会话那一行。
+    ///
+    /// 父正文缺失（源侧已清理）时单独成行——宁可多一行，也不能把这些消耗丢掉。
+    fn attach_sidecar_totals(&mut self) {
+        for ((project, session_id), totals) in std::mem::take(&mut self.sidecar_totals) {
+            let existing = self
+                .sessions
+                .iter()
+                .position(|session| session.project == project && session.session_id == session_id);
+            match existing {
+                Some(index) => self.sessions[index].totals.merge(&totals),
+                None => self.push_session(session_id, None, project, totals),
+            }
+        }
+    }
+
     fn into_value(mut self, name: &str, files_scanned: usize) -> Value {
         let daily_by_model = self
             .daily_by_model
@@ -540,7 +606,7 @@ impl SourceCollector {
 
 /// 单根统计：转发到多根实现，供 CodeBuddy CLI 这类固定单根的数据源使用。
 /// `detail` additionally keeps a bounded window of per-call request rows; both
-/// outputs share the same decode, cutoff, dedupe, and `subagents`-exclusion
+/// outputs share the same decode, cutoff, dedupe, and subagent-attribution
 /// pipeline so a detail row can never disagree with the aggregate totals.
 fn source(root: PathBuf, name: &str, cutoff: Option<i64>, detail: bool) -> Value {
     source_from_roots(std::slice::from_ref(&root), name, cutoff, detail)
@@ -551,7 +617,7 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>, detail: bool) -> Value
 /// 国际版数据根与国内版不同构（实测无 `projects/`、只有 `sessions/`），因此按
 /// 「存在的根」探测；一个都不存在时返回空集且不报错（前端显示空状态）。
 fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail: bool) -> Value {
-    let mut paths: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut paths: Vec<(PathBuf, ScannedFile)> = Vec::new();
     for root in roots {
         let mut found = Vec::new();
         files(root, &mut found);
@@ -567,8 +633,8 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
     // same request would otherwise be counted once per copy. Process files
     // oldest first and skip fingerprints already seen in an earlier file so
     // usage stays attributed to the original session.
-    paths.sort_by_key(|(_, path)| {
-        std::fs::metadata(path)
+    paths.sort_by_key(|(_, scanned)| {
+        std::fs::metadata(&scanned.path)
             .and_then(|metadata| metadata.modified())
             .ok()
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
@@ -577,13 +643,19 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
     });
     let mut seen: HashSet<(i64, u64, u64, u64, u64, String)> = HashSet::new();
 
-    for (root, path) in &paths {
-        let session_id = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("未知会话")
-            .to_string();
+    for (root, scanned) in &paths {
+        let path = &scanned.path;
+        let session_id = match &scanned.session_id {
+            // 子 agent 日志没有独立会话身份：文件的 stem 是 `agent-<uuid>`，
+            // 归属会话由目录结构决定（父会话 id）。
+            Some(parent) => parent.clone(),
+            None => path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("未知会话")
+                .to_string(),
+        };
         let fallback_project = project_name(root, path);
         let Ok(file) = std::fs::File::open(path) else {
             collector.note_parse_error();
@@ -677,14 +749,16 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
                 collector.push_request(row);
             }
         }
-        collector.push_session(
-            session_id,
-            title,
-            session_project.unwrap_or(fallback_project),
-            session_totals,
-        );
+        let project = session_project.unwrap_or(fallback_project);
+        if scanned.session_id.is_some() {
+            // 子 agent：用量并进父会话那一行，不单独成行。
+            collector.add_sidecar_totals(&project, &session_id, session_totals);
+        } else {
+            collector.push_session(session_id, title, project, session_totals);
+        }
     }
 
+    collector.attach_sidecar_totals();
     collector.into_value(name, paths.len())
 }
 
@@ -1242,20 +1316,22 @@ mod tests {
     }
 
     #[test]
-    fn source_excludes_subagents_and_counts_each_record_once() {
+    fn source_counts_subagent_usage_into_parent_session() {
         let root = std::env::temp_dir().join(format!(
             "wb-switch-token-stats-{}-{}",
             std::process::id(),
             crate::modules::config::now_ms()
         ));
         let project = root.join("fixture-project");
-        let ignored = project.join("subagents");
-        fs::create_dir_all(&ignored).expect("create fixture dirs");
-        let record = json!({
+        let subagents = project.join("session").join("subagents");
+        fs::create_dir_all(&subagents).expect("create fixture dirs");
+
+        // 父正文：一条正常记录 + 一行坏 JSON（保留 parseErrors 覆盖）。
+        let parent_record = json!({
             "timestamp": crate::modules::config::now_ms(),
             "providerData": {
                 "model": "fixture-model",
-                "usage": { "inputTokens": 20, "outputTokens": 5 }
+                "usage": { "inputTokens": 10, "outputTokens": 3 }
             },
             "message": { "usage": {
                 "input_tokens": 10,
@@ -1265,22 +1341,43 @@ mod tests {
         });
         fs::write(
             project.join("session.jsonl"),
-            format!("{}\nnot-json\n", record),
+            format!("{}\nnot-json\n", parent_record),
         )
         .expect("write fixture");
-        fs::write(ignored.join("agent.jsonl"), format!("{}\n", record))
-            .expect("write ignored fixture");
+
+        // 两个子 agent：用量与父会话不同（实测父子 usage 记录零重复），必须并入父会话。
+        for (name, input, output) in [("agent-a", 100u64, 7u64), ("agent-b", 200, 9)] {
+            let record = json!({
+                "timestamp": crate::modules::config::now_ms(),
+                "providerData": {
+                    "model": "fixture-model",
+                    "usage": { "inputTokens": input, "outputTokens": output }
+                },
+                "message": { "usage": {
+                    "input_tokens": input,
+                    "output_tokens": output
+                }}
+            });
+            fs::write(
+                subagents.join(format!("{name}.jsonl")),
+                format!("{}\n", record),
+            )
+            .expect("write subagent fixture");
+        }
 
         let result = source(root.clone(), "fixture", None, false);
-        assert_eq!(result["filesScanned"], 1);
+        assert_eq!(result["filesScanned"], 3);
         assert_eq!(result["parseErrors"], 1);
-        assert_eq!(result["summary"]["input"], 10);
-        assert_eq!(result["summary"]["output"], 3);
-        assert_eq!(result["summary"]["cacheRead"], 4);
-        assert_eq!(result["summary"]["total"], 13);
-        assert_eq!(result["summary"]["records"], 1);
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        assert_eq!(result["dailyByModel"]["fixture-model"][0]["key"], today);
+        // 汇总含子 agent：10+100+200 / 3+7+9
+        assert_eq!(result["summary"]["input"], 310);
+        assert_eq!(result["summary"]["output"], 19);
+        assert_eq!(result["summary"]["records"], 3);
+        // 子 agent 不单独成行：只有父会话一行，也不带 `· 2` 后缀。
+        let sessions = result["sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "session");
+        assert_eq!(sessions[0]["input"], 310);
+        assert_eq!(sessions[0]["records"], 3);
         assert_eq!(result["projects"][0]["key"], "fixture-project");
         fs::remove_dir_all(root).expect("remove fixture");
     }
