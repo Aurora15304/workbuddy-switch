@@ -95,7 +95,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [syncSelections, setSyncSelections] = useState<SessionSyncSelection[]>([]);
   const [syncGroups, setSyncGroups] = useState<SessionLinkPreviewGroup[]>([]);
   /** 当前 tab：默认关联会话；该 tab 不可用时回落到复制会话。 */
-  const [tab, setTab] = useState<"links" | "copy">("links");
+  const [tab, setTab] = useState<"links" | "copy" | "sync">("links");
   /** 关联会话区块上报的状态：tab 徽标与常驻提示用。 */
   const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
   /** 工作记忆：把本机所有账号的 MEMORY.md 合并后分发回去（不给目标账号覆盖式写入）。 */
@@ -146,6 +146,10 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setLinksMeta(null);
     setMergeMemory(false);
     setMergeExperts(false);
+    // 人设每次打开都回到「同步 + 只补空白」：上次选的「全部换成同一份」不能
+    // 静默延续到下一次切号，否则会连续覆盖所有人设。
+    setSyncPersona(true);
+    setPersonaMode("safe");
     setTab("links");
     setLoadingSessions(true);
     void api.listSessions(variant)
@@ -489,17 +493,17 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const overwriteCount = syncSelections.filter((item) => item.mode === "overwrite").length;
   const linksAvailable = linksMeta?.available ?? true;
   /**
-   * 切号时顺带同步的资产（记忆 / 专家团）：摘要与勾选说明共用一处措辞，
+   * 切号时顺带同步的资产（记忆 / 人设 / 专家团）：摘要与勾选说明共用一处措辞，
    * 避免「只勾资产」时摘要还写「仅切换账号」。
    */
-  const assetLabel =
-    mergeExperts && mergeMemory
-      ? "专家团与工作记忆"
-      : mergeExperts
-        ? "专家团"
-        : mergeMemory
-          ? "工作记忆"
-          : null;
+  const assetParts = [
+    mergeMemory ? "工作记忆" : null,
+    syncPersona ? "人设" : null,
+    mergeExperts ? "专家团" : null,
+  ].filter((part): part is string => part !== null);
+  const assetLabel = assetParts.length > 0 ? assetParts.join("、") : null;
+  /** 「附加同步」tab 徽标：有多少项会真正执行。 */
+  const syncAssetCount = assetParts.length;
   const sessionSummary =
     copyCount > 0 && syncCount > 0
       ? `将复制 ${copyCount} 个、同步 ${syncCount} 个关联会话`
@@ -543,6 +547,89 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   useEffect(() => {
     if (!linksAvailable && tab === "links") setTab("copy");
   }, [linksAvailable, tab]);
+
+  /** 第三个 tab：跨账号同步（记忆 / 人设 / 专家团）。原来挤在底部，收纳到这里。 */
+  const syncTabContent = (
+    <div className="space-y-2.5">
+      <p className="text-xs text-muted-foreground">
+        这三项都是本地文件操作，与会话无关；勾选后会在写入登录态之前完成，覆盖前都会先备份。
+      </p>
+
+      <label className="flex cursor-pointer items-start gap-2 rounded-md border border-border px-3 py-2.5">
+        <Checkbox
+          checked={mergeMemory}
+          disabled={busy}
+          onCheckedChange={(value) => setMergeMemory(value === true)}
+          className="mt-0.5"
+        />
+        <div className="min-w-0 space-y-1">
+          <div className="text-sm font-medium">合并工作记忆</div>
+          <div className="text-xs text-muted-foreground">
+            把各账号的 MEMORY.md 合成一份，再写回每个账号；原文件先备份。
+          </div>
+        </div>
+      </label>
+
+      <div className="space-y-2 rounded-md border border-border px-3 py-2.5">
+        <label className="flex cursor-pointer items-start gap-2">
+          <Checkbox
+            checked={syncPersona}
+            disabled={busy}
+            onCheckedChange={(value) => setSyncPersona(value === true)}
+            className="mt-0.5"
+          />
+          <div className="min-w-0 space-y-1">
+            <div className="text-sm font-medium">同步人设</div>
+            <div className="text-xs text-muted-foreground">
+              把你设置的人设同步到其他账号（对应 SOUL / IDENTITY / USER 三个文件）。
+            </div>
+          </div>
+        </label>
+        {syncPersona && (
+          <RadioGroup
+            value={personaMode}
+            disabled={busy}
+            onValueChange={(value) => setPersonaMode(value as "safe" | "overwrite")}
+            className="ml-6 gap-2 border-l border-border pl-3"
+          >
+            <label className="flex cursor-pointer items-start gap-2">
+              <RadioGroupItem value="safe" className="mt-0.5" />
+              <div className="min-w-0 space-y-0.5">
+                <div className="text-xs font-medium">只补空白账号</div>
+                <div className="text-xs text-muted-foreground">
+                  哪个账号的人设还是系统自带的空白模板，就写入你这份；你自己改过的人设不动。
+                </div>
+              </div>
+            </label>
+            <label className="flex cursor-pointer items-start gap-2">
+              <RadioGroupItem value="overwrite" className="mt-0.5" />
+              <div className="min-w-0 space-y-0.5">
+                <div className="text-xs font-medium">全部换成同一份</div>
+                <div className="text-xs text-muted-foreground">
+                  所有账号统一成内容最全的那份；其他账号原有内容会先备份再覆盖。
+                </div>
+              </div>
+            </label>
+          </RadioGroup>
+        )}
+      </div>
+
+      <label className="flex cursor-pointer items-start gap-2 rounded-md border border-border px-3 py-2.5">
+        <Checkbox
+          checked={mergeExperts}
+          disabled={busy}
+          onCheckedChange={(value) => setMergeExperts(value === true)}
+          className="mt-0.5"
+        />
+        <div className="min-w-0 space-y-1">
+          <div className="text-sm font-medium">同步专家团</div>
+          <div className="text-xs text-muted-foreground">
+            把各账号添加过的专家团合并成一份，写到每个账号；只新增不删除，原有清单先备份。
+          </div>
+        </div>
+      </label>
+    </div>
+  );
 
   // 「复制会话」tab 内容：勾选即意图，提交结果由底部摘要兜底确认。
   const copyTabContent = (
@@ -672,23 +759,29 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
             </Alert>
           )}
 
-          {linksAvailable ? (
-            <Tabs
-              value={tab}
-              onValueChange={(value) => setTab(value as "links" | "copy")}
-              className="flex min-h-0 flex-col gap-3 overflow-hidden"
-            >
-              <TabsList className="h-auto w-full shrink-0 justify-start gap-5 rounded-none border-b border-border bg-transparent p-0">
+          <Tabs
+            value={tab}
+            onValueChange={(value) => setTab(value as "links" | "copy" | "sync")}
+            className="flex min-h-0 flex-col gap-3 overflow-hidden"
+          >
+            <TabsList className="h-auto w-full shrink-0 justify-start gap-5 rounded-none border-b border-border bg-transparent p-0">
+              {linksAvailable && (
                 <TabsTrigger value="links" className={TAB_TRIGGER_CLASS}>
                   关联会话
                   {tabCount(linksMeta?.groupCount ?? 0)}
                 </TabsTrigger>
-                <TabsTrigger value="copy" className={TAB_TRIGGER_CLASS}>
-                  复制会话
-                  {tabCount(copyCount)}
-                </TabsTrigger>
-              </TabsList>
-              {/* forceMount：切换 tab 不得卸载另一侧，否则关联勾选会被预览重拉重置。 */}
+              )}
+              <TabsTrigger value="copy" className={TAB_TRIGGER_CLASS}>
+                复制会话
+                {tabCount(copyCount)}
+              </TabsTrigger>
+              <TabsTrigger value="sync" className={TAB_TRIGGER_CLASS}>
+                附加同步
+                {tabCount(syncAssetCount)}
+              </TabsTrigger>
+            </TabsList>
+            {/* forceMount：切换 tab 不得卸载另一侧，否则关联勾选会被预览重拉重置。 */}
+            {linksAvailable && (
               <TabsContent
                 value="links"
                 forceMount
@@ -705,92 +798,23 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
                   onMetaChange={setLinksMeta}
                 />
               </TabsContent>
-              <TabsContent
-                value="copy"
-                forceMount
-                className="min-h-0 space-y-2 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
-              >
-                {copyTabContent}
-              </TabsContent>
-            </Tabs>
-          ) : (
-            <div className="min-h-0 space-y-2 overflow-y-auto">{copyTabContent}</div>
-          )}
-        </div>
-
-        <label className="flex shrink-0 cursor-pointer items-start gap-2 rounded-md border border-border px-3 py-2">
-          <Checkbox
-            checked={mergeMemory}
-            disabled={busy}
-            onCheckedChange={(value) => setMergeMemory(value === true)}
-            className="mt-0.5"
-          />
-          <div className="min-w-0 space-y-0.5">
-            <div className="text-sm font-medium">合并并分发工作记忆</div>
-            <div className="text-xs text-muted-foreground">
-              把本机所有账号的 MEMORY.md 合成一份写回每个账号（原文先备份）。人设请看下一项。
-            </div>
-          </div>
-        </label>
-
-        <div className="shrink-0 space-y-2 rounded-md border border-border px-3 py-2">
-          <label className="flex cursor-pointer items-start gap-2">
-            <Checkbox
-              checked={syncPersona}
-              disabled={busy}
-              onCheckedChange={(value) => setSyncPersona(value === true)}
-              className="mt-0.5"
-            />
-            <div className="min-w-0 space-y-0.5">
-              <div className="text-sm font-medium">同步人设到所有账号</div>
-              <div className="text-xs text-muted-foreground">
-                把最完整的一份 SOUL / IDENTITY / USER 写成每个账号的人设；覆盖前先备份。
-              </div>
-            </div>
-          </label>
-          {syncPersona && (
-            <RadioGroup
-              value={personaMode}
-              disabled={busy}
-              onValueChange={(value) => setPersonaMode(value as "safe" | "overwrite")}
-              className="ml-6 gap-1.5"
+            )}
+            <TabsContent
+              value="copy"
+              forceMount
+              className="min-h-0 space-y-2 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
             >
-              <label className="flex cursor-pointer items-start gap-2 text-xs">
-                <RadioGroupItem value="safe" className="mt-0.5" />
-                <span className="min-w-0">
-                  <span className="font-medium">只替换默认模板</span>
-                  <span className="text-muted-foreground">
-                    （安全）仍是客户端默认模板的账号才会被写，手改过的人设保留
-                  </span>
-                </span>
-              </label>
-              <label className="flex cursor-pointer items-start gap-2 text-xs">
-                <RadioGroupItem value="overwrite" className="mt-0.5" />
-                <span className="min-w-0">
-                  <span className="font-medium">以最完整一份为准</span>
-                  <span className="text-muted-foreground">
-                    （覆盖）所有账号统一成同一份，已有设定会被备份后覆盖
-                  </span>
-                </span>
-              </label>
-            </RadioGroup>
-          )}
+              {copyTabContent}
+            </TabsContent>
+            <TabsContent
+              value="sync"
+              forceMount
+              className="min-h-0 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
+            >
+              {syncTabContent}
+            </TabsContent>
+          </Tabs>
         </div>
-
-        <label className="flex shrink-0 cursor-pointer items-start gap-2 rounded-md border border-border px-3 py-2">
-          <Checkbox
-            checked={mergeExperts}
-            disabled={busy}
-            onCheckedChange={(value) => setMergeExperts(value === true)}
-            className="mt-0.5"
-          />
-          <div className="min-w-0 space-y-0.5">
-            <div className="text-sm font-medium">同步专家团到所有账号</div>
-            <div className="text-xs text-muted-foreground">
-              把本机各账号添加过的专家团合并成一份，同步给每个账号（只增不减，原有清单先备份）。
-            </div>
-          </div>
-        </label>
 
         <DialogFooter className="shrink-0 sm:justify-between">
           <div className="min-w-0 space-y-0.5">

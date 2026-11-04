@@ -55,3 +55,6 @@ npm/platform/*/bin/
 .grok/
 /.workbuddy/
 /AGENTS.md
+
+# 本地打包用的临时 tauri 配置（置空 beforeBuildCommand）
+tauri.build.tmp.json
