@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
-    export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
+    export_import, jetbrains, limits, memory, notifications, oauth, process, rate_limit_events,
     rate_limit_hook, refresh, rotate, session, session_groups, switch, token_stats, travel, update,
     variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
 };
@@ -59,6 +59,28 @@ static SWITCH_RUNNING: Mutex<bool> = Mutex::new(false);
 /// 关联会话预览进度：`(已核对组数, 待核对总组数)`。webui 通过
 /// GET /api/session-links/progress 轮询；`None` 表示当前没有在跑的预览。
 static LINKS_PREVIEW_PROGRESS: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+/// Token 统计扫描进度：`(已扫描文件数, 待扫描文件总数)`。webui 通过
+/// GET /api/token-stats/progress 轮询；`None` 表示当前没有在跑的扫描。
+static TOKEN_STATS_PROGRESS: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+/// 关联会话列表加载进度：`(已组装组数, 待组装总组数)`。webui 通过
+/// GET /api/session-groups/progress 轮询；`None` 表示当前没有在跑的加载。
+static SESSION_GROUPS_PROGRESS: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
+/// 进度槽的 RAII 复位。
+///
+/// handler 被 `.await` 期间取消（客户端断开、页面切走）时，写在 await 之后的
+/// `= None` 永远不会执行，static 会永久停在最后一帧，之后任何页面一进加载态
+/// 就显示上一次的陈旧进度。用 Drop 兜住这条路径。
+struct ProgressReset(&'static Mutex<Option<(usize, usize)>>);
+
+impl Drop for ProgressReset {
+    fn drop(&mut self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
 
 pub fn router() -> Router {
     Router::new()
@@ -151,6 +173,10 @@ pub fn router() -> Router {
         )
         .route("/api/session-sync/cross", post(api_session_sync_cross))
         .route("/api/session-groups/list", post(api_list_session_groups))
+        .route(
+            "/api/session-groups/progress",
+            get(api_session_groups_progress),
+        )
         .route("/api/session-groups/detail", post(api_get_session_group))
         .route(
             "/api/session-groups/preview",
@@ -185,6 +211,10 @@ pub fn router() -> Router {
         .route("/api/credits", post(api_credits))
         .route("/api/credits/stats", get(api_credit_statistics))
         .route("/api/token-stats", get(api_token_statistics))
+        .route(
+            "/api/token-stats/progress",
+            get(api_token_statistics_progress),
+        )
         .route("/api/rate-limits", get(api_rate_limits))
         .route(
             "/api/rate-limits/hook-status",
@@ -835,6 +865,12 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
         .get("mergeExperts")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // 人设同步独立于记忆合并：两个副作用差异很大，绑在一个开关上会误伤。
+    let sync_persona = body
+        .get("syncPersona")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let persona_mode = memory::PersonaMode::parse(body.get("personaMode").and_then(|v| v.as_str()));
     let copy_ids: Vec<String> = body
         .get("copySessionIds")
         .and_then(|v| v.as_array())
@@ -873,6 +909,8 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
             &sync_selections,
             merge_memory,
             merge_experts,
+            sync_persona,
+            persona_mode,
         )
     })
     .await;
@@ -1148,9 +1186,33 @@ async fn api_list_session_groups(Json(body): Json<Value>) -> Response {
         Ok(value) => value,
         Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
     };
-    match session_groups::list(client, scope) {
-        Ok(value) => json_ok(value),
-        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    // 组内是真磁盘遍历：放 blocking 线程，别占住 async worker，否则进度轮询排不上队。
+    let _reset = ProgressReset(&SESSION_GROUPS_PROGRESS);
+    let report_progress = |done: usize, total: usize| {
+        *SESSION_GROUPS_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((done, total));
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        session_groups::list_with_progress(client, scope, Some(&report_progress))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("读取会话组失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// GET /api/session-groups/progress —— 列表加载进度；无加载在跑时 running=false。
+async fn api_session_groups_progress() -> Response {
+    let progress = *SESSION_GROUPS_PROGRESS.lock().unwrap();
+    match progress {
+        Some((done, total)) => json_ok(json!({ "running": true, "done": done, "total": total })),
+        None => json_ok(json!({ "running": false, "done": 0, "total": 0 })),
     }
 }
 
@@ -1431,12 +1493,31 @@ async fn api_token_statistics(RawQuery(query): RawQuery) -> Response {
             .split('&')
             .find_map(|part| part.strip_prefix("days=")?.parse::<i64>().ok())
     });
-    match tokio::task::spawn_blocking(move || token_stats::get_statistics(days)).await {
+    let _reset = ProgressReset(&TOKEN_STATS_PROGRESS);
+    let report_progress = |done: usize, total: usize| {
+        *TOKEN_STATS_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((done, total));
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        token_stats::get_statistics_with_progress(days, Some(&report_progress))
+    })
+    .await;
+    match result {
         Ok(statistics) => json_ok(statistics),
         Err(error) => json_err(
             format!("扫描 Token 统计失败: {error}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
+    }
+}
+
+/// GET /api/token-stats/progress —— 扫描进度 `(done, total)`；无扫描在跑时 running=false。
+async fn api_token_statistics_progress() -> Response {
+    let progress = *TOKEN_STATS_PROGRESS.lock().unwrap();
+    match progress {
+        Some((done, total)) => json_ok(json!({ "running": true, "done": done, "total": total })),
+        None => json_ok(json!({ "running": false, "done": 0, "total": 0 })),
     }
 }
 

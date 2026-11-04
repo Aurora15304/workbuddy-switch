@@ -1,13 +1,17 @@
 [package]
 name = "wb-switch-core"
-version = "0.1.71"
+version = "0.1.72"
 edition = "2021"
 description = "wb-switch 核心逻辑（账号/切换/会话/签到/更新），不依赖 Tauri，可被桌面端与 HTTP server 复用"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# system-proxy：不显式配代理时跟随 Windows「Internet 选项」里的系统代理。
+# `default-features = false` 会把它一并关掉，导致只认进程环境变量（GUI 启动时为空），
+# 开了系统代理的用户也会直连失败。显式 `.proxy(..)` 仍优先（reqwest 会自动置
+# auto_sys_proxy=false），所以「设置页填的代理」语义不变。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"

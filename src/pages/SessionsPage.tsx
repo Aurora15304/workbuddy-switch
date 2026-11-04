@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, CheckCircle2, Ellipsis, Folder, Link2, Loader2, MessageCircle, Layers3, RefreshCw, SlidersHorizontal, Trash2 } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 
 import { CodeBuddyCnIdeMark, VscodeExtMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import { DemoAction } from "@/components/demo-action";
+import { ScanProgress } from "@/components/scan-progress";
 import { GroupDetailPanel } from "@/components/session-group-detail";
 import { SessionTreeList } from "@/components/session-tree";
 import { Button } from "@/components/ui/button";
@@ -39,6 +41,8 @@ export default function SessionsPage() {
   const [storeStatus, setStoreStatus] = useState<"missing" | "ready" | "unavailable">("missing");
   const [storeError, setStoreError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  /** 列表加载进度：分母是筛选后的真实组数；null 表示后端还没回报首帧。 */
+  const [loadProgress, setLoadProgress] = useState<{ done: number; total: number } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [detail, setDetail] = useState<SessionGroupDetail | null>(null);
@@ -129,6 +133,7 @@ export default function SessionsPage() {
     const key = `${client}:${scope ?? "all"}`;
     const requestId = ++listRequestId.current;
     setLoading(true);
+    setLoadProgress(null);
     setLoadError(null);
     setStoreError(null);
     try {
@@ -151,6 +156,7 @@ export default function SessionsPage() {
     const requestId = ++listRequestId.current;
     const key = listContextKey;
     setLoading(true);
+    setLoadProgress(null);
     setLoadError(null);
     setDetail(null);
     setSelectedGroupId(null);
@@ -171,6 +177,46 @@ export default function SessionsPage() {
     });
     return () => { live = false; };
   }, [client, scope, listContextKey]);
+
+  // 列表加载进度双通道：桌面端听 `session-groups-progress` 事件，webui 轮询
+  // `/api/session-groups/progress`。只在加载期间订阅，加载完立刻退订。
+  useEffect(() => {
+    if (!loading) return;
+    // 代际快照：切数据源时 listRequestId 会自增，旧扫描的帧一律丢弃，
+    // 否则「500 组的旧扫描」会盖掉「5 组的新扫描」的分母。
+    const generation = listRequestId.current;
+    if (api.isWebui()) {
+      const timer = setInterval(() => {
+        void api
+          .sessionGroupsProgress()
+          .then((state) => {
+            if (generation !== listRequestId.current) return;
+            if (state.running && state.total > 0) {
+              setLoadProgress({ done: state.done, total: state.total });
+            }
+          })
+          .catch(() => {});
+      }, 400);
+      return () => clearInterval(timer);
+    }
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ done: number; total: number }>("session-groups-progress", (event) => {
+      if (generation !== listRequestId.current) return;
+      setLoadProgress(event.payload);
+    }).then((fn) => {
+      // 事件还没订上就已切换数据源：立刻退订，别泄漏。
+      if (disposed) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [loading]);
 
   useEffect(() => {
     // 只有弹窗打开且已选中会话组才需要详情：关闭时同样进入这里，作废在途请求并停掉加载态，
@@ -551,7 +597,7 @@ export default function SessionsPage() {
           </div>
           {(storeStatus === "unavailable" || storeError) && <p role="status" className="mb-3 rounded-lg border border-amber-500/30 p-3 text-sm text-muted-foreground">{storeError ?? "关联组存储暂不可用，当前只展示可读取的数据。"}</p>}
           {loadError && <div role="alert" className="mb-3 rounded-lg border border-destructive/30 p-3 text-sm text-destructive">{loadError}<Button variant="outline" size="sm" className="ml-2" onClick={() => void reloadGroups()}>重试</Button></div>}
-          {loading ? <GroupSkeleton /> : filteredGroups.length === 0 ? <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed p-6 text-center"><Layers3 className="size-7 text-muted-foreground" /><h3 className="mt-3 text-sm font-medium">{groups.length === 0 ? "还没有关联会话组" : "没有符合条件的会话"}</h3><p className="mt-2 text-sm text-muted-foreground">{groups.length === 0 ? "从账号切换时复制会话后，关联组会显示在这里。" : "试试其它筛选条件。"}</p></div> : <div className={`grid min-w-0 gap-3 ${contentWidth >= 600 ? "grid-cols-2" : "grid-cols-1"}`}>{visibleGroups.map((group) => <SessionGroupCard key={group.key} group={group} selected={group.groupId === selectedGroupId} onSelect={() => openDetail(group.groupId)} onRequestDelete={() => setDeleteTarget(group)} />)}</div>}
+          {loading ? <GroupSkeleton progress={loadProgress} /> : filteredGroups.length === 0 ? <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed p-6 text-center"><Layers3 className="size-7 text-muted-foreground" /><h3 className="mt-3 text-sm font-medium">{groups.length === 0 ? "还没有关联会话组" : "没有符合条件的会话"}</h3><p className="mt-2 text-sm text-muted-foreground">{groups.length === 0 ? "从账号切换时复制会话后，关联组会显示在这里。" : "试试其它筛选条件。"}</p></div> : <div className={`grid min-w-0 gap-3 ${contentWidth >= 600 ? "grid-cols-2" : "grid-cols-1"}`}>{visibleGroups.map((group) => <SessionGroupCard key={group.key} group={group} selected={group.groupId === selectedGroupId} onSelect={() => openDetail(group.groupId)} onRequestDelete={() => setDeleteTarget(group)} />)}</div>}
           {!loading && filteredGroups.length > PAGINATION_HIDE_MAX && <div className="mt-6 flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground"><span>显示 {(currentPage - 1) * PAGE_SIZE + 1}–{Math.min(currentPage * PAGE_SIZE, filteredGroups.length)}，共 {filteredGroups.length} 个会话</span><nav aria-label="会话分页" className="flex flex-wrap items-center gap-1.5"><Button variant="outline" size="icon" className="size-8" aria-label="上一页" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}><ChevronLeft /></Button>{pages.map((value, index) => <span key={value} className="flex items-center gap-1.5">{index > 0 && value - pages[index - 1] > 1 && <span>…</span>}<Button variant={value === currentPage ? "default" : "outline"} className={`size-8 p-0 ${value === currentPage ? "bg-brand text-brand-foreground hover:bg-brand/90" : ""}`} aria-label={`第 ${value} 页`} aria-current={value === currentPage ? "page" : undefined} onClick={() => setPage(value)}>{value}</Button></span>)}<Button variant="outline" size="icon" className="size-8" aria-label="下一页" disabled={currentPage >= pageCount} onClick={() => setPage(currentPage + 1)}><ChevronRight /></Button></nav></div>}
         </section>
       </div>
@@ -905,9 +951,12 @@ function AddLinkedSessionDialog({ client, disabled, onDone, requestRestartConfir
   </Dialog>;
 }
 
-function GroupSkeleton() {
-  return <div className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2" aria-label="正在加载会话组">
-    {Array.from({ length: 4 }, (_, index) => <Card key={index} className="gap-3 rounded-xl py-3 shadow-none"><CardContent className="space-y-3 px-3"><Skeleton className="h-4 w-2/3" /><Skeleton className="h-3 w-1/2" /><Skeleton className="h-7 w-full" /></CardContent></Card>)}
+function GroupSkeleton({ progress }: { progress: { done: number; total: number } | null }) {
+  return <div className="space-y-3">
+    <ScanProgress done={progress?.done ?? 0} total={progress?.total ?? 0} label="正在读取会话" />
+    <div className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2" aria-label="正在加载会话组">
+      {Array.from({ length: 4 }, (_, index) => <Card key={index} className="gap-3 rounded-xl py-3 shadow-none"><CardContent className="space-y-3 px-3"><Skeleton className="h-4 w-2/3" /><Skeleton className="h-3 w-1/2" /><Skeleton className="h-7 w-full" /></CardContent></Card>)}
+    </div>
   </div>;
 }
 

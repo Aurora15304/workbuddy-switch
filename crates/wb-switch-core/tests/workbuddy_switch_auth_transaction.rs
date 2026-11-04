@@ -8,7 +8,8 @@ use std::sync::{
     Arc,
 };
 use wb_switch_core::modules::{
-    account, auth_file, auth_transaction as state_lock, config, refresh, switch, variant::WbVariant,
+    account, auth_file, auth_transaction as state_lock, config, memory, refresh, switch,
+    variant::WbVariant,
 };
 
 fn fixture(generation: &str) -> Value {
@@ -71,8 +72,18 @@ fn worker() {
             let callback: switch::ProgressFn = Box::new(move |_| {
                 count.fetch_add(1, Ordering::SeqCst);
             });
-            let result =
-                switch::switch_account(Some(&callback), "fixture", false, false, &[], &[], false, false);
+            let result = switch::switch_account(
+                Some(&callback),
+                "fixture",
+                false,
+                false,
+                &[],
+                &[],
+                false,
+                false,
+                false,
+                memory::PersonaMode::Safe,
+            );
             assert!(
                 matches!(result, Err(ref e) if e.starts_with(state_lock::BUSY_PREFIX)),
                 "{result:?}"
@@ -115,6 +126,8 @@ fn worker() {
                 &[],
                 false,
                 false,
+                false,
+                memory::PersonaMode::Safe,
             )
             .unwrap();
             assert_eq!(result["ok"], true);
@@ -132,7 +145,19 @@ fn worker() {
             );
             // A completed update before the next switch must be read afresh.
             account::upsert_account(&fixture("new")).unwrap();
-            switch::switch_account(None, "fixture", false, false, &[], &[], false, false).unwrap();
+            switch::switch_account(
+                None,
+                "fixture",
+                false,
+                false,
+                &[],
+                &[],
+                false,
+                false,
+                false,
+                memory::PersonaMode::Safe,
+            )
+            .unwrap();
             let exported = auth_file::read_auth_file(WbVariant::Cn).unwrap();
             assert_eq!(
                 exported["auth"]["accessToken"],
@@ -147,7 +172,16 @@ fn worker() {
             std::fs::create_dir_all(auth_path.parent().unwrap().parent().unwrap()).unwrap();
             std::fs::write(auth_path.parent().unwrap(), b"not a directory").unwrap();
             assert!(switch::switch_account(
-                None, "fixture", false, false, &[], &[], false, false
+                None,
+                "fixture",
+                false,
+                false,
+                &[],
+                &[],
+                false,
+                false,
+                false,
+                memory::PersonaMode::Safe,
             )
             .is_err());
             let guard = state_lock::try_auth().expect("Failed switch leaked auth lock");

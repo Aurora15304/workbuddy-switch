@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
   Dialog,
   DialogContent,
@@ -101,6 +102,10 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [mergeMemory, setMergeMemory] = useState(false);
   /** 专家团：把本机各账号已添加的专家团汇总成一份写回每个账号（只增不减）。 */
   const [mergeExperts, setMergeExperts] = useState(false);
+  /** 人设：把最完整的一份 SOUL / IDENTITY / USER 同步到所有账号（默认开）。 */
+  const [syncPersona, setSyncPersona] = useState(true);
+  /** 人设覆盖策略：默认只替换仍是客户端默认模板的目标，手改过的保留。 */
+  const [personaMode, setPersonaMode] = useState<"safe" | "overwrite">("safe");
 
   const variant = accountVariant(account);
   const accountId = account?.id;
@@ -202,6 +207,8 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         syncSelections: requestedSync ? syncSelections : undefined,
         mergeMemory: mergeMemory || undefined,
         mergeExperts: mergeExperts || undefined,
+        syncPersona: syncPersona || undefined,
+        personaMode: syncPersona ? personaMode : undefined,
       });
       const nickname = displayName(account);
       const parts: string[] = [];
@@ -354,6 +361,34 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       } else if (mergeExperts) {
         toast.warning("专家团未同步", {
           description: "没有收到同步结果：当前版本可能不支持该功能，账号已切换，但专家团没有改动。",
+        });
+      }
+      // 人设同步：与记忆合并是两条独立通道，必须单独提示——
+      // 「记忆合并成功但人设被跳过」正是上一版最容易让人误判的地方。
+      const personaReport = res.personaSync;
+      if (personaReport) {
+        if (personaReport.errors.length > 0) {
+          toast.error("人设没有全部同步", {
+            description: personaReport.errors
+              .map((item) => `${item.label}${item.file ? ` / ${item.file}` : ""}：${item.error}`)
+              .join("；"),
+          });
+        }
+        if (personaReport.written.length > 0) {
+          const modeLabel =
+            personaReport.mode === "overwrite" ? "以最完整一份为准覆盖" : "只替换默认模板";
+          toast.success(`人设已同步到 ${personaReport.written.length} 处`, {
+            description: `${modeLabel}；被覆盖的原文已备份为 <文件名>.bak-时间戳`,
+          });
+        } else if (personaReport.errors.length === 0 && personaReport.unchanged.length > 0) {
+          toast.info("人设无需更新", {
+            description:
+              "各账号已有自定义人设（安全模式不覆盖），或已是最完整的那一份。需要强制统一请选「以最完整一份为准」。",
+          });
+        }
+      } else if (syncPersona) {
+        toast.warning("人设未同步", {
+          description: "没有收到同步结果：当前版本可能不支持该功能，账号已切换，但人设没有改动。",
         });
       }
       // 临时备份残留：待清理说明重试入口；待恢复说明必须保留材料并给出下一步。
@@ -693,11 +728,54 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           <div className="min-w-0 space-y-0.5">
             <div className="text-sm font-medium">合并并分发工作记忆</div>
             <div className="text-xs text-muted-foreground">
-              把本机所有账号的 MEMORY.md 合成一份写回每个账号（原文先备份）；SOUL / IDENTITY /
-              USER 只补全缺失的账号，不覆盖已有设定。
+              把本机所有账号的 MEMORY.md 合成一份写回每个账号（原文先备份）。人设请看下一项。
             </div>
           </div>
         </label>
+
+        <div className="shrink-0 space-y-2 rounded-md border border-border px-3 py-2">
+          <label className="flex cursor-pointer items-start gap-2">
+            <Checkbox
+              checked={syncPersona}
+              disabled={busy}
+              onCheckedChange={(value) => setSyncPersona(value === true)}
+              className="mt-0.5"
+            />
+            <div className="min-w-0 space-y-0.5">
+              <div className="text-sm font-medium">同步人设到所有账号</div>
+              <div className="text-xs text-muted-foreground">
+                把最完整的一份 SOUL / IDENTITY / USER 写成每个账号的人设；覆盖前先备份。
+              </div>
+            </div>
+          </label>
+          {syncPersona && (
+            <RadioGroup
+              value={personaMode}
+              disabled={busy}
+              onValueChange={(value) => setPersonaMode(value as "safe" | "overwrite")}
+              className="ml-6 gap-1.5"
+            >
+              <label className="flex cursor-pointer items-start gap-2 text-xs">
+                <RadioGroupItem value="safe" className="mt-0.5" />
+                <span className="min-w-0">
+                  <span className="font-medium">只替换默认模板</span>
+                  <span className="text-muted-foreground">
+                    （安全）仍是客户端默认模板的账号才会被写，手改过的人设保留
+                  </span>
+                </span>
+              </label>
+              <label className="flex cursor-pointer items-start gap-2 text-xs">
+                <RadioGroupItem value="overwrite" className="mt-0.5" />
+                <span className="min-w-0">
+                  <span className="font-medium">以最完整一份为准</span>
+                  <span className="text-muted-foreground">
+                    （覆盖）所有账号统一成同一份，已有设定会被备份后覆盖
+                  </span>
+                </span>
+              </label>
+            </RadioGroup>
+          )}
+        </div>
 
         <label className="flex shrink-0 cursor-pointer items-start gap-2 rounded-md border border-border px-3 py-2">
           <Checkbox

@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ComponentProps, ReactNode } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   CircleAlert,
   ArrowDownToLine,
@@ -35,6 +36,7 @@ import {
   type ChartConfig,
 } from "@/components/ui/chart";
 import { DemoAction } from "@/components/demo-action";
+import { ScanProgress } from "@/components/scan-progress";
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import {
   Dialog,
@@ -1433,18 +1435,34 @@ function Dashboard({ source }: { source: TokenStatsSource }) {
   );
 }
 
-function TokenStatsLoadingSkeleton() {
+function TokenStatsLoadingSkeleton({
+  progress,
+}: {
+  progress: { done: number; total: number } | null;
+}) {
+  // 分母由后端枚举阶段算出；首帧到之前保持原来的静态文案，不闪 0/0。
+  const label =
+    progress && progress.total > 0
+      ? `正在扫描 ${progress.done}/${progress.total} 个会话文件…`
+      : "正在扫描本地会话日志…";
   return (
-    <div
-      className="min-w-0 space-y-12"
-      role="status"
-      aria-label="正在扫描本地会话日志…"
-    >
-      <span className="sr-only">正在扫描本地会话日志…</span>
-      <p className="flex items-center gap-2 text-sm text-muted-foreground" aria-hidden="true">
-        <span className="size-1.5 rounded-full bg-primary/70" />
-        正在扫描本地会话日志…
-      </p>
+    <div className="min-w-0 space-y-12" role="status" aria-label="正在扫描本地会话日志">
+      {/* live region 用固定文案：逐帧变化的数字会让屏幕阅读器连续播报几百次，
+          精确进度由下面进度条的 aria-valuenow 承载。 */}
+      <span className="sr-only">正在扫描本地会话日志</span>
+      <div className="space-y-2">
+        <p className="flex items-center gap-2 text-sm text-muted-foreground" aria-hidden="true">
+          <span className="size-1.5 rounded-full bg-primary/70" />
+          {label}
+        </p>
+        {progress && (
+          <ScanProgress
+            done={progress.done}
+            total={progress.total}
+            label="正在扫描会话文件"
+          />
+        )}
+      </div>
 
       <section className="min-w-0 space-y-2.5" aria-hidden="true">
         <Skeleton className="h-4 w-20" />
@@ -1552,26 +1570,70 @@ export default function TokenStatsPage() {
   const [error, setError] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
   const [detailOpen, setDetailOpen] = useState(false);
+  // 扫描进度：分母是后端枚举出的真实文件数；null 表示后端还没回报首帧。
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+  /** 请求代际：连续刷新时旧扫描的进度帧必须丢弃，否则分母会跳回上一轮。 */
+  const statsRequestId = useRef(0);
 
   useEffect(() => {
     let disposed = false;
+    const requestId = ++statsRequestId.current;
     setLoading(true);
     setError(null);
+    setProgress(null);
     api
       .getTokenStatistics()
       .then((result) => {
-        if (!disposed) setStats(result);
+        if (!disposed && statsRequestId.current === requestId) setStats(result);
       })
       .catch((cause) => {
-        if (!disposed) setError(api.asError(cause));
+        if (!disposed && statsRequestId.current === requestId) setError(api.asError(cause));
       })
       .finally(() => {
-        if (!disposed) setLoading(false);
+        if (!disposed && statsRequestId.current === requestId) setLoading(false);
       });
     return () => {
       disposed = true;
     };
   }, [reload]);
+
+  // 扫描进度双通道：桌面端听 `token-stats-progress` 事件，webui 轮询
+  // `/api/token-stats/progress`。只在扫描期间订阅，扫完立刻退订。
+  useEffect(() => {
+    if (!loading) return;
+    const generation = statsRequestId.current;
+    if (api.isWebui()) {
+      const timer = setInterval(() => {
+        void api
+          .tokenStatsProgress()
+          .then((state) => {
+            if (generation !== statsRequestId.current) return;
+            if (state.running && state.total > 0) {
+              setProgress({ done: state.done, total: state.total });
+            }
+          })
+          .catch(() => {});
+      }, 400);
+      return () => clearInterval(timer);
+    }
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ done: number; total: number }>("token-stats-progress", (event) => {
+      if (generation !== statsRequestId.current) return;
+      setProgress(event.payload);
+    }).then((fn) => {
+      // 事件还没订上就已卸载（切页/StrictMode 双跑）：立刻退订，别泄漏。
+      if (disposed) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [loading]);
 
   useEffect(() => {
     if (!stats || stats.sources.length === 0) return;
@@ -1632,6 +1694,16 @@ export default function TokenStatsPage() {
           </DemoAction>
         </div>
       </header>
+
+      {/* 刷新时骨架不出现（stats 已有值），进度条单独挂一行，否则看不到正在扫。 */}
+      {loading && stats && progress && (
+        <ScanProgress
+          className="mb-6"
+          done={progress.done}
+          total={progress.total}
+          label="正在重新扫描会话文件"
+        />
+      )}
 
       {/* 数据源 Tab 独占一行：数据源变多时不与右上角操作挤在同一排 */}
       {loading && !stats ? (
@@ -1696,7 +1768,7 @@ export default function TokenStatsPage() {
         </Alert>
       )}
 
-      {loading && !stats ? <TokenStatsLoadingSkeleton /> : source ? (
+      {loading && !stats ? <TokenStatsLoadingSkeleton progress={progress} /> : source ? (
         <Dashboard source={source} />
       ) : (
         !error && (

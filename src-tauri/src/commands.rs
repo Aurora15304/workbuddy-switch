@@ -10,7 +10,7 @@ use tauri::Emitter;
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, credit_usage, credits, error_log,
-    export_import, growth_tasks, jetbrains, limits, notifications, oauth, process,
+    export_import, growth_tasks, jetbrains, limits, memory, notifications, oauth, process,
     rate_limit_events, rate_limit_hook, refresh, rotate, session, session_groups, switch,
     task_center, token_stats, travel, update, variant::WbVariant, vscode_ext, vscode_session,
     vscode_session_sync,
@@ -581,6 +581,8 @@ pub async fn switch_account(
     sync_selections: Option<Value>,
     merge_memory: Option<bool>,
     merge_experts: Option<bool>,
+    sync_persona: Option<bool>,
+    persona_mode: Option<String>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
@@ -589,6 +591,8 @@ pub async fn switch_account(
     let share_sessions = share_sessions.unwrap_or(false);
     let merge_memory = merge_memory.unwrap_or(false);
     let merge_experts = merge_experts.unwrap_or(false);
+    let sync_persona = sync_persona.unwrap_or(false);
+    let persona_mode = memory::PersonaMode::parse(persona_mode.as_deref());
     let copy_ids = copy_session_ids.unwrap_or_default();
     // 入参形状由 core 校验（缺 groupId / previewToken / mode 一律拒绝）；这里只做透传，
     // 不在命令层做业务判定。
@@ -606,6 +610,8 @@ pub async fn switch_account(
             &sync_selections,
             merge_memory,
             merge_experts,
+            sync_persona,
+            persona_mode,
         )
     })
     .await
@@ -793,14 +799,24 @@ pub async fn session_sync_cross(
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn list_session_groups(
+    app: tauri::AppHandle,
     client: String,
     variant_scope: Option<String>,
 ) -> Result<Value, String> {
     let client = session_groups::SessionClient::parse(&client)?;
     let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
-    tauri::async_runtime::spawn_blocking(move || session_groups::list(client, scope))
-        .await
-        .map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        // 分母 = 筛选后的组数，前端拿到它就画确定态进度条。
+        let emit_progress = |done: usize, total: usize| {
+            let _ = app.emit(
+                "session-groups-progress",
+                json!({ "done": done, "total": total }),
+            );
+        };
+        session_groups::list_with_progress(client, scope, Some(&emit_progress))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1070,10 +1086,22 @@ pub async fn run_growth_auto(account_id: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn get_token_statistics(days: Option<i64>) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || token_stats::get_statistics(days))
-        .await
-        .map_err(|error| format!("扫描 Token 统计失败: {error}"))
+pub async fn get_token_statistics(
+    app: tauri::AppHandle,
+    days: Option<i64>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // 分母是枚举阶段数出来的真实文件数，前端拿到它就画确定态进度条。
+        let emit_progress = |done: usize, total: usize| {
+            let _ = app.emit(
+                "token-stats-progress",
+                json!({ "done": done, "total": total }),
+            );
+        };
+        token_stats::get_statistics_with_progress(days, Some(&emit_progress))
+    })
+    .await
+    .map_err(|error| format!("扫描 Token 统计失败: {error}"))
 }
 
 /// GET /api/rate-limits —— 模型限额台账（全部账号当前受限的模型与官方恢复时刻）。

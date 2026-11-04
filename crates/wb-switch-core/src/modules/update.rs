@@ -313,10 +313,79 @@ pub async fn update_check(proxy: Option<&str>, force: bool) -> Value {
             });
             value
         }
-        Err((msg, code)) => json!({
+        Err((msg, code)) => failure_value(proxy, &msg, code, &release_url),
+    }
+}
+
+/// 传输层失败的特征串（reqwest / rustls 的英文原文）。
+///
+/// 只认这些标记：404、清单解析失败、标签解析失败都是业务错误，必须原样透出，
+/// 否则会把「仓库没有发布」误报成「你断网了」。
+const TRANSPORT_MARKERS: [&str; 8] = [
+    "error sending request",
+    "connection refused",
+    "connection reset",
+    "failed to lookup address",
+    "dns error",
+    "tls handshake",
+    "timed out",
+    "网络请求失败",
+];
+
+fn is_transport_error(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    TRANSPORT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// 代理地址脱敏：只保留 `scheme://host:port`，丢掉 userinfo 与路径。
+///
+/// 这段文案会进 toast、托盘 tooltip 和更新弹窗——投屏或截图时会连带泄露
+/// 代理账号密码（`http://user:pass@host:port` 是合法配置）。
+fn mask_proxy(raw: &str) -> String {
+    let (scheme, rest) = match raw.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, raw),
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    match scheme {
+        Some(scheme) => format!("{scheme}://{host}"),
+        None => host.to_string(),
+    }
+}
+
+/// 把英文传输错误翻译成用户能照做的提示；业务错误返回 `None` 表示不改写。
+///
+/// `message` 走界面 toast 与托盘 tooltip，必须短；原始英文错误留在 `error`
+/// 字段，供日志与排障复制。
+fn transport_hint(proxy: Option<&str>, raw: &str) -> Option<String> {
+    if !is_transport_error(raw) {
+        return None;
+    }
+    Some(match proxy {
+        Some(proxy) => format!(
+            "连不上 GitHub：代理（{}）未生效。请确认代理已启动、端口正确，且规则放行了 github.com。",
+            mask_proxy(proxy)
+        ),
+        None => "连不上 GitHub（网络不通或被拦截）。如需代理，请到「设置 → 更新代理」填入地址（例如 http://127.0.0.1:7897）后重试。".to_string(),
+    })
+}
+
+/// 检查失败的结果对象。传输层错误换成可操作中文，其余保持「原文 + code」。
+fn failure_value(proxy: Option<&str>, raw: &str, code: i64, release_url: &str) -> Value {
+    match transport_hint(proxy, raw) {
+        Some(hint) => json!({
             "ok": false,
-            "error": msg,
-            "message": format!("{msg}（code={code}）"),
+            "error": raw,
+            "message": hint,
+            "releaseUrl": release_url,
+        }),
+        None => json!({
+            "ok": false,
+            "error": raw,
+            "message": format!("{raw}（code={code}）"),
             "releaseUrl": release_url,
         }),
     }
@@ -366,5 +435,64 @@ mod tests {
         assert_eq!(compare_versions("0.1.18", "0.1.18"), 0);
         assert_eq!(compare_versions("0.1.19", "0.1.18"), 1);
         assert_eq!(compare_versions("v0.1.17", "0.1.18"), -1);
+    }
+
+    /// 传输层错误要变成可操作中文：配了代理点名代理地址，没配就指向设置页；
+    /// 原始英文错误必须留在 `error` 里，否则排障时无从下手。
+    #[test]
+    fn transport_error_becomes_actionable_hint() {
+        let raw = "error sending request for url (https://github.com/o/r/releases/latest)";
+
+        let with_proxy = failure_value(Some("http://127.0.0.1:7897"), raw, -1, "https://r");
+        let message = with_proxy["message"].as_str().unwrap();
+        assert!(message.contains("http://127.0.0.1:7897"), "{message}");
+        assert!(message.contains("代理"), "{message}");
+        assert_eq!(with_proxy["error"].as_str(), Some(raw));
+
+        let without_proxy = failure_value(None, raw, -1, "https://r");
+        let message = without_proxy["message"].as_str().unwrap();
+        assert!(message.contains("更新代理"), "{message}");
+        assert!(
+            !message.contains("code=-1"),
+            "网络错误不该再把 code 抛给用户"
+        );
+    }
+
+    /// 代理账号密码不能进 UI 文案：这段文字会出现在 toast、托盘和截图里。
+    #[test]
+    fn proxy_credentials_never_reach_the_hint() {
+        assert_eq!(
+            mask_proxy("http://alice:s3cret@127.0.0.1:7897"),
+            "http://127.0.0.1:7897"
+        );
+        assert_eq!(mask_proxy("127.0.0.1:7897"), "127.0.0.1:7897");
+        assert_eq!(
+            mask_proxy("socks5://alice:s3cret@proxy.local:1080/"),
+            "socks5://proxy.local:1080"
+        );
+
+        let raw = "error sending request for url (https://github.com/o/r/releases/latest)";
+        let value = failure_value(
+            Some("http://alice:s3cret@127.0.0.1:7897"),
+            raw,
+            -1,
+            "https://r",
+        );
+        let message = value["message"].as_str().unwrap();
+        assert!(message.contains("127.0.0.1:7897"), "{message}");
+        assert!(!message.contains("s3cret"), "凭据泄露：{message}");
+        assert!(!message.contains("alice"), "用户名泄露：{message}");
+    }
+
+    /// 404 / 标签解析失败是业务错误，不能被改写成「你断网了」。
+    #[test]
+    fn business_error_keeps_original_text() {
+        let not_found = failure_value(None, "未找到可用的发布版本", 404, "https://r");
+        assert_eq!(
+            not_found["message"].as_str(),
+            Some("未找到可用的发布版本（code=404）")
+        );
+        assert!(transport_hint(None, "无法解析发布版本标签").is_none());
+        assert!(transport_hint(None, "更新清单解析失败").is_none());
     }
 }

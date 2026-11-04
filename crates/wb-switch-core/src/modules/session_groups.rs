@@ -106,8 +106,22 @@ struct MemberView {
     version_status: &'static str,
 }
 
+/// 列表加载进度回调：`(已组装组数, 待组装总组数)`。
+///
+/// 按组回报：组内的磁盘遍历是串行的，组才是真实进度单元，会话条数在组装前不可知。
+pub type GroupProgressFn<'a> = &'a dyn Fn(usize, usize);
+
 /// List lightweight searchable summaries. IDE must include its mandatory variant scope.
 pub fn list(client: SessionClient, scope: Option<WbVariant>) -> Result<Value, String> {
+    list_with_progress(client, scope, None)
+}
+
+/// 同 `list`，额外按组回报进度（桌面端 emit 事件 / webui 轮询缓存）。
+pub fn list_with_progress(
+    client: SessionClient,
+    scope: Option<WbVariant>,
+    progress: Option<GroupProgressFn<'_>>,
+) -> Result<Value, String> {
     client.validate_scope(scope)?;
     let paths = client.store_paths();
     let mut result = json!({
@@ -126,12 +140,27 @@ pub fn list(client: SessionClient, scope: Option<WbVariant>) -> Result<Value, St
             result["storeStatus"] = json!("ready");
             let accounts = account::load_accounts_at(&account::accounts_file_in(&paths.store_root));
             let mut cache = HashMap::new();
-            let groups = store
+            // 分母在组装前就确定：筛选后的组数，不是估算。
+            let scoped = store
                 .groups
                 .iter()
                 .filter(|group| group_is_in_scope(client, scope, group))
+                .collect::<Vec<_>>();
+            let total = scoped.len();
+            if let Some(progress) = progress {
+                progress(0, total);
+            }
+            let mut done = 0usize;
+            let groups = scoped
+                .into_iter()
                 .map(|group| {
-                    group_payload(client, scope, &paths, group, &accounts, &mut cache, false)
+                    let payload =
+                        group_payload(client, scope, &paths, group, &accounts, &mut cache, false);
+                    done += 1;
+                    if let Some(progress) = progress {
+                        progress(done, total);
+                    }
+                    payload
                 })
                 .collect::<Vec<_>>();
             result["groups"] = json!(groups);

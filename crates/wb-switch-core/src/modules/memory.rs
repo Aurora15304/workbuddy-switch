@@ -75,13 +75,16 @@ fn merge_and_distribute_at(root: &Path, accounts: &[(String, String)]) -> Value 
     }
 
     if sources.is_empty() {
+        // 记忆没什么可合并的，但人设照样按安全模式补一遍：
+        // 「新账号没有 MEMORY.md」不该顺手把人设同步一起掐掉。
+        let persona = distribute_persona(root, accounts, PersonaMode::Safe);
         return json!({
             "accounts": accounts.len(),
             "sources": [],
             "mergedChars": 0,
             "written": [],
             "unchanged": [],
-            "persona": { "written": [], "unchanged": [] },
+            "persona": persona,
             "errors": errors,
             "note": "本机账号都没有可合并的记忆内容，未做任何写入",
         });
@@ -90,7 +93,7 @@ fn merge_and_distribute_at(root: &Path, accounts: &[(String, String)]) -> Value 
     let merged = merge_documents(&sources);
     let (written, unchanged, write_errors) = distribute(root, accounts, &merged, &sources);
     errors.extend(write_errors);
-    let persona = distribute_persona(root, accounts);
+    let persona = distribute_persona(root, accounts, PersonaMode::Safe);
 
     json!({
         "accounts": accounts.len(),
@@ -360,38 +363,108 @@ fn distribute(
     (written, unchanged, errors)
 }
 
-/// 人格文件只取一份（字节数最大的那份视为最完整），且只在目标缺失时补写。
-fn distribute_persona(root: &Path, accounts: &[(String, String)]) -> Value {
+/// 人设同步模式：由用户在切号弹窗里二选一，两种语义互斥。
+///
+/// - `Safe`：只覆盖「仍是客户端默认模板」的目标文件，手改过的一律不动；
+/// - `Overwrite`：以所有账号里最完整的一份为准，内容不同的统一覆盖（先备份）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersonaMode {
+    Safe,
+    Overwrite,
+}
+
+impl PersonaMode {
+    /// 只有显式传 `"overwrite"` 才强制覆盖；缺省、拼错一律走安全模式。
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some("overwrite") => Self::Overwrite,
+            _ => Self::Safe,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::Overwrite => "overwrite",
+        }
+    }
+}
+
+/// 只同步人设，不碰 `MEMORY.md`。
+///
+/// 独立入口：人设同步不再依附「记忆合并」——记忆没什么可合并的时候，人设照样要能补。
+pub fn sync_persona(accounts: &[(String, String)], mode: PersonaMode) -> Value {
+    sync_persona_at(&wb_data_root(), accounts, mode)
+}
+
+fn sync_persona_at(root: &Path, accounts: &[(String, String)], mode: PersonaMode) -> Value {
+    let mut report = distribute_persona(root, accounts, mode);
+    report["mode"] = json!(mode.as_str());
+    report
+}
+
+/// 模板基准：根部 `~/.workbuddy/<file>` 是客户端首次生成的原始模板。
+///
+/// 读它而不是硬编码大小或 md5——客户端升级换了模板，这里的判定自动跟着变。
+/// 根部文件缺失时返回 `None`，安全模式退化为「只在目标缺失时补写」。
+fn template_baseline(root: &Path, file: &str) -> Option<String> {
+    std::fs::read_to_string(root.join(file))
+        .ok()
+        .map(|text| text.replace("\r\n", "\n"))
+}
+
+/// 人格文件只取一份（字节数最大的那份视为最完整），按 `mode` 决定写不写。
+fn distribute_persona(root: &Path, accounts: &[(String, String)], mode: PersonaMode) -> Value {
     let mut written: Vec<Value> = Vec::new();
     let mut unchanged: Vec<Value> = Vec::new();
     let mut errors: Vec<Value> = Vec::new();
 
     for file in PERSONA_FILES {
-        let mut best: Option<(usize, String)> = None;
-        for (uid, _) in accounts {
+        let baseline = template_baseline(root, file);
+        // 模板副本不算人设：否则全新机器会把 A 的默认模板当成「最完整人格」推给 B。
+        let mut best: Option<(usize, String, String)> = None;
+        for (uid, label) in accounts {
             if uid.trim().is_empty() {
                 continue;
             }
-            let path = personal_dir_at(root, uid).join(file);
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(text) = std::fs::read_to_string(personal_dir_at(root, uid).join(file)) else {
                 continue;
             };
-            let size = text.len();
-            if best.as_ref().is_none_or(|(best_size, _)| size > *best_size) {
-                best = Some((size, text));
+            let normalized = text.replace("\r\n", "\n");
+            if baseline.as_deref() == Some(normalized.as_str()) {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(best_size, _, _)| text.len() > *best_size)
+            {
+                best = Some((text.len(), text, label.clone()));
             }
         }
-        let Some((_, content)) = best else {
+        let Some((_, content, source)) = best else {
             continue;
         };
+
         for (uid, label) in accounts {
             if uid.trim().is_empty() {
                 continue;
             }
             let dir = personal_dir_at(root, uid);
             let path = dir.join(file);
-            if path.is_file() {
-                // 已有设定一律不动：人格取一份，不是覆盖。
+            let existing = std::fs::read_to_string(&path).ok();
+            let replaceable = match &existing {
+                // 目标缺失：两种模式都补。
+                None => true,
+                Some(text) => match mode {
+                    // 安全模式：只有「内容仍等于模板」才当作空壳可换。
+                    PersonaMode::Safe => baseline
+                        .as_deref()
+                        .is_some_and(|base| base == text.replace("\r\n", "\n")),
+                    PersonaMode::Overwrite => text != &content,
+                },
+            };
+            if !replaceable {
+                // 已有自定义设定：安全模式下如实报 unchanged，不做任何写入。
                 unchanged.push(json!({ "label": label, "file": file }));
                 continue;
             }
@@ -399,8 +472,30 @@ fn distribute_persona(root: &Path, accounts: &[(String, String)]) -> Value {
                 errors.push(json!({ "label": label, "file": file, "error": "创建人格目录失败" }));
                 continue;
             }
+            // 覆盖前必须备份：人格是手写内容，不可恢复比不同步更糟。
+            let backup = if existing.is_some() {
+                let backup = backup_path(&path);
+                match std::fs::copy(&path, &backup) {
+                    Ok(_) => Some(backup.to_string_lossy().to_string()),
+                    Err(error) => {
+                        errors.push(json!({
+                            "label": label,
+                            "file": file,
+                            "error": format!("备份失败，已跳过：{error}"),
+                        }));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             match atomic_write(&path, &content) {
-                Ok(()) => written.push(json!({ "label": label, "file": file })),
+                Ok(()) => written.push(json!({
+                    "label": label,
+                    "file": file,
+                    "backup": backup,
+                    "source": source,
+                })),
                 Err(error) => errors.push(json!({
                     "label": label,
                     "file": file,
@@ -578,6 +673,77 @@ mod tests {
             .unwrap()
             .iter()
             .any(|item| item["label"] == "acc-b"));
+    }
+
+    /// 安全模式：目标内容仍是客户端默认模板时允许替换。
+    ///
+    /// 这正是「默认模板挡住人设同步」的修复点：客户端首次登录会种一份模板，
+    /// 旧逻辑只要 `path.is_file()` 就跳过，导致自定义人格永远同步不过去。
+    #[test]
+    fn persona_safe_mode_replaces_client_template() {
+        let dir = TempDir::new("persona-template");
+        // 根部文件 = 客户端首次生成的原文模板。
+        std::fs::write(dir.path().join("SOUL.md"), "默认模板\n").unwrap();
+        dir.write("a", MEMORY_FILE, "## 甲\n\n- A\n");
+        dir.write("a", "SOUL.md", "自定义人格：审讯官\n");
+        dir.write("b", MEMORY_FILE, "## 乙\n\n- B\n");
+        dir.write("b", "SOUL.md", "默认模板\n");
+        dir.write("c", MEMORY_FILE, "## 丙\n\n- C\n");
+
+        let report = merge_and_distribute_at(dir.path(), &[pair("a"), pair("b"), pair("c")]);
+
+        // 仍是模板的 b 被替换，缺失的 c 直接补写，源账号保持原样。
+        assert_eq!(dir.read("b", "SOUL.md").unwrap(), "自定义人格：审讯官\n");
+        assert_eq!(dir.read("c", "SOUL.md").unwrap(), "自定义人格：审讯官\n");
+        assert_eq!(dir.read("a", "SOUL.md").unwrap(), "自定义人格：审讯官\n");
+        let written = report["persona"]["written"].as_array().unwrap();
+        assert!(
+            written
+                .iter()
+                .any(|item| item["label"] == "acc-b" && item["backup"].is_string()),
+            "覆盖默认模板前必须留下备份：{written:?}"
+        );
+    }
+
+    /// 模板本身不算人设：三个账号都只有默认模板时，一个都不写（避免把模板当人格互推）。
+    #[test]
+    fn persona_safe_mode_skips_when_every_account_is_template() {
+        let dir = TempDir::new("persona-all-template");
+        std::fs::write(dir.path().join("SOUL.md"), "默认模板\n").unwrap();
+        for uid in ["a", "b"] {
+            dir.write(uid, MEMORY_FILE, "## 甲\n\n- A\n");
+            dir.write(uid, "SOUL.md", "默认模板\n");
+        }
+
+        let report = merge_and_distribute_at(dir.path(), &[pair("a"), pair("b")]);
+
+        assert!(report["persona"]["written"].as_array().unwrap().is_empty());
+        assert_eq!(dir.read("a", "SOUL.md").unwrap(), "默认模板\n");
+        assert_eq!(dir.read("b", "SOUL.md").unwrap(), "默认模板\n");
+    }
+
+    /// 强制模式：所有账号统一成最完整的一份，手改过的也覆盖，但必须先备份。
+    #[test]
+    fn persona_overwrite_mode_unifies_every_account() {
+        let dir = TempDir::new("persona-overwrite");
+        std::fs::write(dir.path().join("SOUL.md"), "默认模板\n").unwrap();
+        dir.write("a", "SOUL.md", "最长的一份人设设定，字数明显更多。\n");
+        dir.write("b", "SOUL.md", "短人设\n");
+
+        let report = sync_persona_at(dir.path(), &[pair("a"), pair("b")], PersonaMode::Overwrite);
+
+        assert_eq!(
+            dir.read("b", "SOUL.md").unwrap(),
+            "最长的一份人设设定，字数明显更多。\n"
+        );
+        assert_eq!(report["mode"], "overwrite");
+        let written = report["written"].as_array().unwrap();
+        assert!(
+            written
+                .iter()
+                .any(|item| item["label"] == "acc-b" && item["backup"].is_string()),
+            "强制覆盖必须备份原人设：{written:?}"
+        );
     }
 
     #[test]

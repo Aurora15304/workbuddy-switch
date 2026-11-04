@@ -496,6 +496,23 @@ export interface SwitchResult {
   memoryMerge?: MemoryMergeReport;
   /** 本次的专家团清单同步报告（未勾选同步时不返回）。 */
   expertsMerge?: ExpertsMergeReport;
+  /** 本次的人设同步报告（未勾选同步时不返回）。 */
+  personaSync?: PersonaSyncReport;
+}
+
+/**
+ * 人设同步结果：`SOUL.md` / `IDENTITY.md` / `USER.md` 各取最完整的一份写回各账号。
+ *
+ * `mode` 决定「已有设定」怎么处理：`safe` 只替换仍是默认模板的目标，
+ * `overwrite` 内容不同就覆盖（覆盖前一定先备份）。
+ */
+export interface PersonaSyncReport {
+  mode: "safe" | "overwrite";
+  /** 本次写入的目标；`backup` 是被覆盖前的备份路径（原本无文件时为 null）。 */
+  written: { label: string; file: string; backup: string | null; source: string }[];
+  /** 保留原样、未写入的账号（safe 模式下多为手改过的人设）。 */
+  unchanged: { label: string; file: string }[];
+  errors: { label: string; file?: string; error: string }[];
 }
 
 /** 跨账号专家团清单同步结果：各账号的名单取并集后写回每个账号。 */
@@ -527,7 +544,7 @@ export interface MemoryMergeReport {
   /** 合并结果与现有内容一致、未写入的账号。 */
   unchanged: { label: string }[];
   persona: {
-    written: { label: string; file: string }[];
+    written: { label: string; file: string; backup: string | null; source: string }[];
     unchanged: { label: string; file: string }[];
     errors: { label: string; file: string; error: string }[];
   };

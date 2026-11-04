@@ -12,6 +12,7 @@
 
 use chrono::{Datelike, Local, Timelike};
 use serde_json::{json, Map, Value};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -608,15 +609,23 @@ impl SourceCollector {
 /// `detail` additionally keeps a bounded window of per-call request rows; both
 /// outputs share the same decode, cutoff, dedupe, and subagent-attribution
 /// pipeline so a detail row can never disagree with the aggregate totals.
+/// 单根测试夹具：生产路径统一走 `source_from_roots`（要带跨源进度）。
+#[cfg(test)]
 fn source(root: PathBuf, name: &str, cutoff: Option<i64>, detail: bool) -> Value {
-    source_from_roots(std::slice::from_ref(&root), name, cutoff, detail)
+    source_from_roots(std::slice::from_ref(&root), name, cutoff, detail, None)
 }
 
 /// 多根合并统计：同一档位下的多个 jsonl 根合并成**一个** source。
 ///
 /// 国际版数据根与国内版不同构（实测无 `projects/`、只有 `sessions/`），因此按
 /// 「存在的根」探测；一个都不存在时返回空集且不报错（前端显示空状态）。
-fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail: bool) -> Value {
+fn source_from_roots(
+    roots: &[PathBuf],
+    name: &str,
+    cutoff: Option<i64>,
+    detail: bool,
+    scan: Option<&ScanProgress<'_>>,
+) -> Value {
     let mut paths: Vec<(PathBuf, ScannedFile)> = Vec::new();
     for root in roots {
         let mut found = Vec::new();
@@ -644,6 +653,9 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
     let mut seen: HashSet<(i64, u64, u64, u64, u64, String)> = HashSet::new();
 
     for (root, scanned) in &paths {
+        if let Some(scan) = scan {
+            scan.advance();
+        }
         let path = &scanned.path;
         let session_id = match &scanned.session_id {
             // 子 agent 日志没有独立会话身份：文件的 stem 是 `agent-<uuid>`，
@@ -1062,6 +1074,7 @@ fn ide_source(
     name: &str,
     cutoff: Option<i64>,
     project_by_session: &HashMap<String, String>,
+    scan: Option<&ScanProgress<'_>>,
 ) -> Value {
     let mut paths = Vec::new();
     ide_index_files(&root, &mut paths);
@@ -1091,6 +1104,9 @@ fn ide_source(
     let mut collector = SourceCollector::default();
 
     for (index, _) in paths.iter().enumerate() {
+        if let Some(scan) = scan {
+            scan.advance();
+        }
         let fingerprint = weights[index]
             .as_ref()
             .map(|(fingerprint, _, _)| fingerprint.as_str());
@@ -1149,10 +1165,67 @@ fn ide_source(
     collector.into_value(name, paths.len())
 }
 
+/// 扫描进度回调：`(已扫描文件数, 待扫描文件总数)`。
+///
+/// 分母在解析开始**之前**由一次枚举算出（只做 read_dir，不读文件内容），
+/// 所以进度只会单调前进、不会因分母后补而回跳。
+pub type StatsProgressFn<'a> = &'a dyn Fn(usize, usize);
+
+/// 跨四个数据源共享的进度计数器。
+///
+/// `total` 是四个源的 jsonl / index 文件总数；`done` 每处理完一个文件加一。
+/// 枚举到的文件数可能与预枚举有极小偏差（跑的过程中日志在写），`advance`
+/// 用 `min(total)` 兜住，防止进度条越过 100%。
+struct ScanProgress<'a> {
+    callback: StatsProgressFn<'a>,
+    done: Cell<usize>,
+    total: usize,
+}
+
+impl<'a> ScanProgress<'a> {
+    fn new(callback: StatsProgressFn<'a>, total: usize) -> Self {
+        let progress = Self {
+            callback,
+            done: Cell::new(0),
+            total,
+        };
+        progress.report();
+        progress
+    }
+
+    /// 每处理一个文件调一次。放在循环体**开头**而不是末尾：循环里有多处
+    /// `continue`（打不开、解析失败、跳过副本），放末尾会漏计。
+    fn advance(&self) {
+        self.done.set((self.done.get() + 1).min(self.total));
+        self.report();
+    }
+
+    fn report(&self) {
+        (self.callback)(self.done.get(), self.total);
+    }
+}
+
+/// 预枚举分母：与正式扫描用同一套枚举函数，保证分子分母口径一致。
+fn count_files(roots: &[PathBuf]) -> usize {
+    let mut found = Vec::new();
+    for root in roots {
+        files(root, &mut found);
+    }
+    found.len()
+}
+
 /// Return independent WorkBuddy (CN), WorkBuddy AI, CodeBuddy CLI, and
 /// CodeBuddy IDE aggregates.
 /// `days` is interpreted in Rust using the same millisecond clock for every source.
 pub fn get_statistics(days: Option<i64>) -> Value {
+    get_statistics_with_progress(days, None)
+}
+
+/// 同 `get_statistics`，额外按文件回报进度（桌面端 emit 事件 / webui 轮询缓存）。
+pub fn get_statistics_with_progress(
+    days: Option<i64>,
+    progress: Option<StatsProgressFn<'_>>,
+) -> Value {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let generated_at = crate::modules::config::now_ms();
     let range_days = match days {
@@ -1162,22 +1235,30 @@ pub fn get_statistics(days: Option<i64>) -> Value {
         _ => None,
     };
     let cutoff = range_days.map(|value| generated_at - value * 86_400_000);
+
+    let cn_roots = variant_source_roots(WbVariant::Cn);
+    let ai_roots = variant_source_roots(WbVariant::Ai);
+    let cli_roots = [home.join(".codebuddy/projects")];
+    let ide_root = codebuddy_extension_data_dir();
+    let mut ide_paths = Vec::new();
+    ide_index_files(&ide_root, &mut ide_paths);
+
+    let total =
+        count_files(&cn_roots) + count_files(&ai_roots) + count_files(&cli_roots) + ide_paths.len();
+    let scan = progress.map(|callback| ScanProgress::new(callback, total));
+    let scan_ref = scan.as_ref();
+
     let ide_projects = ide_project_by_session();
     json!({
         "generatedAt": generated_at,
         "rangeDays": range_days,
         "sources": [
-            source_from_roots(&variant_source_roots(WbVariant::Cn), "workbuddy", cutoff, false),
+            source_from_roots(&cn_roots, "workbuddy", cutoff, false, scan_ref),
             // 国际版独立 source：不与国内版混算（不同账号体系）。
-            source_from_roots(&variant_source_roots(WbVariant::Ai), "workbuddy-ai", cutoff, false),
+            source_from_roots(&ai_roots, "workbuddy-ai", cutoff, false, scan_ref),
             // 请求明细目前只对 CodeBuddy CLI 开放（见 spec 的 requests 契约）。
-            source(home.join(".codebuddy/projects"), "codebuddy-cli", cutoff, true),
-            ide_source(
-                codebuddy_extension_data_dir(),
-                "codebuddy-ide",
-                cutoff,
-                &ide_projects,
-            ),
+            source_from_roots(&cli_roots, "codebuddy-cli", cutoff, true, scan_ref),
+            ide_source(ide_root, "codebuddy-ide", cutoff, &ide_projects, scan_ref),
         ],
     })
 }
@@ -2090,7 +2171,13 @@ mod tests {
 
         let mut projects = HashMap::new();
         projects.insert("conv-a".to_string(), "example-project".to_string());
-        let result = ide_source(root.clone(), "codebuddy-ide", Some(now - 50_000), &projects);
+        let result = ide_source(
+            root.clone(),
+            "codebuddy-ide",
+            Some(now - 50_000),
+            &projects,
+            None,
+        );
 
         assert_eq!(result["source"], "codebuddy-ide");
         assert_eq!(result["filesScanned"], 2);
@@ -2169,7 +2256,7 @@ mod tests {
         )
         .expect("write forked conversation");
 
-        let result = ide_source(root.clone(), "codebuddy-ide", None, &HashMap::new());
+        let result = ide_source(root.clone(), "codebuddy-ide", None, &HashMap::new(), None);
 
         assert_eq!(result["filesScanned"], 3);
         // 并集：100 + 200 + 400；重放的 req-1 只算一次，分叉两边独有的请求都在。
@@ -2215,7 +2302,7 @@ mod tests {
     /// 国际版数据根缺少 jsonl 根时返回空集，不报错。
     #[test]
     fn ai_source_is_empty_and_error_free_when_roots_are_missing() {
-        let value = source_from_roots(&[], "workbuddy-ai", None, false);
+        let value = source_from_roots(&[], "workbuddy-ai", None, false, None);
         assert_eq!(value["source"], "workbuddy-ai");
         assert_eq!(value["filesScanned"], 0);
         assert_eq!(value["summary"]["input"], 0);
@@ -2277,6 +2364,7 @@ mod tests {
             "workbuddy-ai",
             None,
             false,
+            None,
         );
         // 两个根都被扫到；重放记录计一次，第二个根的新记录另计一次。
         assert_eq!(result["filesScanned"], 2);
@@ -2301,5 +2389,58 @@ mod tests {
                 PathBuf::from("/tmp/wb-root/sessions")
             ]
         );
+    }
+
+    /// 进度分母必须是真实文件数：首帧 `(0,total)`、每个文件推进一格、末帧
+    /// `(total,total)` 且全程不回退——否则前端进度条永远到不了 100%。
+    #[test]
+    fn progress_advances_once_per_scanned_file() {
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-progress-{}-{}",
+            std::process::id(),
+            crate::modules::config::now_ms()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(project.join("session").join("subagents")).expect("create fixture dirs");
+        let record = json!({
+            "timestamp": crate::modules::config::now_ms(),
+            "providerData": {
+                "model": "fixture-model",
+                "usage": { "inputTokens": 1, "outputTokens": 1 }
+            },
+            "message": { "usage": { "input_tokens": 1, "output_tokens": 1 } }
+        });
+        fs::write(project.join("session.jsonl"), format!("{record}\n")).expect("write parent");
+        fs::write(
+            project
+                .join("session")
+                .join("subagents")
+                .join("agent-a.jsonl"),
+            format!("{record}\n"),
+        )
+        .expect("write subagent");
+
+        let seen: std::cell::RefCell<Vec<(usize, usize)>> = std::cell::RefCell::new(Vec::new());
+        let callback = |done: usize, total: usize| seen.borrow_mut().push((done, total));
+
+        let total = count_files(std::slice::from_ref(&root));
+        assert_eq!(total, 2, "父正文 + 1 个子 agent 日志");
+        let scan = ScanProgress::new(&callback, total);
+        let _ = source_from_roots(
+            std::slice::from_ref(&root),
+            "fixture",
+            None,
+            false,
+            Some(&scan),
+        );
+
+        let frames = seen.borrow();
+        assert_eq!(frames.first(), Some(&(0, 2)), "首帧必须报 0/total");
+        assert_eq!(frames.last(), Some(&(2, 2)), "末帧必须报满");
+        assert!(
+            frames.windows(2).all(|pair| pair[1].0 >= pair[0].0),
+            "进度不得回退：{frames:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

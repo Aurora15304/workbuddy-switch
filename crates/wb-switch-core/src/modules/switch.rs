@@ -176,6 +176,8 @@ pub fn switch_account(
     sync_selections: &[SyncSelection],
     merge_memory: bool,
     merge_experts: bool,
+    sync_persona: bool,
+    persona_mode: memory::PersonaMode,
 ) -> Result<Value, String> {
     // 快照与导出必须和令牌刷新处在同一个事务里：在任何备份、进程管理之前取锁，
     // 这样一次失败的切换不会留下副作用。
@@ -200,6 +202,7 @@ pub fn switch_account(
     let mut recovery_report: Option<Value> = None;
     let mut memory_report: Option<Value> = None;
     let mut experts_report: Option<Value> = None;
+    let mut persona_report: Option<Value> = None;
     if restart {
         progress("正在关闭 WorkBuddy…");
         close_workbuddy(variant, 20)?;
@@ -313,6 +316,16 @@ pub fn switch_account(
         progress("正在合并并分发工作记忆…");
         memory_report = Some(memory::merge_and_distribute(&account_pairs()));
     }
+    if sync_persona {
+        // 人设与记忆解耦：没勾「合并记忆」也能单独同步人设。
+        // 同样必须在写认证之前——那时各账号的人格目录还是切换前的状态。
+        progress(if persona_mode == memory::PersonaMode::Overwrite {
+            "正在同步人设（以最完整一份为准）…"
+        } else {
+            "正在同步人设（只替换默认模板）…"
+        });
+        persona_report = Some(memory::sync_persona(&account_pairs(), persona_mode));
+    }
     if merge_experts {
         // 专家团清单也是纯本地 JSON 文件（`{home}/.workbuddy/experts/custom/<uid>/experts.json`），
         // 与会话写入无关，同样不受 restart=false 限制。位置必须在写认证之前、并且在
@@ -353,6 +366,9 @@ pub fn switch_account(
     }
     if let Some(e) = experts_report {
         result["expertsMerge"] = e;
+    }
+    if let Some(p) = persona_report {
+        result["personaSync"] = p;
     }
     Ok(result)
 }

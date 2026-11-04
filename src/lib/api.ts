@@ -156,6 +156,7 @@ const ROUTES: Record<string, Route> = {
   session_links_preview_cross: { method: "POST", path: "/api/session-links/preview-cross" },
   session_sync_cross: { method: "POST", path: "/api/session-sync/cross" },
   list_session_groups: { method: "POST", path: "/api/session-groups/list" },
+  session_groups_progress: { method: "GET", path: "/api/session-groups/progress" },
   get_session_group: { method: "POST", path: "/api/session-groups/detail" },
   preview_session_group_pair: { method: "POST", path: "/api/session-groups/preview" },
   sync_session_group_pair: { method: "POST", path: "/api/session-groups/sync" },
@@ -170,6 +171,7 @@ const ROUTES: Record<string, Route> = {
   get_credit_expiry: { method: "POST", path: "/api/credits" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
   get_token_statistics: { method: "GET", path: "/api/token-stats" },
+  token_stats_progress: { method: "GET", path: "/api/token-stats/progress" },
   get_rate_limits: { method: "GET", path: "/api/rate-limits" },
   get_rate_limit_hook_status: { method: "GET", path: "/api/rate-limits/hook-status" },
   install_rate_limit_hook: { method: "POST", path: "/api/rate-limits/install-hook" },
@@ -555,6 +557,17 @@ export function switchAccount(args: {
   mergeMemory?: boolean;
   /** 勾选后把本机各账号已添加的专家团汇总成一份，写回每个账号。 */
   mergeExperts?: boolean;
+  /**
+   * 勾选后把最完整的一份人设（SOUL / IDENTITY / USER）同步到所有账号。
+   *
+   * 与 `mergeMemory` 独立：人设是手写内容，和记忆合并的副作用完全不同。
+   */
+  syncPersona?: boolean;
+  /**
+   * 人设覆盖策略：`safe` 只替换仍是客户端默认模板的目标（默认）；
+   * `overwrite` 以最完整一份为准统一覆盖（覆盖前备份）。
+   */
+  personaMode?: "safe" | "overwrite";
 }): Promise<SwitchResult> {
   return call("switch_account", args as unknown as Record<string, unknown>);
 }
@@ -637,6 +650,19 @@ export function sessionLinksProgress(): Promise<{
 }
 
 /**
+ * Token 统计扫描的逐文件进度（webui 轮询用；桌面端由 `token-stats-progress` 事件推送）。
+ *
+ * `total` 是扫描前枚举出的真实文件数，不是估算——前端不得按时间伪造百分比。
+ */
+export function tokenStatsProgress(): Promise<{
+  running: boolean;
+  done: number;
+  total: number;
+}> {
+  return call("token_stats_progress");
+}
+
+/**
  * 预览「显式来源账号 → 显式目标账号」可同步的关联会话（只读；跨档支持）。
  *
  * 与 `sessionLinksPreview` 同形，多一个 `sourceAccountId`；成员内容按成员自身档位读取
@@ -665,6 +691,19 @@ export function sessionSyncCross(
 
 export function listSessionGroups(client: SessionGroupClient, variantScope?: WbVariant): Promise<SessionGroupList> {
   return call("list_session_groups", { client, ...(variantScope ? { variantScope } : {}) });
+}
+
+/**
+ * 会话组列表加载的逐组进度（webui 轮询用；桌面端由 `session-groups-progress` 事件推送）。
+ *
+ * `total` 是筛选后待组装的组数——真实分母，前端不得按时间估算。
+ */
+export function sessionGroupsProgress(): Promise<{
+  running: boolean;
+  done: number;
+  total: number;
+}> {
+  return call("session_groups_progress");
 }
 
 export function getSessionGroup(client: SessionGroupClient, groupId: string, variantScope?: WbVariant): Promise<SessionGroupDetail> {
