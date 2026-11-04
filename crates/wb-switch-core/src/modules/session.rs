@@ -4554,7 +4554,14 @@ fn recover_sync_operation(
     }
 
     // 4) 复用同一段阶段代码补完（阶段只前进，已越过的阶段只核验不重放）。
-    match run_sync_phases(paths, read_paths, &mut operation, &backup_dir, &manifest, body) {
+    match run_sync_phases(
+        paths,
+        read_paths,
+        &mut operation,
+        &backup_dir,
+        &manifest,
+        body,
+    ) {
         // 附属目录结果/未同步原因随恢复成功一并上报，不再丢掉。
         Ok(sidecar) => RecoverOutcome::Recovered {
             id: operation_id.clone(),
@@ -5660,7 +5667,11 @@ mod tests {
             "{\"rootSessionId\":\"sess-1\"}\n",
         );
         env.add_sidecar("sess-1", "subagents/agent-x/tool-results/out.txt", "render");
-        env.add_sidecar("sess-1", "tool-results/call_1-render.txt", "{\"content\":\"x\"}");
+        env.add_sidecar(
+            "sess-1",
+            "tool-results/call_1-render.txt",
+            "{\"content\":\"x\"}",
+        );
 
         let report = copy(&env, "uid-b", &["sess-1"]);
         assert_eq!(report["copied"].as_array().unwrap().len(), 1, "{report}");
@@ -5668,7 +5679,10 @@ mod tests {
 
         // 附属目录按新会话 id 建：真实落盘内容里主会话 id 已替换。
         let agent = env.read_sidecar(&new_id, "subagents/agent-x.jsonl");
-        assert!(agent.contains(&new_id), "附属文件里的主会话 id 必须替换成新 id");
+        assert!(
+            agent.contains(&new_id),
+            "附属文件里的主会话 id 必须替换成新 id"
+        );
         assert!(!agent.contains("sess-1"), "附属文件里不得残留源会话 id");
         assert_eq!(
             env.read_sidecar(&new_id, "subagents/agent-x/tool-results/out.txt"),
@@ -6908,7 +6922,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(status, "archived", "归档状态必须原样保留，否则归档同步会失效");
+        assert_eq!(
+            status, "archived",
+            "归档状态必须原样保留，否则归档同步会失效"
+        );
         assert_eq!(project, None, "归档副本同样不能继承项目归属");
         assert_eq!(activity, Some(1500), "已有排序键不得被改写");
     }
@@ -8697,9 +8714,7 @@ mod tests {
             &env.paths(),
             WbVariant::Cn,
             &env.target("uid-b"),
-            Some(&|done: usize, total: usize| {
-                seen.borrow_mut().push((done, total))
-            }),
+            Some(&|done: usize, total: usize| seen.borrow_mut().push((done, total))),
         )
         .unwrap();
         let total = report["groups"].as_array().unwrap().len();

@@ -365,8 +365,8 @@ mod tests {
 
     use super::*;
     use crate::modules::session_link::{
-        save_operation, OpPhase, OperationMember, RecoveryIssue, SidecarWarning, TemporaryFileIssue,
-        OPERATION_VERSION,
+        save_operation, OpPhase, OperationMember, RecoveryIssue, SidecarWarning,
+        TemporaryFileIssue, OPERATION_VERSION,
     };
 
     struct TempDir(std::path::PathBuf);

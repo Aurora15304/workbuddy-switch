@@ -328,7 +328,12 @@ mod tests {
 
     #[test]
     fn updater_manifest_urls_macos_skips_duplicate_fallback() {
-        let urls = updater_manifest_urls("Binbin-miao", "workbuddy-switch-binbinbin", "macos", "aarch64");
+        let urls = updater_manifest_urls(
+            "Binbin-miao",
+            "workbuddy-switch-binbinbin",
+            "macos",
+            "aarch64",
+        );
         assert_eq!(
             urls,
             vec![
@@ -340,7 +345,12 @@ mod tests {
 
     #[test]
     fn updater_manifest_urls_windows_keeps_macos_compat() {
-        let urls = updater_manifest_urls("Binbin-miao", "workbuddy-switch-binbinbin", "windows", "x86_64");
+        let urls = updater_manifest_urls(
+            "Binbin-miao",
+            "workbuddy-switch-binbinbin",
+            "windows",
+            "x86_64",
+        );
         assert_eq!(
             urls,
             vec![

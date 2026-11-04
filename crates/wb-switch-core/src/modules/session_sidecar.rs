@@ -342,7 +342,9 @@ fn copy_file(source: &Path, target: &Path, kind: FileKind, ctx: &mut CopyContext
     if std::fs::symlink_metadata(target).is_ok() {
         // 目标已有同名文件：绝不覆盖（目标侧自己也会产生子 agent 记录）。
         ctx.outcome.skipped += 1;
-        let identical = std::fs::read(target).map(|old| old == content).unwrap_or(false);
+        let identical = std::fs::read(target)
+            .map(|old| old == content)
+            .unwrap_or(false);
         if !identical {
             ctx.outcome.mismatched += 1;
             ctx.outcome
@@ -353,9 +355,9 @@ fn copy_file(source: &Path, target: &Path, kind: FileKind, ctx: &mut CopyContext
     }
     if let Some(parent) = target.parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
-            ctx.outcome.errors.push(format!(
-                "附属文件目录创建失败（{name}）：{error}"
-            ));
+            ctx.outcome
+                .errors
+                .push(format!("附属文件目录创建失败（{name}）：{error}"));
             return;
         }
     }
@@ -411,11 +413,7 @@ pub fn is_safe_component(name: &OsStr) -> bool {
     let Some(text) = name.to_str() else {
         return false;
     };
-    !text.is_empty()
-        && text != "."
-        && text != ".."
-        && !text.contains('/')
-        && !text.contains('\\')
+    !text.is_empty() && text != "." && text != ".." && !text.contains('/') && !text.contains('\\')
 }
 
 /// 目录/文件的可读名（用于报告）：取最后一段路径。
@@ -499,9 +497,13 @@ mod tests {
     #[test]
     fn copy_sidecar_reports_no_sidecar_as_success() {
         let env = Env::new("no_sidecar");
-        let outcome =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let outcome = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert!(!outcome.source_present);
         assert_eq!(outcome.copied_total(), 0);
         assert_eq!(outcome.skipped, 0);
@@ -517,15 +519,16 @@ mod tests {
         let body = format!(
             "{{\"sessionId\":\"agent-abc\",\"rootSessionId\":\"{SOURCE_CID}\",\"path\":\"C:\\\\ws\\\\{SOURCE_CID}\\\\tool-results\\\\x.txt\"}}\n"
         );
-        env.write_source(
-            "subagents/agent-abc.jsonl",
-            &body,
-        );
+        env.write_source("subagents/agent-abc.jsonl", &body);
         env.write_source("subagents/agent-abc/tool-results/out.txt", "hello");
 
-        let outcome =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let outcome = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert!(outcome.source_present);
         assert_eq!(outcome.agents_copied, 1);
         assert_eq!(outcome.tool_results_copied, 1);
@@ -537,7 +540,10 @@ mod tests {
         assert!(!copied.contains(SOURCE_CID), "落盘内容仍含源会话 id");
         assert!(copied.contains(TARGET_CID));
         assert!(copied.contains(&format!("rootSessionId\":\"{TARGET_CID}\"")));
-        assert_eq!(env.read_target("subagents/agent-abc/tool-results/out.txt"), "hello");
+        assert_eq!(
+            env.read_target("subagents/agent-abc/tool-results/out.txt"),
+            "hello"
+        );
     }
 
     #[test]
@@ -551,9 +557,13 @@ mod tests {
         )
         .unwrap();
 
-        let outcome =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let outcome = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert_eq!(outcome.agents_copied, 0);
         assert_eq!(outcome.skipped, 1);
         assert_eq!(outcome.mismatched, 1);
@@ -572,9 +582,13 @@ mod tests {
         std::fs::create_dir_all(env.target_sidecar().join("tool-results")).unwrap();
         std::fs::write(env.target_sidecar().join("tool-results/call.txt"), "same").unwrap();
 
-        let outcome =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let outcome = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert_eq!(outcome.tool_results_copied, 0);
         assert_eq!(outcome.skipped, 1);
         assert_eq!(outcome.mismatched, 0);
@@ -586,9 +600,13 @@ mod tests {
         env.write_source("tool-results/call_1-render.txt", "{\"content\":\"ok\"}");
         env.write_source("tool-results/call_2-render.txt", "{\"content\":\"ok2\"}");
 
-        let outcome =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let outcome = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert_eq!(outcome.tool_results_copied, 2);
         assert_eq!(outcome.agents_copied, 0);
         assert!(env.target_exists("tool-results/call_1-render.txt"));
@@ -607,9 +625,13 @@ mod tests {
         std::fs::create_dir_all(env.source_sidecar().join("tool-results/odd-dir")).unwrap();
         env.write_source("tool-results/ok.txt", "content-b");
 
-        let outcome =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let outcome = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert_eq!(outcome.agents_copied, 1);
         assert_eq!(outcome.tool_results_copied, 1);
         assert_eq!(outcome.errors.len(), 1);
@@ -639,9 +661,13 @@ mod tests {
             .open(env.source_sidecar().join("subagents/agent-abc.jsonl"))
             .unwrap();
 
-        let outcome =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let outcome = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert_eq!(outcome.errors.len(), 1, "{outcome:?}");
         assert!(
             outcome.errors[0].contains("附属文件读取失败"),
@@ -667,9 +693,13 @@ mod tests {
         )
         .unwrap();
 
-        let outcome =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let outcome = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert_eq!(outcome.errors.len(), 1, "{outcome:?}");
         assert!(
             outcome.errors[0].contains("附属文件读取失败"),
@@ -688,9 +718,13 @@ mod tests {
         env.write_source("other-dir/inside.txt", "evil");
         env.write_source("..evil/inside.txt", "evil");
 
-        let outcome =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let outcome = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert_eq!(outcome.agents_copied, 1);
         assert_eq!(outcome.other_copied, 0);
         assert!(!env.target_exists("evil.txt"));
@@ -708,9 +742,13 @@ mod tests {
         env.write_source("subagents/agent-abc.jsonl", "content-a");
         env.write_source("plans/plan-1.md", "not session material");
 
-        let outcome =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let outcome = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         // 已知目录照常复制。
         assert_eq!(outcome.agents_copied, 1, "{outcome:?}");
         // 未知目录不复制……
@@ -735,9 +773,13 @@ mod tests {
         std::fs::create_dir_all(env.source_sidecar()).unwrap();
         std::os::unix::fs::symlink(&outside, env.source_sidecar().join("subagents")).unwrap();
 
-        let outcome =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let outcome = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert_eq!(outcome.agents_copied, 0, "{outcome:?}");
         assert_eq!(outcome.ignored_entries, 1, "{outcome:?}");
         assert!(!env.target_exists("subagents/secret.txt"));
@@ -756,20 +798,29 @@ mod tests {
     }
 
     #[test]
-    fn copy_sidecar_is_idempotent() {        let env = Env::new("idempotent");
+    fn copy_sidecar_is_idempotent() {
+        let env = Env::new("idempotent");
         env.write_source("subagents/agent-abc.jsonl", "content-a");
         env.write_source("tool-results/call.txt", "content-b");
 
-        let first =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let first = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert_eq!(first.agents_copied, 1);
         assert_eq!(first.tool_results_copied, 1);
         assert_eq!(first.skipped, 0);
 
-        let second =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let second = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert_eq!(second.agents_copied, 0);
         assert_eq!(second.tool_results_copied, 0);
         assert_eq!(second.skipped, 2);
@@ -787,9 +838,13 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("blob.bin"), &bytes).unwrap();
 
-        let outcome =
-            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
-                .unwrap();
+        let outcome = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
         assert_eq!(outcome.tool_results_copied, 1);
         let copied = std::fs::read(env.target_sidecar().join("tool-results/blob.bin")).unwrap();
         assert_eq!(copied, bytes);
@@ -802,6 +857,9 @@ mod tests {
             SOURCE_CID,
             TARGET_CID,
         );
-        assert_eq!(String::from_utf8(replaced).unwrap(), format!("before {TARGET_CID} after"));
+        assert_eq!(
+            String::from_utf8(replaced).unwrap(),
+            format!("before {TARGET_CID} after")
+        );
     }
 }

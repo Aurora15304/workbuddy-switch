@@ -1043,11 +1043,8 @@ async fn api_session_links_preview(Json(body): Json<Value>) -> Response {
     let report_progress = |done: usize, total: usize| {
         *LINKS_PREVIEW_PROGRESS.lock().unwrap() = Some((done, total));
     };
-    let result = session::session_links_preview_with_progress(
-        variant,
-        &target,
-        Some(&report_progress),
-    );
+    let result =
+        session::session_links_preview_with_progress(variant, &target, Some(&report_progress));
     *LINKS_PREVIEW_PROGRESS.lock().unwrap() = None;
     match result {
         Ok(report) => json_ok(report),
@@ -1091,8 +1088,11 @@ async fn api_session_links_preview_cross(Json(body): Json<Value>) -> Response {
     let report_progress = |done: usize, total: usize| {
         *LINKS_PREVIEW_PROGRESS.lock().unwrap() = Some((done, total));
     };
-    let result =
-        session::session_links_preview_cross_with_progress(&source, &target, Some(&report_progress));
+    let result = session::session_links_preview_cross_with_progress(
+        &source,
+        &target,
+        Some(&report_progress),
+    );
     *LINKS_PREVIEW_PROGRESS.lock().unwrap() = None;
     match result {
         Ok(report) => json_ok(report),
