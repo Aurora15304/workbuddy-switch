@@ -482,6 +482,9 @@ export interface AppNotification {
  */
 export type ErrorLogKind = "frontend_crash" | "frontend_unhandled" | "backend";
 
+/** 工作记忆同步方式：合并 / 复制覆盖。不传该参数 = 不同步（旧版 `mergeMemory` 已移除）。 */
+export type MemorySyncMode = "merge" | "overwrite";
+
 export interface SwitchResult {
   ok: boolean;
   account: string;
@@ -492,7 +495,7 @@ export interface SwitchResult {
   /** 本次的会话同步报告（未勾选同步时不返回）；含跳过与失败原因，不只是成功数。 */
   sessionSync?: SessionSyncReport;
   sessionRecovery?: SessionRecoveryReport;
-  /** 本次的记忆合并与分发报告（未勾选合并时不返回）。 */
+  /** 本次的工作记忆报告（选「不同步」时不返回）；合并与覆盖共用同一形状。 */
   memoryMerge?: MemoryMergeReport;
   /** 本次的专家团清单同步报告（未勾选同步时不返回）。 */
   expertsMerge?: ExpertsMergeReport;
@@ -531,17 +534,20 @@ export interface ExpertsMergeReport {
   note?: string;
 }
 
-/** 跨账号工作记忆合并结果：`MEMORY.md` 合并分发，人格文件只补全缺失项。 */
+/**
+ * 跨账号工作记忆结果：`MEMORY.md` 合并分发或复制覆盖，人格文件只补全缺失项。
+ * 合并与覆盖共用同一形状，既有字段一个不删；新增 `mode` / `sourceUid` 描述本次方式。
+ */
 export interface MemoryMergeReport {
   /** 参与本次处理的账号数（含没有记忆文件的账号）。 */
   accounts: number;
-  /** 实际贡献了记忆内容的账号及其字符数。 */
+  /** 实际贡献了记忆内容的账号及其字符数。覆盖模式只列母本一份。 */
   sources: { label: string; chars: number }[];
-  /** 合并后的记忆字符数。 */
+  /** 合并后的记忆字符数（覆盖模式 = 母本字符数）。 */
   mergedChars: number;
   /** 本次写入的账号；`backup` 是被覆盖前的原文备份路径（原本无文件时为 null）。 */
   written: { label: string; backup: string | null; hadContent: boolean }[];
-  /** 合并结果与现有内容一致、未写入的账号。 */
+  /** 结果与现有内容一致、未写入的账号。 */
   unchanged: { label: string }[];
   persona: {
     written: { label: string; file: string; backup: string | null; source: string }[];
@@ -549,6 +555,10 @@ export interface MemoryMergeReport {
     errors: { label: string; file: string; error: string }[];
   };
   errors: { label: string; error: string }[];
+  /** 本次方式：合并 / 覆盖。前端分级文案以本次请求为准，不依赖报告回填。 */
+  mode: MemorySyncMode;
+  /** 覆盖模式的母本账号 uid；合并模式不返回。 */
+  sourceUid?: string;
   note?: string;
 }
 

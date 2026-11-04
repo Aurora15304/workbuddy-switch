@@ -579,7 +579,8 @@ pub async fn switch_account(
     share_sessions: Option<bool>,
     copy_session_ids: Option<Vec<String>>,
     sync_selections: Option<Value>,
-    merge_memory: Option<bool>,
+    memory_mode: Option<String>,
+    memory_source_uid: Option<String>,
     merge_experts: Option<bool>,
     sync_persona: Option<bool>,
     persona_mode: Option<String>,
@@ -589,7 +590,8 @@ pub async fn switch_account(
     }
     let restart = restart.unwrap_or(true);
     let share_sessions = share_sessions.unwrap_or(false);
-    let merge_memory = merge_memory.unwrap_or(false);
+    // 边界一次性归一化：非法 memoryMode 明确报错，绝不静默回退成「不同步」。
+    let memory_sync = memory::MemorySyncMode::parse(memory_mode.as_deref())?;
     let merge_experts = merge_experts.unwrap_or(false);
     let sync_persona = sync_persona.unwrap_or(false);
     let persona_mode = memory::PersonaMode::parse(persona_mode.as_deref());
@@ -608,7 +610,8 @@ pub async fn switch_account(
             share_sessions,
             &copy_ids,
             &sync_selections,
-            merge_memory,
+            memory_sync,
+            memory_source_uid.as_deref(),
             merge_experts,
             sync_persona,
             persona_mode,

@@ -3,6 +3,7 @@
 use chrono::{Local, TimeZone};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -914,22 +915,66 @@ pub fn utc_iso() -> String {
 // 文件
 // ---------------------------------------------------------------------------
 
-/// 原子写文件（临时文件 + rename），对照 Python atomic_write。
+/// 持久化目录项更新（父目录 fsync）的 Unix 实现。
+///
+/// rename 只改目录项；Unix 上对目录 `fsync` 才能保证断电后仍可见。Windows
+/// 无法打开目录句柄（`File::open(dir)` 恒失败），属平台限制，显式 no-op
+/// 而非静默假装已 fsync——与 `session_backup::sync_dir` 的平台口径一致。
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) -> std::io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_parent: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// 目标文件所在目录的持久化；无父目录时无需处理。
+fn sync_parent_of(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => sync_parent_dir(parent),
+        _ => Ok(()),
+    }
+}
+
+/// 持久化原子写（临时文件 + `sync_all` + rename + 父目录 fsync）。
+///
+/// 对照 Python `atomic_write`，但补齐持久化证明：普通 `flush`、回读摘要或
+/// rename 成功都不能替代 `sync_all`。崩在 rename 之前时主文件保持原样，仅残留
+/// `<name>.tmp-*`（残留不是损坏信号，读取方一律忽略）；rename 之后主文件已是
+/// 完整新内容。全仓 ~45 处调用点因此统一获得 durable 语义，无需逐一改动。
 pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     let tmp = path.with_file_name(format!("{file_name}.tmp-{}", uuid::Uuid::new_v4().simple()));
-    if let Err(e) = std::fs::write(&tmp, content) {
-        eprintln!("[atomic] write tmp FAILED: {e}");
-        return Err(e);
+
+    // create_new 把「uuid 意外撞名」从静默截断变成显式失败，并给出可写句柄：
+    // Windows 的 FlushFileBuffers 要求句柄可写，只读句柄 sync_all 会 ACCESS_DENIED。
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(error) = written {
+        eprintln!("[atomic] write tmp FAILED: {error}");
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        eprintln!("[atomic] rename FAILED: {e}");
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        eprintln!("[atomic] rename FAILED: {error}");
         // rename 失败时清理临时文件，避免在目标目录残留 `<name>.tmp-*`。
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+        return Err(error);
+    }
+    if let Err(error) = sync_parent_of(path) {
+        eprintln!("[atomic] sync parent FAILED: {error}");
+        return Err(error);
     }
     Ok(())
 }

@@ -12,6 +12,85 @@ use crate::modules::config::{http_request, load_checkin_config, norm_ts, now_ms,
 
 static KEEPALIVE_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// 账号库写入失败的可观测标记（只存在于返回对象，绝不落盘）。
+///
+/// 与 `refresh_error`（本地锁失败的瞬态语义）严格区分：写盘失败是另一类故障，
+/// 复用 `refresh_error` 会让保活错误文案盖掉真正的 `needs_relogin_reason`，
+/// 也会把「健康账号因本地锁没刷新」与「刷新成功但没保存」混成同一个信号。
+const PERSIST_ERROR_KEY: &str = "persist_error";
+
+// ---------------------------------------------------------------------------
+// 刷新结果落盘：I/O 边界 + 失败可观测策略
+// ---------------------------------------------------------------------------
+
+/// 唯一写入接缝：落盘前剥掉瞬态诊断字段（绝不让它进账号库），写失败时记
+/// error.log + stderr 做可观测上报，再把 Result 原样交给纯策略折叠。
+///
+/// 5 个调用点全部收敛到这里，避免「上报」逻辑散落复制。
+fn persist_refresh_account(account: &mut Value) -> std::io::Result<()> {
+    if let Some(map) = account.as_object_mut() {
+        map.remove(PERSIST_ERROR_KEY);
+    }
+    let result = upsert_account(account);
+    if let Err(error) = &result {
+        let message = format!("刷新结果写入账号库失败（本次变更未持久化）: {error}");
+        crate::modules::error_log::record("backend", "刷新结果落盘失败", &message);
+        eprintln!("[refresh] {message}");
+    }
+    result
+}
+
+/// 纯策略（可测接缝）：把写盘结果折叠进返回对象。
+///
+/// - `Ok`：清除历史瞬态标记，原样返回（正常路径逐字段不变）；
+/// - `Err`：打上 `persist_error` 让保活报告判 failed（不再假绿 `"ok"`），
+///   并**保留**调用方已设的 `needs_relogin`，绝不因写失败把它抹掉。
+///
+/// 标记只在返回对象里，`persist_refresh_account` 已在写盘前把它剥掉，
+/// 因此永远不会落盘污染下个周期的账号库。
+fn fold_persist_outcome(mut account: Value, result: std::io::Result<()>) -> Value {
+    let Some(map) = account.as_object_mut() else {
+        return account;
+    };
+    match result {
+        Ok(()) => {
+            map.remove(PERSIST_ERROR_KEY);
+        }
+        Err(error) => {
+            map.insert(
+                PERSIST_ERROR_KEY.to_string(),
+                json!(format!("账号库写入失败（本次刷新结果未持久化）: {error}")),
+            );
+        }
+    }
+    account
+}
+
+/// 纯策略（可测接缝）：从刷新返回对象生成保活报告。
+///
+/// 写盘失败（`persist_error`）与 `needs_relogin` / `refresh_error` 并列为失败信号，
+/// 保证「刷新成功但没落盘」不再被报告成 `"ok"`。错误文案按根因优先级拼接，
+/// 正常成功 / 失败 / 本地锁失败三条路径的输出与改造前逐字一致。
+fn keepalive_outcome(fresh: &Value) -> (&'static str, Option<String>) {
+    let failed = fresh.get("needs_relogin").and_then(Value::as_bool) == Some(true)
+        || fresh.get("refresh_error").is_some()
+        || fresh.get(PERSIST_ERROR_KEY).is_some();
+    if !failed {
+        return ("ok", None);
+    }
+    let reason = [
+        fresh.get("refresh_error"),
+        fresh.get("needs_relogin_reason"),
+        fresh.get(PERSIST_ERROR_KEY),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .collect::<Vec<_>>()
+    .join("; ");
+    ("failed", (!reason.is_empty()).then_some(reason))
+}
+
 /// 刷新接口 URL：域名与路径前缀都按账号自身档位选（缺档位字段 → 国内版，零回归）。
 fn refresh_url(account: &Value) -> String {
     let variant = crate::modules::account::variant_of(account);
@@ -72,8 +151,8 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     if rt.is_empty() {
         account["needs_relogin"] = json!(true);
         account["needs_relogin_reason"] = json!("缺少 refresh token，无法刷新，需重新登录");
-        let _ = upsert_account(&account);
-        return account;
+        let result = persist_refresh_account(&mut account);
+        return fold_persist_outcome(account, result);
     }
 
     let headers = refresh_headers(&account, &rt);
@@ -90,8 +169,8 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
                 .and_then(|v| v.as_str())
                 .unwrap_or("未知错误")
         ));
-        let _ = upsert_account(&account);
-        return account;
+        let result = persist_refresh_account(&mut account);
+        return fold_persist_outcome(account, result);
     }
 
     let data = resp.get("data").cloned().unwrap_or_else(|| json!({}));
@@ -103,8 +182,8 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     let Some(new_at) = new_at else {
         account["needs_relogin"] = json!(true);
         account["needs_relogin_reason"] = json!("刷新响应缺少 accessToken");
-        let _ = upsert_account(&account);
-        return account;
+        let result = persist_refresh_account(&mut account);
+        return fold_persist_outcome(account, result);
     };
 
     account["access_token"] = json!(new_at);
@@ -153,7 +232,8 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     let map = account.as_object_mut().unwrap();
     map.remove("needs_relogin");
     map.remove("needs_relogin_reason");
-    let _ = upsert_account(&account);
+    let result = persist_refresh_account(&mut account);
+    account = fold_persist_outcome(account, result);
     // Windows 不执行 apiKeyHelper；当前 CLI 账号刷新后同步 settings env。
     // 同步失败不阻断 WorkBuddy 保活；状态接口会根据 settings 与账号库是否
     // 一致显示“待同步”，避免把认证配置错误混入账号数据。
@@ -224,24 +304,25 @@ pub async fn run_keepalive_cycle() -> Value {
         {
             acc["needs_relogin"] = json!(true);
             acc["needs_relogin_reason"] = json!("缺少 refresh token，无法保活，需重新登录");
-            let _ = upsert_account(&acc);
-            results.push(json!({
+            let result = persist_refresh_account(&mut acc);
+            let acc = fold_persist_outcome(acc, result);
+            let mut entry = json!({
                 "email": crate::modules::account::account_display_name(&acc),
                 "status": "missing_rt",
-            }));
+            });
+            // 写盘失败时把可观测错误带进报告，绝不静默丢掉 needs_relogin 的落盘结果。
+            if let Some(error) = acc.get(PERSIST_ERROR_KEY).and_then(Value::as_str) {
+                entry["error"] = json!(error);
+            }
+            results.push(entry);
             continue;
         }
         let fresh = refresh_account_token(acc).await;
-        let failed = fresh.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true)
-            || fresh.get("refresh_error").is_some();
+        let (status, error) = keepalive_outcome(&fresh);
         results.push(json!({
             "email": crate::modules::account::account_display_name(&fresh),
-            "status": if failed { "failed" } else { "ok" },
-            "error": if failed {
-                fresh.get("refresh_error").or_else(|| fresh.get("needs_relogin_reason")).and_then(|v| v.as_str()).map(|s| s.to_string())
-            } else {
-                None
-            },
+            "status": status,
+            "error": error,
         }));
     }
     json!({"checked": total, "refreshed": results})
@@ -306,5 +387,104 @@ mod tests {
             // 刷新不带 platform 查询参数/头：官方刷新同样不带（research §2 已推翻旧假设）。
             assert!(!headers.contains_key("platform"));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // T7 写盘失败治理（纯策略接缝：注入 io::Result，绝不触碰真实账号库）
+    // -----------------------------------------------------------------------
+
+    /// 模拟磁盘满 / 只读目录等写盘失败。
+    fn disk_full() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::Other, "模拟磁盘已满 / no space left")
+    }
+
+    /// 验收：成功路径写盘失败 → 报告不得为 ok，且不得把健康账号误标 needs_relogin。
+    #[test]
+    fn successful_refresh_with_failed_write_is_never_reported_as_ok() {
+        let account = json!({
+            "id": "acc-1",
+            "access_token": "fresh-at",
+            "refresh_token": "fresh-rt",
+        });
+        let written = fold_persist_outcome(account, Err(disk_full()));
+        assert!(
+            written
+                .get(PERSIST_ERROR_KEY)
+                .and_then(Value::as_str)
+                .is_some(),
+            "写失败必须留下可观测标记"
+        );
+        assert!(
+            written.get("needs_relogin").is_none(),
+            "写盘失败不得把健康账号标记成需重新登录"
+        );
+        let (status, error) = keepalive_outcome(&written);
+        assert_eq!(status, "failed", "写盘失败绝不能假报 ok");
+        assert!(error.unwrap().contains("磁盘已满"), "错误文案必须带根因");
+    }
+
+    /// 验收：失败路径写盘失败 → needs_relogin 不得静默丢失，写失败也要可观测。
+    #[test]
+    fn failed_refresh_with_failed_write_keeps_needs_relogin_observable() {
+        let account = json!({
+            "id": "acc-1",
+            "needs_relogin": true,
+            "needs_relogin_reason": "刷新失败(code=12153)",
+        });
+        let written = fold_persist_outcome(account, Err(disk_full()));
+        assert_eq!(
+            written["needs_relogin"], true,
+            "needs_relogin 不得被静默抹掉"
+        );
+        assert!(written.get(PERSIST_ERROR_KEY).is_some(), "写失败必须可观测");
+
+        let (status, error) = keepalive_outcome(&written);
+        assert_eq!(status, "failed");
+        let error = error.unwrap();
+        assert!(
+            error.contains("刷新失败(code=12153)"),
+            "根因不能被写盘错误盖掉: {error}"
+        );
+        assert!(error.contains("磁盘已满"), "写盘失败本身也要上报: {error}");
+    }
+
+    /// 不变式：正常成功 / 失败 / 本地锁失败三条路径输出与改造前逐字一致。
+    #[test]
+    fn keepalive_outcome_is_unchanged_on_normal_paths() {
+        let (status, error) = keepalive_outcome(&json!({"id": "a", "access_token": "t"}));
+        assert_eq!(status, "ok");
+        assert!(error.is_none());
+
+        let (status, error) = keepalive_outcome(&json!({
+            "needs_relogin": true,
+            "needs_relogin_reason": "刷新失败(code=12153)",
+        }));
+        assert_eq!(status, "failed");
+        assert_eq!(error.as_deref(), Some("刷新失败(code=12153)"));
+
+        let (status, error) = keepalive_outcome(&json!({"refresh_error": "auth lock timeout"}));
+        assert_eq!(status, "failed");
+        assert_eq!(error.as_deref(), Some("auth lock timeout"));
+    }
+
+    /// 写成功时清除瞬态标记：诊断字段绝不残留、绝不落盘污染下个周期的判定。
+    #[test]
+    fn successful_write_clears_stale_persist_marker() {
+        let account = json!({
+            "id": "a",
+            "access_token": "t",
+            "persist_error": "上一轮的瞬态诊断",
+        });
+        let written = fold_persist_outcome(account, Ok(()));
+        assert!(written.get(PERSIST_ERROR_KEY).is_none());
+        assert_eq!(written["access_token"], "t");
+        assert_eq!(keepalive_outcome(&written).0, "ok");
+    }
+
+    /// 非对象 Value 折叠不 panic（定义错误出局）。
+    #[test]
+    fn persist_outcome_handles_non_object_values() {
+        let value = json!("not an object");
+        assert_eq!(fold_persist_outcome(value.clone(), Err(disk_full())), value);
     }
 }

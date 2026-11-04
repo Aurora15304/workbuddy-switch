@@ -68,16 +68,24 @@ export function useCreditAutoRefresh() {
     };
     document.addEventListener("visibilitychange", onVisibility);
 
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     if (!api.isWebui()) {
       void listen<boolean>("main-window-visible", (event) => {
         setVisible(event.payload);
       }).then((fn) => {
+        // StrictMode 下「挂载 → 卸载 → 再挂载」：listen 的 Promise 可能在清理之后才
+        // resolve，不立即解绑就会残留一个监听，同一事件被两个监听器重复处理。
+        if (disposed) {
+          fn();
+          return;
+        }
         unlisten = fn;
       });
     }
 
     return () => {
+      disposed = true;
       stopTimer();
       document.removeEventListener("visibilitychange", onVisibility);
       unlisten?.();

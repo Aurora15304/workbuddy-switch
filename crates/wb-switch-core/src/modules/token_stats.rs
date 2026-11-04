@@ -1200,6 +1200,20 @@ impl<'a> ScanProgress<'a> {
         self.report();
     }
 
+    /// 扫描收尾：**无条件**补一帧 `(total, total)`。
+    ///
+    /// 分母是扫描前的预枚举快照（[`count_files`]），分子来自各 source 内部的
+    /// 第二次枚举。日志被清理/轮转使 `paths.len() < total` 时，末帧会停在
+    /// `(done, total)` 且 `done < total`；前端在 running 转 false 后不再刷新，
+    /// 进度条永远到不了 100%。因此不能等 `done == total`（该条件在文件变少时
+    /// 永不触发），必须在返回前显式收口。
+    ///
+    /// 与 `new` 的首帧 `(0, total)` 成对对称；`done` 只增不减，重复调用幂等。
+    fn finish(&self) {
+        self.done.set(self.total);
+        self.report();
+    }
+
     fn report(&self) {
         (self.callback)(self.done.get(), self.total);
     }
@@ -1249,7 +1263,7 @@ pub fn get_statistics_with_progress(
     let scan_ref = scan.as_ref();
 
     let ide_projects = ide_project_by_session();
-    json!({
+    let value = json!({
         "generatedAt": generated_at,
         "rangeDays": range_days,
         "sources": [
@@ -1260,7 +1274,13 @@ pub fn get_statistics_with_progress(
             source_from_roots(&cli_roots, "codebuddy-cli", cutoff, true, scan_ref),
             ide_source(ide_root, "codebuddy-ide", cutoff, &ide_projects, scan_ref),
         ],
-    })
+    });
+    // 四个 source 全部扫完后无条件收口：预枚举分母与第二次枚举的分子之间
+    // 存在 TOCTOU 窗口，日志变少时末帧会停在 99%，见 [`ScanProgress::finish`]。
+    if let Some(scan) = &scan {
+        scan.finish();
+    }
+    value
 }
 
 #[cfg(test)]
@@ -2437,10 +2457,96 @@ mod tests {
         let frames = seen.borrow();
         assert_eq!(frames.first(), Some(&(0, 2)), "首帧必须报 0/total");
         assert_eq!(frames.last(), Some(&(2, 2)), "末帧必须报满");
+        assert_eq!(frames.len(), 1 + total, "首帧 + 每个文件恰好一帧，不得漏计/多计");
         assert!(
-            frames.windows(2).all(|pair| pair[1].0 >= pair[0].0),
-            "进度不得回退：{frames:?}"
+            frames.windows(2).all(|pair| pair[1].0 >= pair[0].0 && pair[1].1 == pair[0].1),
+            "进度不得回退、分母不得漂移：{frames:?}"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// S3 反例：预枚举 1000、实际只扫到 995（日志被清理/轮转）。
+    /// 旧实现 `.min(total)` 只钳上界，末帧停在 `(995,1000)`，前端 running 转
+    /// false 后不再刷新 → 进度条永远 99%。`finish()` 必须无条件补到 100%。
+    #[test]
+    fn progress_finishes_at_total_when_fewer_files_survive() {
+        let seen: std::cell::RefCell<Vec<(usize, usize)>> = std::cell::RefCell::new(Vec::new());
+        let callback = |done: usize, total: usize| seen.borrow_mut().push((done, total));
+
+        let total = 1000usize;
+        let scanned = 995usize;
+        let scan = ScanProgress::new(&callback, total);
+        for _ in 0..scanned {
+            scan.advance();
+        }
+        // 修复前：末帧卡在 995/1000，永远不会自己走到 100%。
+        assert_eq!(seen.borrow().last(), Some(&(scanned, total)));
+
+        scan.finish();
+
+        let frames = seen.borrow();
+        assert_eq!(frames.first(), Some(&(0, total)), "首帧必须报 0/total");
+        assert_eq!(frames.last(), Some(&(total, total)), "末帧必须必达 100%");
+        assert_eq!(frames.len(), 1 + scanned + 1, "首帧 + 995 次 advance + 收口帧");
+        assert!(
+            frames.windows(2).all(|pair| pair[1].0 >= pair[0].0 && pair[1].1 == total),
+            "进度单调不回退、分母恒为预枚举快照：{frames:?}"
+        );
+        assert!(
+            frames.iter().all(|&(done, denominator)| done <= denominator),
+            "分子不得越过分母：{frames:?}"
+        );
+    }
+
+    /// `finish()` 无条件且幂等：已经到 100% 或分母为 0 时也不回退、不越界。
+    #[test]
+    fn progress_finish_is_idempotent_and_never_regresses() {
+        let seen: std::cell::RefCell<Vec<(usize, usize)>> = std::cell::RefCell::new(Vec::new());
+        let callback = |done: usize, total: usize| seen.borrow_mut().push((done, total));
+
+        let scan = ScanProgress::new(&callback, 3);
+        for _ in 0..3 {
+            scan.advance();
+        }
+        scan.finish();
+        scan.finish();
+        let frames = seen.borrow();
+        assert_eq!(frames.last(), Some(&(3, 3)), "重复收口仍停在 100%");
+        assert!(
+            frames.windows(2).all(|pair| pair[1].0 >= pair[0].0 && pair[1].1 == 3),
+            "进度不得回退：{frames:?}"
+        );
+
+        let zero_seen: std::cell::RefCell<Vec<(usize, usize)>> = std::cell::RefCell::new(Vec::new());
+        let zero_callback = |done: usize, total: usize| zero_seen.borrow_mut().push((done, total));
+        let zero = ScanProgress::new(&zero_callback, 0);
+        zero.advance();
+        zero.finish();
+        assert_eq!(zero_seen.borrow().last(), Some(&(0, 0)), "空扫描末帧仍是 0/0");
+    }
+
+    /// 端到端接线：生产入口 `get_statistics_with_progress` 必须真的调用
+    /// `finish()`，最后一帧恒定 `(total,total)`，全程分母一致、分子不回退。
+    #[test]
+    fn get_statistics_with_progress_ends_at_100_percent() {
+        let seen: std::cell::RefCell<Vec<(usize, usize)>> = std::cell::RefCell::new(Vec::new());
+        let callback = |done: usize, total: usize| seen.borrow_mut().push((done, total));
+        let _ = get_statistics_with_progress(None, Some(&callback));
+
+        let frames = seen.borrow();
+        assert!(frames.len() >= 2, "首帧 + 收口帧必须都在: {frames:?}");
+        let total = frames[0].1;
+        assert_eq!(frames.first(), Some(&(0, total)), "首帧报 0/total");
+        assert_eq!(frames.last(), Some(&(total, total)), "生产入口末帧必须必达 100%");
+        assert!(
+            frames
+                .windows(2)
+                .all(|pair| pair[1].0 >= pair[0].0 && pair[1].1 == total),
+            "进度不得回退、分母不得漂移：{frames:?}"
+        );
+        assert!(
+            frames.iter().all(|&(done, denominator)| done <= denominator),
+            "分子不得越过分母：{frames:?}"
+        );
     }
 }

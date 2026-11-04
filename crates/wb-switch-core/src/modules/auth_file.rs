@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::modules::account::{get_str, secret_value};
 use crate::modules::config::{atomic_write, backup_dir, now_ms, utc_iso};
+use crate::modules::session_backup;
 use crate::modules::variant::WbVariant;
 
 /// WorkBuddy 官方认证文件路径（按档位，与 cockpit 一致）。
@@ -49,18 +50,48 @@ pub fn read_auth_file_at(path: &Path) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
-/// 切换前备份当前认证文件，返回备份路径。对照 server.py `backup_auth_file`。
-pub fn backup_auth_file(variant: WbVariant) -> Option<PathBuf> {
-    let path = auth_file_path(variant);
-    if !path.exists() {
-        return None;
+/// 切换前备份当前认证文件。对照 server.py `backup_auth_file`。
+///
+/// 三态语义不可合并：旧实现把「文件不存在」与「复制失败」都吞成 `None`，
+/// 导致磁盘满/权限受限时仍继续覆盖认证文件，切号失败再也回不到原账号。
+/// - `Ok(Some(dest))`：原文件存在且已可靠复制，可作为人工恢复依据；
+/// - `Ok(None)`：原文件本就不存在，无可备份内容——允许继续，如实上报；
+/// - `Err(reason)`：目录创建或复制失败——调用方必须中止，绝不写认证。
+pub fn backup_auth_file(variant: WbVariant) -> Result<Option<PathBuf>, String> {
+    backup_auth_file_at(&auth_file_path(variant), &backup_dir(), variant)
+}
+
+/// 路径注入的备份接缝：真实落盘的失败分支无需改动全局 HOME 即可测试。
+fn backup_auth_file_at(
+    path: &Path,
+    dir: &Path,
+    variant: WbVariant,
+) -> Result<Option<PathBuf>, String> {
+    match std::fs::metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "检查认证文件失败（{}）：{error}，已中止切换，未写入目标账号",
+                path.display()
+            ));
+        }
     }
-    let dir = backup_dir();
-    std::fs::create_dir_all(&dir).ok()?;
-    let ts = utc_iso();
-    let dest = dir.join(variant.backup_file_name(&ts));
-    std::fs::copy(&path, &dest).ok()?;
-    Some(dest)
+    std::fs::create_dir_all(dir).map_err(|error| {
+        format!(
+            "创建认证备份目录失败（{}）：{error}，已中止切换，未写入目标账号",
+            dir.display()
+        )
+    })?;
+    let dest = dir.join(variant.backup_file_name(&utc_iso()));
+    std::fs::copy(path, &dest).map_err(|error| {
+        format!(
+            "备份认证文件失败（{} → {}）：{error}，已中止切换，未写入目标账号",
+            path.display(),
+            dest.display()
+        )
+    })?;
+    Ok(Some(dest))
 }
 
 /// 从账号库记录构造官方 account 字段。对照 server.py `build_account_obj`。
@@ -198,17 +229,43 @@ pub fn build_auth_obj(acc: &Value) -> Value {
     Value::Object(obj)
 }
 
-/// 把账号写入官方认证文件（原子写 + 写后校验）。对照 server.py `write_account_to_auth_file`。
+/// 把账号写入官方认证文件（原子写 + 写后校验 + 失败自动回滚）。
+/// 对外签名保持不变：`switch.rs` 与集成测试仍只用 `(acc, variant)`。
+/// 对照 server.py `write_account_to_auth_file`。
 pub fn write_account_to_auth_file(acc: &Value, variant: WbVariant) -> Result<(), String> {
     write_account_to_auth_file_at(acc, &auth_file_path(variant))
 }
 
 fn write_account_to_auth_file_at(acc: &Value, path: &Path) -> Result<(), String> {
+    commit_auth_write_with(acc, path, atomic_write, finalize_auth_write)
+}
+
+/// 认证写入事务：写前快照 → 写盘 → 写后收尾 → 任一阶段失败自动回滚。
+///
+/// `write` 与 `finalize` 是可注入接缝：生产传入 `atomic_write` 与「读回校验 +
+/// 清理退出标记」，测试可注入失败钩子，真实落盘验证任意阶段的失败都被回滚。
+/// 绝不假设「写盘返回 Err ⇒ 文件未被改动」：config::atomic_write 会在 rename
+/// 已成功后因父目录 fsync 失败返回 Err，此时主文件已是新内容。
+fn commit_auth_write_with<F>(
+    acc: &Value,
+    path: &Path,
+    write: fn(&Path, &str) -> std::io::Result<()>,
+    finalize: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path, &Value) -> Result<(), String>,
+{
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    let existing = read_auth_file_at(path).unwrap_or_else(|| json!({}));
+    // 边界一次性归一化：整份原文件字节同时充当回滚源与 allAccounts 解析源，
+    // 避免两次读取之间出现不一致；「不存在」与「读失败」严格区分。
+    let original = snapshot_auth_bytes(path)?;
+    let existing = original
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+        .unwrap_or_else(|| json!({}));
     eprintln!(
         "[auth] write_account: existing is_object={} allAccounts_len={}",
         existing.is_object(),
@@ -218,6 +275,38 @@ fn write_account_to_auth_file_at(acc: &Value, path: &Path) -> Result<(), String>
             .map(|a| a.len())
             .unwrap_or(0)
     );
+
+    let (content, expect_token) = build_session_content(acc, &existing)?;
+    let outcome = match write(path, &content) {
+        Ok(()) => finalize(path, &expect_token),
+        Err(error) => {
+            eprintln!("[auth] atomic_write FAILED: {error}");
+            Err(write_failure_message(error))
+        }
+    };
+
+    // 写盘可能在 rename 已成功后才返回 Err（父目录 fsync 失败），因此不能按
+    // 「哪个阶段失败」决定是否回滚：只要 commit 未成功，一律恢复到写前字节。
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(reason) => Err(rollback_auth_file(path, &original, reason)),
+    }
+}
+
+/// 写前快照：不存在 → None（允许继续）；读失败 → Err（绝不误判为无文件后覆盖）。
+fn snapshot_auth_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "读取当前认证文件失败（{}）：{error}",
+            path.display()
+        )),
+    }
+}
+
+/// 纯业务计算：合并 allAccounts 并序列化，返回写盘内容与期望的 accessToken。
+fn build_session_content(acc: &Value, existing: &Value) -> Result<(String, Value), String> {
     let all_accounts = existing
         .get("allAccounts")
         .cloned()
@@ -253,33 +342,40 @@ fn write_account_to_auth_file_at(acc: &Value, path: &Path) -> Result<(), String>
         "allAccounts": &all,
     });
     let content = serde_json::to_string_pretty(&session).map_err(|e| e.to_string())?;
-    if let Err(e) = atomic_write(path, &content) {
-        eprintln!("[auth] atomic_write FAILED: {e}");
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            return Err(
-                "无权限写入认证文件：请打开 系统设置→隐私与安全性→App 管理，允许本 App 控制 WorkBuddy 的数据（或为其开启『完全磁盘访问』后重试）"
-                    .to_string(),
-            );
-        }
-        return Err(e.to_string());
-    }
+    let expect_token = auth_obj.get("accessToken").cloned().unwrap_or(Value::Null);
+    Ok((content, expect_token))
+}
 
-    // 写后校验：按值比较（token 可能是明文字符串，也可能是 WorkBuddy 5.6 加密信封对象）
-    let written: Value =
-        serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+fn write_failure_message(error: std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        return "无权限写入认证文件：请打开 系统设置→隐私与安全性→App 管理，允许本 App 控制 WorkBuddy 的数据（或为其开启『完全磁盘访问』后重试）"
+            .to_string();
+    }
+    error.to_string()
+}
+
+/// 写后校验按值比较：accessToken 可能是明文字符串，也可能是 WorkBuddy 5.6 加密信封。
+fn verify_written_token(written: &Value, expect_token: &Value) -> Result<(), String> {
     let written_token = written
         .get("auth")
         .and_then(|a| a.get("accessToken"))
         .cloned()
         .unwrap_or(Value::Null);
-    let expect_token = auth_obj.get("accessToken").cloned().unwrap_or(Value::Null);
-    if written_token != expect_token {
+    if written_token != *expect_token {
         return Err("认证文件写后校验失败，未写入目标账号".to_string());
     }
+    Ok(())
+}
+
+/// 写后收尾：读回校验 → 清理官方退出标记。任一失败都由事务统一回滚。
+fn finalize_auth_write(path: &Path, expect_token: &Value) -> Result<(), String> {
+    let written: Value =
+        serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    verify_written_token(&written, expect_token)?;
 
     // WorkBuddy 优先读取退出标记：即使认证文件已有凭据，标记仍存在时也视为未登录。
-    // 必须在写入及校验成功后清理；失败时保留退出状态，并阻止调用方报告切换成功。
+    // 清理失败时标记保持原样，配合认证文件回滚即可完整复原切换前状态。
     let marker = logout_marker_path(path);
     match std::fs::remove_file(&marker) {
         Ok(()) => {}
@@ -292,6 +388,54 @@ fn write_account_to_auth_file_at(acc: &Value, path: &Path) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+/// 把认证文件恢复到写前字节；原文件本就不存在时恢复为「不存在」。
+///
+/// 回滚写回复用 `durable_write`（sync_all + 原子 rename + 同步父目录），
+/// 让「回滚过程中断电」也不会留下半写入的认证文件。回滚失败必须如实上报，
+/// 绝不假装已经回到原账号。
+fn rollback_auth_file(path: &Path, original: &Option<Vec<u8>>, reason: String) -> String {
+    let restored = match original {
+        Some(bytes) => session_backup::durable_write(path, bytes),
+        None => remove_auth_file_if_present(path),
+    };
+    // durable_write 与 atomic_write 一样，可能在 rename 已成功后因父目录 fsync
+    // 失败返回 Err（保守误报，数据其实已落盘）。唯一可信判据是落盘字节是否
+    // 真的回到写前状态，而不是写操作的返回值。
+    if auth_file_matches_snapshot(path, original) {
+        return format!("{reason}；已自动回滚认证文件到切换前的账号");
+    }
+    let detail = restored
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "回滚后内容仍与切换前不符".to_string());
+    // 无原文件时本就没有磁盘备份，不能给出「从备份恢复」的误导指引。
+    let recovery = match original {
+        Some(_) => format!("请从 {} 中的备份手动恢复", backup_dir().display()),
+        None => "切换前无认证文件，请手动删除该认证文件后重试".to_string(),
+    };
+    format!(
+        "{reason}；但回滚认证文件失败（{detail}）：当前认证文件可能仍为目标账号，{recovery}"
+    )
+}
+
+/// 回滚是否成功的唯一判据：认证文件当前字节与写前快照逐字节一致。
+fn auth_file_matches_snapshot(path: &Path, original: &Option<Vec<u8>>) -> bool {
+    match (original, std::fs::read(path)) {
+        (Some(expected), Ok(actual)) => actual == *expected,
+        (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => true,
+        _ => false,
+    }
+}
+
+/// 定义错误出局：文件已不存在就是回滚目标已达成，无需报错。
+fn remove_auth_file_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// 官方退出标记是在完整认证文件名后追加后缀，不能替换 `.info` 扩展名。
@@ -495,7 +639,11 @@ mod tests {
         std::fs::write(&marker, "logged-out").unwrap();
         let account = json!({"uid": "target", "access_token": "test-access-token"});
 
-        assert!(write_account_to_auth_file_at(&account, &path).is_err());
+        let error = write_account_to_auth_file_at(&account, &path).unwrap_err();
+        assert!(
+            error.contains("读取当前认证文件失败"),
+            "读失败不得被误判为『原文件不存在』而继续覆盖：{error}"
+        );
 
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "logged-out");
         assert_eq!(
@@ -504,11 +652,17 @@ mod tests {
         );
     }
 
+    /// 退出标记清理失败：不报成功、标记原样保留、认证文件回到切换前的账号。
     #[test]
-    fn failed_logout_marker_removal_is_not_reported_as_success() {
+    fn failed_logout_marker_removal_rolls_back_auth_file() {
         let dir = TempAuthDir::new();
         let path = dir.auth_path(WbVariant::Cn);
         let marker = dir.marker_path(WbVariant::Cn);
+
+        let original = json!({"uid": "original", "access_token": "OLD-AT"});
+        write_account_to_auth_file_at(&original, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
         // 用同名非空目录模拟无法 remove_file 的标记，不依赖平台权限行为。
         std::fs::create_dir(&marker).unwrap();
         std::fs::write(marker.join("keep"), "existing-data").unwrap();
@@ -520,10 +674,12 @@ mod tests {
             error.contains("退出标记"),
             "错误应说明未清理退出标记：{error}"
         );
-        assert!(marker.exists());
+        assert!(error.contains("回滚"), "错误应说明已自动回滚：{error}");
+        assert!(marker.exists(), "标记清理失败必须保留退出状态");
         assert_eq!(
-            read_auth_file_at(&path).unwrap()["account"]["uid"],
-            "target"
+            std::fs::read(&path).unwrap(),
+            before,
+            "认证文件必须逐字节回到原账号"
         );
     }
 
@@ -755,5 +911,251 @@ mod tests {
             WbVariant::Ai,
             "导入账号自带档位，无需依赖域名兜底"
         );
+    }
+
+    /// P0 回归：写后阶段失败时认证文件必须逐字节回到切换前。
+    /// 修复前 atomic_write 已把新账号落盘，marker 清理失败只返回 Err，
+    /// 用户看到「切换失败」但客户端已是目标账号，重试会造成二次切换。
+    #[test]
+    fn failed_post_write_step_restores_auth_file_byte_for_byte() {
+        let dir = TempAuthDir::new();
+        let path = dir.auth_path(WbVariant::Cn);
+        let marker = dir.marker_path(WbVariant::Cn);
+
+        let original = json!({"uid": "original", "access_token": "OLD-AT"});
+        write_account_to_auth_file_at(&original, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(read_auth_file_at(&path).unwrap()["account"]["uid"], "original");
+
+        // 同名非空目录占住退出标记：remove_file 必失败，跨平台且不依赖权限位。
+        std::fs::create_dir(&marker).unwrap();
+        std::fs::write(marker.join("keep"), "existing-data").unwrap();
+
+        let target = json!({"uid": "target", "access_token": "NEW-AT"});
+        let error = write_account_to_auth_file_at(&target, &path).unwrap_err();
+
+        assert!(error.contains("退出标记"), "{error}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "写后失败必须把认证文件逐字节恢复到切换前，不能停留在目标账号"
+        );
+    }
+
+    /// 模拟 config::atomic_write 的新持久化语义：rename 已成功、主文件已是新内容，
+    /// 随后父目录 fsync 才失败返回 Err（Unix 卷不支持 dir-fsync 时的保守误报）。
+    fn write_then_fail_parent_sync(path: &Path, content: &str) -> std::io::Result<()> {
+        atomic_write(path, content)?;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "模拟父目录 fsync 失败（rename 已成功）",
+        ))
+    }
+
+    /// P0 回归：写盘阶段在 rename 已成功后返回 Err，认证文件也必须被回滚。
+    /// 修复前该分支直接 return Err 不回滚，正是「报错但已切」的新触发路径；
+    /// Windows 上 sync_parent_dir 为 no-op，故必须靠注入接缝才能稳定复现。
+    #[test]
+    fn write_failure_after_rename_still_rolls_back_auth_file() {
+        let dir = TempAuthDir::new();
+        let path = dir.auth_path(WbVariant::Cn);
+        let original = json!({"uid": "original", "access_token": "OLD-AT"});
+        write_account_to_auth_file_at(&original, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let target = json!({"uid": "target", "access_token": "NEW-AT"});
+        let error = commit_auth_write_with(
+            &target,
+            &path,
+            write_then_fail_parent_sync,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("fsync"), "{error}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "写盘阶段在 rename 成功后返回 Err，认证文件必须逐字节回滚到切换前"
+        );
+    }
+
+    /// 注入写后校验失败钩子：真实落盘串起「校验不符 → 逐字节回滚」的因果链。
+    #[test]
+    fn failed_write_verification_rolls_back_auth_file() {
+        let dir = TempAuthDir::new();
+        let path = dir.auth_path(WbVariant::Cn);
+        let original = json!({"uid": "original", "access_token": "OLD-AT"});
+        write_account_to_auth_file_at(&original, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let target = json!({"uid": "target", "access_token": "NEW-AT"});
+        let error = commit_auth_write_with(&target, &path, atomic_write, |_, _| {
+            Err("认证文件写后校验失败，未写入目标账号".to_string())
+        })
+        .unwrap_err();
+
+        assert!(error.contains("写后校验"), "{error}");
+        assert!(error.contains("回滚"), "{error}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "写后校验失败必须把认证文件逐字节回滚到切换前"
+        );
+    }
+
+    /// 写后校验按值比较：明文与加密信封都要能识别不符。
+    #[test]
+    fn verify_written_token_rejects_mismatches_for_plain_and_envelope_tokens() {
+        for token in [
+            json!("plain-token"),
+            json!({"$wbEncrypted": 1, "envelope": {"v": 1, "wrapped": "enc"}}),
+        ] {
+            let written = json!({"auth": {"accessToken": token}});
+            let expect = written["auth"]["accessToken"].clone();
+            assert!(verify_written_token(&written, &expect).is_ok());
+
+            let mut wrong = written.clone();
+            wrong["auth"]["accessToken"] = json!("TAMPERED");
+            let error = verify_written_token(&wrong, &expect).unwrap_err();
+            assert!(error.contains("写后校验"), "{error}");
+        }
+    }
+
+    /// 原认证文件本就不存在：写后失败必须恢复成「不存在」，不留目标账号残留。
+    #[test]
+    fn rollback_when_original_absent_restores_absent_auth_file() {
+        let dir = TempAuthDir::new();
+        let path = dir.auth_path(WbVariant::Cn);
+        assert!(!path.exists());
+
+        let target = json!({"uid": "target", "access_token": "NEW-AT"});
+        let error = commit_auth_write_with(&target, &path, atomic_write, |_, _| {
+            Err("模拟写后失败".to_string())
+        })
+        .unwrap_err();
+
+        assert!(error.contains("回滚"), "{error}");
+        assert!(
+            !path.exists(),
+            "切换前无认证文件，回滚后也不得残留目标账号文件"
+        );
+    }
+
+    /// 回滚本身失败必须如实上报，不能让用户误以为已回到原账号。
+    #[test]
+    fn rollback_failure_is_reported_with_recovery_hint() {
+        let dir = TempAuthDir::new();
+        // 父目录不存在 → durable_write 无法创建临时文件，回滚必然失败。
+        let unreachable = dir.0.join("missing-parent").join("auth.info");
+        let message = rollback_auth_file(
+            &unreachable,
+            &Some(b"original-bytes".to_vec()),
+            "模拟写后失败".to_string(),
+        );
+
+        assert!(message.contains("回滚认证文件失败"), "{message}");
+        assert!(message.contains("备份"), "{message}");
+        assert!(!message.contains("已自动回滚"), "{message}");
+    }
+
+    /// 无磁盘备份时的回滚失败指引必须准确，不能误导用户去找备份。
+    #[test]
+    fn rollback_failure_without_original_points_to_manual_removal() {
+        let dir = TempAuthDir::new();
+        let blocked = dir.0.join("blocked-auth.info");
+        // 目录无法被 remove_file 删除 → 回滚必失败（跨平台可靠）。
+        std::fs::create_dir(&blocked).unwrap();
+
+        let message = rollback_auth_file(&blocked, &None, "模拟写后失败".to_string());
+
+        assert!(message.contains("回滚认证文件失败"), "{message}");
+        assert!(message.contains("手动删除"), "{message}");
+        assert!(!message.contains("备份恢复"), "{message}");
+    }
+
+    /// 回滚成功与否只认落盘字节，不认写操作返回值（规避 fsync 保守误报）。
+    #[test]
+    fn rollback_confirmation_uses_on_disk_bytes_not_return_value() {
+        let dir = TempAuthDir::new();
+        let path = dir.auth_path(WbVariant::Cn);
+        let bytes = b"{\"uid\":\"original\"}".to_vec();
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(auth_file_matches_snapshot(&path, &Some(bytes.clone())));
+        assert!(!auth_file_matches_snapshot(&path, &Some(b"other".to_vec())));
+        assert!(!auth_file_matches_snapshot(&path, &None));
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(auth_file_matches_snapshot(&path, &None));
+        assert!(!auth_file_matches_snapshot(&path, &Some(bytes)));
+    }
+
+    /// 三态之一：原文件不存在 → Ok(None)，且不得凭空创建备份目录。
+    #[test]
+    fn backup_when_auth_missing_returns_none_without_creating_backup_dir() {
+        let dir = TempAuthDir::new();
+        let path = dir.auth_path(WbVariant::Cn);
+        let backups = dir.0.join("backups");
+        assert!(!path.exists());
+
+        assert!(backup_auth_file_at(&path, &backups, WbVariant::Cn)
+            .unwrap()
+            .is_none());
+        assert!(!backups.exists(), "无原文件时不应产生空备份目录");
+    }
+
+    /// 三态之二：原文件存在 → Ok(Some(dest))，备份逐字节等于原文件。
+    #[test]
+    fn backup_copies_existing_auth_byte_for_byte() {
+        let raw = b"{\"account\":{\"uid\":\"original\"},\"auth\":{\"accessToken\":\"OLD\"}}".to_vec();
+        for variant in [WbVariant::Cn, WbVariant::Ai] {
+            let dir = TempAuthDir::new();
+            let path = dir.auth_path(variant);
+            let backups = dir.0.join("backups");
+            std::fs::write(&path, &raw).unwrap();
+
+            let dest = backup_auth_file_at(&path, &backups, variant)
+                .unwrap()
+                .expect("原文件存在必须产生备份");
+
+            assert_eq!(std::fs::read(&dest).unwrap(), raw);
+            assert!(dest.starts_with(&backups));
+            assert_eq!(std::fs::read(&path).unwrap(), raw, "备份不得改动原文件");
+        }
+    }
+
+    /// 三态之三（目录创建失败，等价磁盘满/权限受限）：必须 Err 并中止，不得再吞成 None。
+    #[test]
+    fn backup_dir_failure_is_reported_instead_of_silently_ignored() {
+        let dir = TempAuthDir::new();
+        let path = dir.auth_path(WbVariant::Cn);
+        let raw = b"original-auth".to_vec();
+        std::fs::write(&path, &raw).unwrap();
+        // 用文件占住备份目录的祖先，create_dir_all 必失败。
+        let blocker = dir.0.join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let backups = blocker.join("backups");
+
+        let error = backup_auth_file_at(&path, &backups, WbVariant::Cn).unwrap_err();
+
+        assert!(error.contains("备份"), "{error}");
+        assert!(error.contains("未写入目标账号"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+    }
+
+    /// 三态之三（复制失败）：必须 Err，不得静默忽略后覆盖认证。
+    #[test]
+    fn backup_copy_failure_is_reported_instead_of_silently_ignored() {
+        let dir = TempAuthDir::new();
+        let path = dir.auth_path(WbVariant::Cn);
+        let backups = dir.0.join("backups");
+        // metadata 判定存在，但 fs::copy 无法复制目录，跨平台可靠。
+        std::fs::create_dir(&path).unwrap();
+
+        let error = backup_auth_file_at(&path, &backups, WbVariant::Cn).unwrap_err();
+
+        assert!(error.contains("备份认证文件失败"), "{error}");
+        assert!(error.contains("未写入目标账号"), "{error}");
     }
 }

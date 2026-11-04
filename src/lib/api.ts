@@ -21,6 +21,7 @@ import type {
   GithubConfig,
   ImportPreviewAccount,
   ImportResult,
+  MemorySyncMode,
   OAuthPollResult,
   OAuthStartResult,
   RateLimitConfig,
@@ -553,14 +554,19 @@ export function switchAccount(args: {
   shareSessions?: boolean;
   copySessionIds?: string[];
   syncSelections?: SessionSyncSelection[];
-  /** 勾选后把本机所有账号的记忆合并成一份并分发回去。 */
-  mergeMemory?: boolean;
+  /**
+   * 工作记忆同步方式：不传 = 不同步；`merge` = 合并；`overwrite` = 复制覆盖。
+   * 取代旧版 `mergeMemory?: boolean`，两套参数不并存。
+   */
+  memoryMode?: MemorySyncMode;
+  /** `overwrite` 时必填：母本账号 uid，后端以 `user-{uid}-personal/MEMORY.md` 取原文。 */
+  memorySourceUid?: string;
   /** 勾选后把本机各账号已添加的专家团汇总成一份，写回每个账号。 */
   mergeExperts?: boolean;
   /**
    * 勾选后把最完整的一份人设（SOUL / IDENTITY / USER）同步到所有账号。
    *
-   * 与 `mergeMemory` 独立：人设是手写内容，和记忆合并的副作用完全不同。
+   * 与工作记忆同步独立：人设是手写内容，和记忆合并/覆盖的副作用完全不同。
    */
   syncPersona?: boolean;
   /**

@@ -607,12 +607,13 @@ fn persist_cli_region_env(variant: WbVariant) -> Result<(), String> {
         .map_err(|_| "CodeBuddy settings.json 不是有效 JSON")?
         .unwrap_or_else(|| json!({}));
     apply_cli_region_env(&mut value, variant)?;
-    persist_settings_at(&settings, &value).inspect_err(|_| {
-        restore_file(&settings, previous.as_deref());
-    })?;
+    if let Err(error) = persist_settings_at(&settings, &value) {
+        let restore = restore_file(&settings, previous.as_deref());
+        return Err(with_rollback_result(error, restore));
+    }
     if let Err(error) = sync_cli_runtime_cache(&settings, variant) {
-        restore_file(&settings, previous.as_deref());
-        return Err(error);
+        let restore = restore_file(&settings, previous.as_deref());
+        return Err(with_rollback_result(error, restore));
     }
     Ok(())
 }
@@ -628,8 +629,8 @@ fn commit_settings_env_update(
         .and_then(|_| validate_persisted_env_token_at(settings, expected_token))
         .and_then(|_| sync_cli_runtime_cache(settings, variant))
     {
-        restore_file(settings, previous);
-        return Err(error);
+        let restore = restore_file(settings, previous);
+        return Err(with_rollback_result(error, restore));
     }
     Ok(())
 }
@@ -809,11 +810,115 @@ fn configured_helper_path(path: &Path) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
-fn restore_file(path: &Path, previous: Option<&str>) {
-    if let Some(previous) = previous {
-        let _ = atomic_write(path, previous);
-    } else {
-        let _ = std::fs::remove_file(path);
+/// 回滚成功的唯一可信判据：当前落盘字节 == 写前快照。
+///
+/// 绝不采信写原语的返回值——`config::atomic_write` 会在 rename 已成功后因
+/// 父目录 fsync 失败返回 Err，此时主文件其实已是新内容；反过来，一次「返回
+/// Err」的回滚写也可能已经把字节写对了。逐字节比对才能如实回答「回到写前了吗」。
+fn file_matches_snapshot(path: &Path, previous: Option<&str>) -> bool {
+    match (previous, std::fs::read(path)) {
+        (Some(expected), Ok(actual)) => actual == expected.as_bytes(),
+        (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => true,
+        _ => false,
+    }
+}
+
+/// 定义错误出局：文件本就不存在即「已恢复到写前」，无需报错。
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// 单文件回滚深模块：写回快照 → **落盘逐字节复核** → 如实上报。
+///
+/// `write` 是可注入接缝：生产传 `atomic_write`，测试可注入「先落盘再 Err」或
+/// 「写入直接失败」的替身，验证任意写盘返回语义下都能给出正确结论，绝不再用
+/// `let _ =` 把回滚结果吞掉。
+fn restore_file_with<W>(path: &Path, previous: Option<&str>, write: W) -> Result<(), String>
+where
+    W: FnOnce(&Path, &str) -> std::io::Result<()>,
+{
+    // 定义错误出局：已经处于写前状态就是「无需回滚」。统一 outcome 会对两份文件
+    // 都尝试回滚，早期失败时 settings 根本没被写过——这个守卫让它成为零副作用 no-op，
+    // 既不产生冗余写盘，也不会因一次无关的失败而误报回滚错误。
+    if file_matches_snapshot(path, previous) {
+        return Ok(());
+    }
+    let write_error = match previous {
+        Some(content) => write(path, content).err(),
+        None => remove_file_if_present(path).err(),
+    };
+    if file_matches_snapshot(path, previous) {
+        return Ok(());
+    }
+    let detail = write_error
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "回滚写入后内容仍与写前不一致".to_string());
+    Err(format!("无法把 {} 恢复到写前状态：{detail}", path.display()))
+}
+
+/// 生产入口：回滚写一律用 `atomic_write`（durable），且落盘复核。
+fn restore_file(path: &Path, previous: Option<&str>) -> Result<(), String> {
+    restore_file_with(path, previous, |p, c| atomic_write(p, c))
+}
+
+/// 失败文案如实叠加回滚结论：回滚干净时保留原始错误（成功路径/既有文案零改动）；
+/// 回滚失败时显式警告「可能半安装」，绝不假装配置已复原。
+fn with_rollback_result(reason: String, rollback: Result<(), String>) -> String {
+    match rollback {
+        Ok(()) => reason,
+        Err(detail) => format!(
+            "{reason}；且回滚失败（{detail}）：当前配置可能处于半安装状态，请手动检查后重试"
+        ),
+    }
+}
+
+/// 一次安装事务涉及的两份文件与各自的写前快照（边界一次性归一化）。
+struct InstallPair<'a> {
+    settings: &'a Path,
+    previous_settings: Option<&'a str>,
+    logic_target: &'a Path,
+    previous_logic: Option<&'a str>,
+}
+
+/// 安装事务的统一回滚：settings 与 helper 成对恢复到写前字节。
+///
+/// 两个文件都尽力回滚（不因其中一个失败就短路另一个），失败信息聚合后如实上报。
+fn rollback_install_with<W>(pair: &InstallPair<'_>, write: &W) -> Result<(), String>
+where
+    W: Fn(&Path, &str) -> std::io::Result<()>,
+{
+    // 两个文件都尽力回滚：不因其中一个失败就短路另一个，避免留下半安装态。
+    let settings = restore_file_with(pair.settings, pair.previous_settings, |p, c| write(p, c));
+    let logic = restore_file_with(pair.logic_target, pair.previous_logic, |p, c| write(p, c));
+    match (settings, logic) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(settings_error), Err(logic_error)) => {
+            Err(format!("{settings_error}；{logic_error}"))
+        }
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+/// 安装事务：写前快照 → 执行 `steps`（全部经 `write` 写盘 + 写后校验）→ 单一 outcome。
+///
+/// **不再按「哪个阶段失败」决定回滚谁**：写盘可能在 rename 已成功后才返回 Err，
+/// 任一阶段失败都走同一个成对回滚，从根上消除「只回一半」的漏路径。
+/// `write` 与 `steps` 均为可注入接缝，便于在 Windows 上复现 post-rename fsync 失败。
+fn commit_install_with<W, S>(pair: &InstallPair<'_>, write: W, steps: S) -> Result<(), String>
+where
+    W: Fn(&Path, &str) -> std::io::Result<()>,
+    S: FnOnce(&W) -> Result<(), String>,
+{
+    match steps(&write) {
+        Ok(()) => Ok(()),
+        Err(reason) => {
+            let rollback = rollback_install_with(pair, &write);
+            Err(with_rollback_result(reason, rollback))
+        }
     }
 }
 
@@ -1319,85 +1424,79 @@ pub fn install_helper() -> Result<Value, String> {
         return Err("CodeBuddy settings.json 顶层不是对象".to_string());
     }
 
-    std::fs::create_dir_all(rotate_dir()).map_err(|_| {
-        helper_validation_error("安装阶段", "无法创建 helper 目录，请检查用户目录权限")
-    })?;
-    // 各平台都直接配置这份 helper.cjs。
-    atomic_write(&logic_target, STANDARD_HELPER)
-        .map_err(|_| helper_validation_error("安装阶段", "无法写入 helper.cjs，请检查文件权限"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if std::fs::set_permissions(&logic_target, std::fs::Permissions::from_mode(0o700)).is_err()
+    // 写 helper + 写 settings + 写后校验统一为单个 outcome：任一阶段失败都走同一个
+    // 成对回滚，不再按「哪个阶段失败」决定回滚谁。写盘可能在 rename 已成功后才
+    // 返回 Err（父目录 fsync 失败），此时 settings 已是新内容——只回滚 helper 会留下
+    // 「settings 指向新 helper、helper 却是旧内容」的半安装态。
+    let pair = InstallPair {
+        settings: settings.as_path(),
+        previous_settings: previous_settings.as_deref(),
+        logic_target: logic_target.as_path(),
+        previous_logic: previous_logic.as_deref(),
+    };
+    commit_install_with(&pair, atomic_write, |write| {
+        std::fs::create_dir_all(rotate_dir()).map_err(|_| {
+            helper_validation_error("安装阶段", "无法创建 helper 目录，请检查用户目录权限")
+        })?;
+        // 各平台都直接配置这份 helper.cjs。
+        write(&logic_target, STANDARD_HELPER).map_err(|_| {
+            helper_validation_error("安装阶段", "无法写入 helper.cjs，请检查文件权限")
+        })?;
+        #[cfg(unix)]
         {
-            restore_file(&logic_target, previous_logic.as_deref());
-            return Err(helper_validation_error(
-                "安装阶段",
-                "无法设置 helper 执行权限",
-            ));
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::set_permissions(
+                &logic_target,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .is_err()
+            {
+                return Err(helper_validation_error(
+                    "安装阶段",
+                    "无法设置 helper 执行权限",
+                ));
+            }
         }
-    }
-    // CodeBuddy 2.138.0 会先将 apiKeyHelper 当作文件路径解析，然后在
-    // Windows Git Bash eval 前将 `C:\\...` 归一化为 `C:/...`。这里必须
-    // 保持为未引号的绝对路径，否则 CLI 会错将它解析到当前工作目录。
-    let configured_target = match configured_helper_path(&target) {
-        Ok(path) => path,
-        Err(error) => {
-            restore_file(&logic_target, previous_logic.as_deref());
-            return Err(error);
+        // CodeBuddy 2.138.0 会先将 apiKeyHelper 当作文件路径解析，然后在
+        // Windows Git Bash eval 前将 `C:\\...` 归一化为 `C:/...`。这里必须
+        // 保持为未引号的绝对路径，否则 CLI 会错将它解析到当前工作目录。
+        let configured_target = configured_helper_path(&target)?;
+        let configured_command = configured_target.to_string_lossy().to_string();
+        settings_value["apiKeyHelper"] = json!(configured_command);
+        let content = serde_json::to_string_pretty(&settings_value).map_err(|_| {
+            helper_validation_error("配置阶段", "无法生成 CodeBuddy settings.json")
+        })?;
+        if let Some(parent) = settings.parent() {
+            std::fs::create_dir_all(parent).map_err(|_| {
+                helper_validation_error(
+                    "配置阶段",
+                    "无法创建 CodeBuddy 配置目录，请检查用户目录权限",
+                )
+            })?;
         }
-    };
-    let configured_command = configured_target.to_string_lossy().to_string();
-    settings_value["apiKeyHelper"] = json!(configured_command);
-    let content = match serde_json::to_string_pretty(&settings_value) {
-        Ok(content) => content,
-        Err(_) => {
-            restore_file(&logic_target, previous_logic.as_deref());
-            return Err(helper_validation_error(
+        write(&settings, &content).map_err(|_| {
+            helper_validation_error(
                 "配置阶段",
-                "无法生成 CodeBuddy settings.json",
-            ));
-        }
-    };
-    if let Some(parent) = settings.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            restore_file(&logic_target, previous_logic.as_deref());
-            return Err(helper_validation_error(
-                "配置阶段",
-                "无法创建 CodeBuddy 配置目录，请检查用户目录权限",
-            ));
-        }
-    }
-    if atomic_write(&settings, &content).is_err() {
-        restore_file(&logic_target, previous_logic.as_deref());
-        return Err(helper_validation_error(
-            "配置阶段",
-            "无法写入 CodeBuddy settings.json，请检查文件权限",
-        ));
-    }
+                "无法写入 CodeBuddy settings.json，请检查文件权限",
+            )
+        })?;
 
-    let accounts = account::load_accounts();
-    let state = load_state();
-    let active_account =
-        state_account_index(&state, &accounts).and_then(|(index, _)| accounts.get(index));
-    let variant = active_account.map(WbVariant::from_account);
-    let validation = active_account
-        .ok_or_else(|| {
-            helper_validation_error("账号阶段", "当前没有可供 helper 验证的账号，请先添加账号")
-        })
-        .and_then(|account| validate_helper_for_account(&configured_command, account));
-    if let Err(error) = validation {
-        restore_file(&settings, previous_settings.as_deref());
-        restore_file(&logic_target, previous_logic.as_deref());
-        return Err(error);
-    }
-    if let Some(variant) = variant {
-        if let Err(error) = persist_cli_region_env(variant) {
-            restore_file(&settings, previous_settings.as_deref());
-            restore_file(&logic_target, previous_logic.as_deref());
-            return Err(error);
+        let accounts = account::load_accounts();
+        let state = load_state();
+        let active_account =
+            state_account_index(&state, &accounts).and_then(|(index, _)| accounts.get(index));
+        let variant = active_account.map(WbVariant::from_account);
+        let validation = active_account
+            .ok_or_else(|| {
+                helper_validation_error("账号阶段", "当前没有可供 helper 验证的账号，请先添加账号")
+            })
+            .and_then(|account| validate_helper_for_account(&configured_command, account));
+        validation?;
+        if let Some(variant) = variant {
+            persist_cli_region_env(variant)?;
         }
-    }
+        Ok(())
+    })?;
 
     // 验证通过后再清理旧版 helper.sh，避免失败时破坏旧配置。
     if legacy_target.exists() && legacy_target != target {
@@ -1488,8 +1587,11 @@ pub fn switch_active_account(account_id: &str) -> Result<Value, String> {
             &token,
             variant,
         ) {
-            restore_file(&state_path(), previous_state.as_deref());
-            return Err(after_close_error(error, closed_count));
+            let restore = restore_file(&state_path(), previous_state.as_deref());
+            return Err(after_close_error(
+                with_rollback_result(error, restore),
+                closed_count,
+            ));
         }
     } else {
         // helper 校验必须在 state 写完之后：helper 是照 `state.json` 选 token 的，
@@ -1499,8 +1601,11 @@ pub fn switch_active_account(account_id: &str) -> Result<Value, String> {
             .and_then(|command| validate_helper_for_account(&command, &accounts[index]))
             .and_then(|_| persist_cli_region_env(variant));
         if let Err(error) = validation {
-            restore_file(&state_path(), previous_state.as_deref());
-            return Err(after_close_error(error, closed_count));
+            let restore = restore_file(&state_path(), previous_state.as_deref());
+            return Err(after_close_error(
+                with_rollback_result(error, restore),
+                closed_count,
+            ));
         }
     }
 
@@ -2151,13 +2256,285 @@ mod tests {
         fs::create_dir_all(&test_dir).unwrap();
         let existing = test_dir.join("existing.json");
         fs::write(&existing, "old").unwrap();
-        restore_file(&existing, Some("old"));
+        restore_file(&existing, Some("old")).unwrap();
         assert_eq!(fs::read_to_string(&existing).unwrap(), "old");
 
         let newly_created = test_dir.join("new.json");
         fs::write(&newly_created, "temporary").unwrap();
-        restore_file(&newly_created, None);
+        restore_file(&newly_created, None).unwrap();
         assert!(!newly_created.exists());
         fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // T9 安装回滚原子性：写盘返回 Err ≠ 文件未动；失败必须成对、逐字节回滚。
+    // -----------------------------------------------------------------------
+
+    /// 安装事务的磁盘 fixture：目录下的 settings.json / helper.cjs 各自有写前内容。
+    fn install_fixture() -> (PathBuf, PathBuf, PathBuf) {
+        let dir = helper_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        (dir.clone(), dir.join("settings.json"), dir.join("helper.cjs"))
+    }
+
+    const OLD_SETTINGS: &str = r#"{"env":{"A":1}}"#;
+    const NEW_SETTINGS: &str = r#"{"apiKeyHelper":"/tmp/helper.cjs","env":{"A":1}}"#;
+    const OLD_LOGIC: &str = "OLD_HELPER_LOGIC";
+    const NEW_LOGIC: &str = "NEW_HELPER_LOGIC";
+
+    /// 注入替身：先把字节真正落到盘上（模拟 rename 已成功），再对 settings.json
+    /// 返回 Err —— 精确复刻 config::atomic_write 的 post-rename fsync 失败语义。
+    /// Windows 上该路径物理不可达，只能靠这个接缝稳定复现。
+    fn land_then_fail_settings(path: &Path, content: &str) -> std::io::Result<()> {
+        atomic_write(path, content)?;
+        if path.file_name().and_then(|name| name.to_str()) == Some("settings.json") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "模拟父目录 fsync 失败（rename 已成功）",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 注入替身：安装写入正常落盘，但写前字节（回滚写入）一律失败且不落盘，
+    /// 用来证明「回滚本身失败」会被如实上报。
+    fn land_install_fail_rollback(path: &Path, content: &str) -> std::io::Result<()> {
+        if content == OLD_SETTINGS || content == OLD_LOGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "模拟回滚写失败",
+            ));
+        }
+        atomic_write(path, content)
+    }
+
+    /// 两步安装（写 helper → 写 settings → 校验），经可注入 write 落盘。
+    fn install_steps<W>(write: &W, settings: &Path, logic: &Path) -> Result<(), String>
+    where
+        W: Fn(&Path, &str) -> std::io::Result<()>,
+    {
+        write(logic, NEW_LOGIC).map_err(|error| error.to_string())?;
+        write(settings, NEW_SETTINGS).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn settings_write_err_after_rename_rolls_back_both_files() {
+        let (dir, settings, logic) = install_fixture();
+        fs::write(&settings, OLD_SETTINGS).unwrap();
+        fs::write(&logic, OLD_LOGIC).unwrap();
+        let pair = InstallPair {
+            settings: settings.as_path(),
+            previous_settings: Some(OLD_SETTINGS),
+            logic_target: logic.as_path(),
+            previous_logic: Some(OLD_LOGIC),
+        };
+
+        let error = commit_install_with(&pair, land_then_fail_settings, |write| {
+            install_steps(write, &settings, &logic)
+        })
+        .unwrap_err();
+
+        assert!(error.contains("fsync"), "错误应保留写盘失败原因: {error}");
+        assert_eq!(
+            fs::read(&settings).unwrap(),
+            OLD_SETTINGS.as_bytes(),
+            "settings 必须逐字节回滚到安装前（post-rename fsync 失败时它其实已落盘）"
+        );
+        assert_eq!(
+            fs::read(&logic).unwrap(),
+            OLD_LOGIC.as_bytes(),
+            "helper 必须逐字节回滚到安装前"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn finalize_failure_rolls_back_both_files() {
+        let (dir, settings, logic) = install_fixture();
+        fs::write(&settings, OLD_SETTINGS).unwrap();
+        fs::write(&logic, OLD_LOGIC).unwrap();
+        let pair = InstallPair {
+            settings: settings.as_path(),
+            previous_settings: Some(OLD_SETTINGS),
+            logic_target: logic.as_path(),
+            previous_logic: Some(OLD_LOGIC),
+        };
+
+        let error = commit_install_with(&pair, atomic_write, |write| {
+            install_steps(write, &settings, &logic)?;
+            Err("模拟写后校验失败".to_string())
+        })
+        .unwrap_err();
+
+        assert!(error.contains("模拟写后校验失败"), "{error}");
+        assert_eq!(fs::read(&settings).unwrap(), OLD_SETTINGS.as_bytes());
+        assert_eq!(fs::read(&logic).unwrap(), OLD_LOGIC.as_bytes());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn successful_install_keeps_new_content_in_both_files() {
+        let (dir, settings, logic) = install_fixture();
+        fs::write(&settings, OLD_SETTINGS).unwrap();
+        fs::write(&logic, OLD_LOGIC).unwrap();
+        let pair = InstallPair {
+            settings: settings.as_path(),
+            previous_settings: Some(OLD_SETTINGS),
+            logic_target: logic.as_path(),
+            previous_logic: Some(OLD_LOGIC),
+        };
+
+        commit_install_with(&pair, atomic_write, |write| {
+            install_steps(write, &settings, &logic)
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&settings).unwrap(), NEW_SETTINGS.as_bytes());
+        assert_eq!(fs::read(&logic).unwrap(), NEW_LOGIC.as_bytes());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn consecutive_failed_installs_are_idempotent() {
+        let (dir, settings, logic) = install_fixture();
+        fs::write(&settings, OLD_SETTINGS).unwrap();
+        fs::write(&logic, OLD_LOGIC).unwrap();
+        let pair = InstallPair {
+            settings: settings.as_path(),
+            previous_settings: Some(OLD_SETTINGS),
+            logic_target: logic.as_path(),
+            previous_logic: Some(OLD_LOGIC),
+        };
+
+        for attempt in 1..=2 {
+            commit_install_with(&pair, land_then_fail_settings, |write| {
+                install_steps(write, &settings, &logic)
+            })
+            .unwrap_err();
+            assert_eq!(
+                fs::read(&settings).unwrap(),
+                OLD_SETTINGS.as_bytes(),
+                "第 {attempt} 次失败后 settings 仍须逐字节等于安装前"
+            );
+            assert_eq!(
+                fs::read(&logic).unwrap(),
+                OLD_LOGIC.as_bytes(),
+                "第 {attempt} 次失败后 helper 仍须逐字节等于安装前"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rollback_write_failure_is_reported_not_silently_swallowed() {
+        let (dir, settings, logic) = install_fixture();
+        fs::write(&settings, OLD_SETTINGS).unwrap();
+        fs::write(&logic, OLD_LOGIC).unwrap();
+        let pair = InstallPair {
+            settings: settings.as_path(),
+            previous_settings: Some(OLD_SETTINGS),
+            logic_target: logic.as_path(),
+            previous_logic: Some(OLD_LOGIC),
+        };
+
+        let error = commit_install_with(&pair, land_install_fail_rollback, |write| {
+            install_steps(write, &settings, &logic)?;
+            Err("模拟写后校验失败".to_string())
+        })
+        .unwrap_err();
+
+        assert!(error.contains("模拟写后校验失败"), "{error}");
+        assert!(
+            error.contains("回滚失败") && error.contains("半安装"),
+            "回滚写失败必须如实上报，不得假装已复原: {error}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restore_file_with_write_then_err_still_verifies_landed_bytes() {
+        let (dir, settings, _logic) = install_fixture();
+        fs::write(&settings, NEW_SETTINGS).unwrap();
+
+        let result = restore_file_with(&settings, Some(OLD_SETTINGS), |path, content| {
+            atomic_write(path, content)?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "模拟父目录 fsync 失败",
+            ))
+        });
+
+        assert!(
+            result.is_ok(),
+            "字节已回到快照，就不能因写原语返回 Err 而误判回滚失败: {result:?}"
+        );
+        assert_eq!(fs::read(&settings).unwrap(), OLD_SETTINGS.as_bytes());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restore_file_with_failing_write_returns_err() {
+        let (dir, settings, _logic) = install_fixture();
+        fs::write(&settings, NEW_SETTINGS).unwrap();
+
+        let result = restore_file_with(&settings, Some(OLD_SETTINGS), |_path, _content| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "模拟回滚写失败",
+            ))
+        });
+
+        assert!(result.is_err(), "回滚写失败不得静默返回成功");
+        assert!(result.unwrap_err().contains("模拟回滚写失败"));
+        assert_eq!(
+            fs::read(&settings).unwrap(),
+            NEW_SETTINGS.as_bytes(),
+            "如实上报的同时不得谎称已复原"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restore_absent_original_removes_the_created_file() {
+        let (dir, settings, _logic) = install_fixture();
+        fs::write(&settings, NEW_SETTINGS).unwrap();
+
+        restore_file_with(&settings, None, |_path, _content| {
+            Ok(())
+        })
+        .unwrap();
+        assert!(!settings.exists());
+        // 幂等：对本来就不存在的文件再次回滚仍成功。
+        restore_file_with(&settings, None, |_path, _content| Ok(())).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn file_matches_snapshot_covers_all_three_states() {
+        let (dir, path, _logic) = install_fixture();
+        fs::write(&path, "abc").unwrap();
+        assert!(file_matches_snapshot(&path, Some("abc")));
+        assert!(!file_matches_snapshot(&path, Some("other")));
+        assert!(!file_matches_snapshot(&path, None));
+        fs::remove_file(&path).unwrap();
+        assert!(file_matches_snapshot(&path, None));
+        assert!(!file_matches_snapshot(&path, Some("abc")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn with_rollback_result_only_augments_on_failure() {
+        assert_eq!(
+            with_rollback_result("原始错误".to_string(), Ok(())),
+            "原始错误"
+        );
+        let augmented = with_rollback_result(
+            "原始错误".to_string(),
+            Err("回滚挂了".to_string()),
+        );
+        assert!(augmented.contains("原始错误"));
+        assert!(augmented.contains("回滚挂了"));
+        assert!(augmented.contains("半安装"));
     }
 }

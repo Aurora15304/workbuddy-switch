@@ -128,10 +128,13 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
   useEffect(() => {
     if (!open || preview || error) return;
     if (api.isWebui()) {
+      let cancelled = false;
       const timer = setInterval(() => {
         void api
           .sessionLinksProgress()
           .then((state) => {
+            // 预览可能已落定 / 弹窗已关闭：迟到的进度帧不能再回写状态。
+            if (cancelled) return;
             if (state.running && state.total > 0) {
               setProgress({ done: state.done, total: state.total });
             }
@@ -140,15 +143,25 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
             /* 进度是尽力而为：拿不到就退回骨架，不影响预览本身 */
           });
       }, 400);
-      return () => clearInterval(timer);
+      return () => {
+        cancelled = true;
+        clearInterval(timer);
+      };
     }
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen<{ done: number; total: number }>("session-links-progress", (event) => {
       setProgress(event.payload);
     }).then((fn) => {
+      // StrictMode / 预览落定时 Promise 可能晚于清理才 resolve：立即解绑，避免残留监听。
+      if (disposed) {
+        fn();
+        return;
+      }
       unlisten = fn;
     });
     return () => {
+      disposed = true;
       unlisten?.();
     };
   }, [open, preview, error]);

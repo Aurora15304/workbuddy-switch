@@ -1058,6 +1058,22 @@ fn run_copy(
     }
 
     // 本次请求之后仍存在未完成操作（含本次刚留下的）→ 必须提示恢复需求。
+    //
+    // Chesterton's fence：附属目录失败**刻意不**计入 unusable。附属目录是「加法」
+    // 的渲染增强材料，正文写成功后就不留 pending operation，因此把它升级成
+    // needsRecovery 会：① 让前端把 warning 报成「会话操作待恢复」的 error toast；
+    // ② 在 group-sync 合并路径里被当成启动阻断项（session_groups.rs 的
+    // `needsRecovery == true` → 暂停重新打开客户端）。两条都违反 B7「附属目录失败
+    // 不阻断正文可用性」。既有口径见 session_link.rs 的 RecoveryReport::is_clean
+    // （刻意不含 sidecar_warnings）、switch.rs 的
+    // sidecar_warnings_are_reported_without_blocking_startup、以及本文件
+    // SidecarRecovery / recover_sidecar_at 的设计注释。
+    //
+    // 「可重试依据」由 copied[].sidecar.errors 承载：每条含目录名 + OS 原因，
+    // 前端 collectSidecar 已消费为「子 agent 内容可能显示不全」warning。副本是
+    // 只补缺失、绝不覆盖的幂等加法，后续同步/复制会自然重试缺失文件，无需伪造
+    // 一个会卡启动门禁的 needsRecovery。回归锁死见
+    // copy_sidecar_failure_is_visible_without_blocking_startup。
     let unfinished_after = session_link::pending_operations(target.paths, target.variant);
     let unusable = !recovery.is_clean() || !unfinished_after.is_empty();
     // 置顶状态同步（写目标账号自己的 conversations.json）：放在复制结果之后、报告组装
@@ -5705,6 +5721,53 @@ mod tests {
         assert_eq!(sidecar["agentsCopied"], 1, "{report}");
         assert_eq!(sidecar["toolResultsCopied"], 2, "{report}");
         assert_eq!(sidecar["errors"].as_array().unwrap().len(), 0, "{report}");
+    }
+
+    /// 护栏（Chesterton's fence）：附属目录失败必须「可见但不卡启动」。
+    ///
+    /// 失败挂在 `copied[].sidecar.errors`（前端 collectSidecar 消费为
+    /// "子 agent 内容可能显示不全" warning），每条含目录名 + OS 原因，即
+    /// 可重试依据。但**绝不**置 needsRecovery：那会把 warning 报成
+    /// "会话操作待恢复" error toast，并在 group-sync 合并路径升级为
+    /// "暂停重新打开客户端" 的启动阻断，违反 B7。
+    #[test]
+    fn copy_sidecar_failure_is_visible_without_blocking_startup() {
+        let env = ready_env("copy-sidecar-failure");
+        env.add_sidecar(
+            "sess-1",
+            "subagents/agent-x.jsonl",
+            "{\"rootSessionId\":\"sess-1\"}\n",
+        );
+        // tool-results 是扁平目录，出现子目录 → 记 error，但正文照常可用。
+        std::fs::create_dir_all(env.sidecar_dir("sess-1").join("tool-results/odd-dir")).unwrap();
+        env.add_sidecar("sess-1", "tool-results/call_1-render.txt", "render");
+
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        assert_eq!(report["copied"].as_array().unwrap().len(), 1, "{report}");
+        let item = &report["copied"][0];
+        let errors = item["sidecar"]["errors"]
+            .as_array()
+            .expect("附属目录失败必须出现在复制结果里");
+        assert!(!errors.is_empty(), "报告不得全绿: {report}");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.as_str().unwrap_or("").contains("工具结果目录内出现子目录")),
+            "错误原因必须可据以重试: {report}"
+        );
+        // B7：正文可用性不受影响，其余附属文件照常复制。
+        assert_eq!(item["sidecar"]["agentsCopied"], 1, "{report}");
+        assert_eq!(item["sidecar"]["toolResultsCopied"], 1, "{report}");
+        let new_id = env.first_copy_id(&report);
+        assert!(env
+            .sidecar_dir(&new_id)
+            .join("subagents/agent-x.jsonl")
+            .exists());
+        // 关键不变量：不置 needsRecovery，不卡切号门禁。
+        assert!(
+            report.get("needsRecovery").and_then(Value::as_bool) != Some(true),
+            "附属目录失败不得升级成 needsRecovery（B7）: {report}"
+        );
     }
 
     /// 批量复制逐项清理：进入下一项之前，上一成功项的临时目录已经消失（不累积备份）。

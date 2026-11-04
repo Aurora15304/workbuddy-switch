@@ -59,6 +59,9 @@ static SWITCH_RUNNING: Mutex<bool> = Mutex::new(false);
 /// 关联会话预览进度：`(已核对组数, 待核对总组数)`。webui 通过
 /// GET /api/session-links/progress 轮询；`None` 表示当前没有在跑的预览。
 static LINKS_PREVIEW_PROGRESS: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+/// 跨档预览进度：与普通预览分开计数。两路预览共用一个前端轮询端点，共用一个槽时
+/// 一路结束/被取消会把手写 `= None` 落到另一路正在跑的进度上。
+static LINKS_PREVIEW_CROSS_PROGRESS: Mutex<Option<(usize, usize)>> = Mutex::new(None);
 /// Token 统计扫描进度：`(已扫描文件数, 待扫描文件总数)`。webui 通过
 /// GET /api/token-stats/progress 轮询；`None` 表示当前没有在跑的扫描。
 static TOKEN_STATS_PROGRESS: Mutex<Option<(usize, usize)>> = Mutex::new(None);
@@ -77,6 +80,46 @@ impl Drop for ProgressReset {
     fn drop(&mut self) {
         *self
             .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+/// 切号状态的 RAII 守卫：把「判重 → 置位 → 复位」收进一个接口极简的深模块。
+///
+/// 客户端在 `spawn_blocking(...).await` 期间断开时 handler future 被 drop，写在
+/// await 之后的手动 `= false` 永不执行，static 会永久停在 running=true，之后所有
+/// `/api/switch` 恒 409 直到重启进程。Drop 兜住这条取消路径。
+struct SwitchStateGuard;
+
+impl SwitchStateGuard {
+    /// 原子抢占切号状态；已有任务在跑时返回 None，由调用方回 409。
+    ///
+    /// 判重必须留在构造函数内：若先构造 guard 再判重，409 早返回时 Drop 会把
+    /// **别人正在跑**的 running 误清成 false，反而放行第二个切号。
+    fn acquire() -> Option<Self> {
+        let mut running = SWITCH_RUNNING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *running {
+            return None;
+        }
+        *running = true;
+        *SWITCH_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("开始切换账号…".to_string());
+        Some(Self)
+    }
+}
+
+impl Drop for SwitchStateGuard {
+    fn drop(&mut self) {
+        // running 与 progress 是两条独立复位路径：漏前者恒 409，漏后者留陈旧文案。
+        *SWITCH_RUNNING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        *SWITCH_PROGRESS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
@@ -857,10 +900,17 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
         .get("shareSessions")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let merge_memory = body
-        .get("mergeMemory")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // 边界一次性归一化：非法 memoryMode 直接 400，不静默回退成「不同步」。
+    let memory_sync = match memory::MemorySyncMode::parse(
+        body.get("memoryMode").and_then(|v| v.as_str()),
+    ) {
+        Ok(mode) => mode,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let memory_source_uid = body
+        .get("memorySourceUid")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let merge_experts = body
         .get("mergeExperts")
         .and_then(|v| v.as_bool())
@@ -886,17 +936,14 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
         Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
     };
 
-    {
-        let mut running = SWITCH_RUNNING.lock().unwrap();
-        if *running {
-            return json_err("已有切换任务进行中".to_string(), StatusCode::CONFLICT);
-        }
-        *running = true;
-        *SWITCH_PROGRESS.lock().unwrap() = Some("开始切换账号…".to_string());
-    }
+    let Some(_switch_guard) = SwitchStateGuard::acquire() else {
+        return json_err("已有切换任务进行中".to_string(), StatusCode::CONFLICT);
+    };
 
     let progress: switch::ProgressFn = Box::new(|msg| {
-        *SWITCH_PROGRESS.lock().unwrap() = Some(msg.to_string());
+        *SWITCH_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(msg.to_string());
     });
 
     let result = tokio::task::spawn_blocking(move || {
@@ -907,15 +954,14 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
             share_sessions,
             &copy_ids,
             &sync_selections,
-            merge_memory,
+            memory_sync,
+            memory_source_uid.as_deref(),
             merge_experts,
             sync_persona,
             persona_mode,
         )
     })
     .await;
-
-    *SWITCH_RUNNING.lock().unwrap() = false;
 
     match result {
         Ok(Ok(v)) => json_ok(v),
@@ -925,8 +971,13 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
 }
 
 async fn api_switch_progress() -> Response {
-    let p = SWITCH_PROGRESS.lock().unwrap().clone();
-    let running = *SWITCH_RUNNING.lock().unwrap();
+    let p = SWITCH_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let running = *SWITCH_RUNNING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     json_ok(json!({ "running": running, "progress": p }))
 }
 
@@ -1076,23 +1127,39 @@ async fn api_session_links_preview(Json(body): Json<Value>) -> Response {
         Some(raw) => WbVariant::parse(Some(raw)),
         None => account::variant_of(&target),
     };
-    // 预览逐组核对是真 IO：把进度写进轮询缓存，前端据此画确定态进度条。
-    // 无论成功失败都清空，避免前端把上一轮的残留值当成实时进度。
+    // 逐组核对是真 IO：放 blocking 线程，别占住 async worker，否则进度轮询排不上队。
+    // Drop 复位兜住取消路径：写在 await 之后的 `= None` 不会执行，会留下陈旧帧。
+    let _reset = ProgressReset(&LINKS_PREVIEW_PROGRESS);
     let report_progress = |done: usize, total: usize| {
-        *LINKS_PREVIEW_PROGRESS.lock().unwrap() = Some((done, total));
+        *LINKS_PREVIEW_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((done, total));
     };
-    let result =
-        session::session_links_preview_with_progress(variant, &target, Some(&report_progress));
-    *LINKS_PREVIEW_PROGRESS.lock().unwrap() = None;
+    let result = tokio::task::spawn_blocking(move || {
+        session::session_links_preview_with_progress(variant, &target, Some(&report_progress))
+    })
+    .await;
     match result {
-        Ok(report) => json_ok(report),
-        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        Ok(Ok(report)) => json_ok(report),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("读取关联会话预览失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
+}
+
+/// 两路预览共用一个轮询端点：取任一在跑的进度槽，都空闲才报 running=false。
+/// 前端不带请求标识，只能汇总；两路各写各槽，一路结束不会清掉另一路。
+fn links_preview_progress_snapshot() -> Option<(usize, usize)> {
+    [&LINKS_PREVIEW_PROGRESS, &LINKS_PREVIEW_CROSS_PROGRESS]
+        .iter()
+        .find_map(|slot| *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
 }
 
 /// GET /api/session-links/progress —— 关联会话预览的逐组进度（webui 轮询用）。
 async fn api_session_links_progress() -> Response {
-    let progress = *LINKS_PREVIEW_PROGRESS.lock().unwrap();
+    let progress = links_preview_progress_snapshot();
     match progress {
         Some((done, total)) => json_ok(json!({ "running": true, "done": done, "total": total })),
         None => json_ok(json!({ "running": false, "done": 0, "total": 0 })),
@@ -1123,18 +1190,27 @@ async fn api_session_links_preview_cross(Json(body): Json<Value>) -> Response {
     let Some(target) = account::find_account(&target_account_id) else {
         return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
     };
+    let _reset = ProgressReset(&LINKS_PREVIEW_CROSS_PROGRESS);
     let report_progress = |done: usize, total: usize| {
-        *LINKS_PREVIEW_PROGRESS.lock().unwrap() = Some((done, total));
+        *LINKS_PREVIEW_CROSS_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((done, total));
     };
-    let result = session::session_links_preview_cross_with_progress(
-        &source,
-        &target,
-        Some(&report_progress),
-    );
-    *LINKS_PREVIEW_PROGRESS.lock().unwrap() = None;
+    let result = tokio::task::spawn_blocking(move || {
+        session::session_links_preview_cross_with_progress(
+            &source,
+            &target,
+            Some(&report_progress),
+        )
+    })
+    .await;
     match result {
-        Ok(report) => json_ok(report),
-        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        Ok(Ok(report)) => json_ok(report),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("读取跨档关联会话预览失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1585,6 +1661,13 @@ async fn api_uninstall_rate_limit_hook() -> Response {
     }
 }
 
+/// webui 把配置包在 `{ config: {...} }` 里，桌面端 Tauri 直接把裸 config 作为命令入参。
+/// 在边界一次性解包，让 core 拿到与桌面端同形的顶层字段；否则 enabled/proxy 会被
+/// 当成缺省值写回，前端拿到的又是错误的外层包装。
+fn submitted_config(body: &Value) -> &Value {
+    body.get("config").unwrap_or(body)
+}
+
 async fn api_rate_limit_config() -> Response {
     json_ok(config::load_rate_limit_config())
 }
@@ -1593,7 +1676,7 @@ async fn api_rate_limit_config() -> Response {
 ///
 /// 与桌面端同语义：`scanIdeLogs` 变化时作废扫描缓存，下一次按当前来源范围重算。
 async fn api_save_rate_limit_config(Json(body): Json<Value>) -> Response {
-    let submitted = body.get("config").unwrap_or(&body);
+    let submitted = submitted_config(&body);
     match limits::save_rate_limit_config(submitted) {
         Ok(()) => json_ok(config::load_rate_limit_config()),
         Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
@@ -1631,7 +1714,7 @@ async fn api_checkin_config() -> Response {
 }
 
 async fn api_save_checkin_config(Json(body): Json<Value>) -> Response {
-    let submitted = body.get("config").unwrap_or(&body);
+    let submitted = submitted_config(&body);
     match config::save_checkin_config(submitted) {
         Ok(()) => json_ok(config::load_checkin_config()),
         Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
@@ -1663,7 +1746,7 @@ async fn api_travel_config() -> Response {
 }
 
 async fn api_save_travel_config(Json(body): Json<Value>) -> Response {
-    let submitted = body.get("config").unwrap_or(&body);
+    let submitted = submitted_config(&body);
     match config::save_travel_config(submitted) {
         Ok(()) => {
             let saved = config::load_travel_config();
@@ -1696,8 +1779,8 @@ async fn api_rotate_config() -> Response {
 }
 
 async fn api_save_rotate_config(Json(body): Json<Value>) -> Response {
-    match config::save_auto_rotate_config(&body) {
-        Ok(()) => json_ok(json!({ "ok": true, "config": config::load_auto_rotate_config() })),
+    match config::save_auto_rotate_config(submitted_config(&body)) {
+        Ok(()) => json_ok(config::load_auto_rotate_config()),
         Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
     }
 }
@@ -1718,8 +1801,20 @@ async fn api_rotate_logs() -> Response {
 // 更新
 // ---------------------------------------------------------------------------
 
-async fn api_update_check() -> Response {
-    json_ok(update::update_check(None, false).await)
+/// GET 的 query 一次归一化：前端 `checkUpdate(proxy, force)` 把参数拼在 URL 上，
+/// 桌面端由 Tauri 直接透传同名入参；两条路径都必须到达 `update::update_check`。
+fn update_check_args(query: &HashMap<String, String>) -> (Option<&str>, bool) {
+    let proxy = query
+        .get("proxy")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty());
+    let force = query.get("force").map_or(false, |value| value == "true");
+    (proxy, force)
+}
+
+async fn api_update_check(Query(query): Query<HashMap<String, String>>) -> Response {
+    let (proxy, force) = update_check_args(&query);
+    json_ok(update::update_check(proxy, force).await)
 }
 
 async fn api_update_config() -> Response {
@@ -1727,8 +1822,8 @@ async fn api_update_config() -> Response {
 }
 
 async fn api_save_update_config(Json(body): Json<Value>) -> Response {
-    match update::save_github_config(&body) {
-        Ok(()) => json_ok(json!({ "ok": true, "config": update::load_github_config() })),
+    match update::save_github_config(submitted_config(&body)) {
+        Ok(()) => json_ok(update::load_github_config()),
         Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
     }
 }
@@ -1818,10 +1913,32 @@ async fn api_clear_notifications() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{body_variant, checkin_status_item, query_variant, static_handler};
+    use super::{
+        body_variant, checkin_status_item, links_preview_progress_snapshot, query_variant,
+        static_handler, submitted_config, update_check_args, ProgressReset, SwitchStateGuard,
+        LINKS_PREVIEW_CROSS_PROGRESS, LINKS_PREVIEW_PROGRESS, SWITCH_PROGRESS, SWITCH_RUNNING,
+    };
     use axum::http::{header, StatusCode, Uri};
-    use serde_json::json;
+    use axum::Json;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use wb_switch_core::modules::variant::WbVariant;
+
+    // 全局状态用例各自独占一把锁：Rust 测试默认并行，避免互相踩 static。
+    static SWITCH_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static LINKS_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 非法 memoryMode 必须在边界被拒（400），绝不静默回退成「不同步」后闷头切号。
+    /// 校验发生在 SwitchStateGuard 与任何会话/记忆写入之前，因此无需抢全局状态锁。
+    #[tokio::test]
+    async fn illegal_memory_mode_is_rejected_before_any_side_effect() {
+        for illegal in ["MERGE", "sync", "overwrite-all", ""] {
+            let body: Value = json!({ "accountId": "acc-1", "memoryMode": illegal });
+            let response = super::api_switch(Json(body)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{illegal:?}");
+        }
+    }
 
     /// SPA 回退必须按**命中的文件**给 Content-Type：`/sessions` 这类前端路由曾按请求路径
     /// 被标成 application/octet-stream，浏览器直接当文件下载、页面打不开（真机验收发现）。
@@ -1914,5 +2031,143 @@ mod tests {
 
         assert_eq!(item["variant"], "ai");
         assert_eq!(item["statusUnsupported"], true);
+    }
+
+    /// 一次断连不得永久 409：guard 无论正常收尾还是被取消，都要复位两个独立槽。
+    #[test]
+    fn switch_state_guard_resets_running_and_progress_on_cancel() {
+        let _serial = SWITCH_STATE_TEST_LOCK.lock().unwrap();
+        *SWITCH_RUNNING.lock().unwrap() = false;
+        *SWITCH_PROGRESS.lock().unwrap() = None;
+
+        let guard = SwitchStateGuard::acquire().expect("首次切号应抢占成功");
+        assert!(*SWITCH_RUNNING.lock().unwrap(), "抢占后 running=true");
+        assert_eq!(
+            SWITCH_PROGRESS.lock().unwrap().as_deref(),
+            Some("开始切换账号…")
+        );
+
+        // 连点/并发：判重仍生效，且被拒绝的抢占不得复位正在跑的那一轮。
+        assert!(SwitchStateGuard::acquire().is_none(), "并发切号必须 409");
+        assert!(
+            *SWITCH_RUNNING.lock().unwrap(),
+            "被拒绝的抢占不得把别人的 running 清掉"
+        );
+        assert!(
+            SWITCH_PROGRESS.lock().unwrap().is_some(),
+            "被拒绝的抢占不得清掉别人的进度"
+        );
+
+        // 模拟客户端断开：handler future 被 drop，await 之后的手动复位永不执行。
+        drop(guard);
+        assert!(
+            !*SWITCH_RUNNING.lock().unwrap(),
+            "取消后 running 不得恒 true"
+        );
+        assert!(
+            SWITCH_PROGRESS.lock().unwrap().is_none(),
+            "取消后 progress 必须复位为 null（独立于 running 的第二条路径）"
+        );
+
+        // 组合态：标志复位后再次切号不得 409。
+        let again = SwitchStateGuard::acquire().expect("复位后应能再次切号");
+        drop(again);
+        assert!(!*SWITCH_RUNNING.lock().unwrap());
+        assert!(SWITCH_PROGRESS.lock().unwrap().is_none());
+    }
+
+    /// 两路预览并发各写各槽：一路结束/取消不得清掉另一路；取消后无陈旧帧。
+    #[test]
+    fn links_preview_slots_do_not_clear_each_other() {
+        let _serial = LINKS_STATE_TEST_LOCK.lock().unwrap();
+        *LINKS_PREVIEW_PROGRESS.lock().unwrap() = None;
+        *LINKS_PREVIEW_CROSS_PROGRESS.lock().unwrap() = None;
+
+        let plain = ProgressReset(&LINKS_PREVIEW_PROGRESS);
+        let cross = ProgressReset(&LINKS_PREVIEW_CROSS_PROGRESS);
+        *LINKS_PREVIEW_PROGRESS.lock().unwrap() = Some((3, 10));
+        *LINKS_PREVIEW_CROSS_PROGRESS.lock().unwrap() = Some((2, 7));
+
+        // 普通预览先结束：跨档那一路的进度必须还在。
+        drop(plain);
+        assert!(LINKS_PREVIEW_PROGRESS.lock().unwrap().is_none());
+        assert_eq!(links_preview_progress_snapshot(), Some((2, 7)));
+
+        // 跨档那一路被取消：槽清空，端点不得留下陈旧帧。
+        drop(cross);
+        assert_eq!(links_preview_progress_snapshot(), None);
+
+        // 只有跨档槽在跑时，单一轮询端点也必须能读到（前端契约不变）。
+        let cross_only = ProgressReset(&LINKS_PREVIEW_CROSS_PROGRESS);
+        *LINKS_PREVIEW_CROSS_PROGRESS.lock().unwrap() = Some((1, 4));
+        assert_eq!(links_preview_progress_snapshot(), Some((1, 4)));
+        drop(cross_only);
+        assert_eq!(links_preview_progress_snapshot(), None);
+    }
+
+    /// 三宿主同形：webui 的 `{config:{...}}` 与桌面端的裸 config 都解成顶层字段。
+    #[test]
+    fn submitted_config_normalizes_nested_and_bare_payloads() {
+        let cases = [
+            (
+                json!({"config": {"enabled": true}}),
+                json!({"enabled": true}),
+            ),
+            (
+                json!({"enabled": false, "check_interval_minutes": 15}),
+                json!({"enabled": false, "check_interval_minutes": 15}),
+            ),
+            (
+                json!({"config": {"owner": "o", "repo": "r", "proxy": "http://127.0.0.1:7897"}}),
+                json!({"owner": "o", "repo": "r", "proxy": "http://127.0.0.1:7897"}),
+            ),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(submitted_config(&body), &expected);
+        }
+        // config::save_auto_rotate_config 只读顶层 enabled：解包后落盘值必须是 true。
+        assert_eq!(
+            submitted_config(&json!({"config": {"enabled": true}}))["enabled"],
+            true
+        );
+    }
+
+    /// `checkUpdate(proxy, force)` 的 GET query 归一化：proxy/force 不再被硬编码丢弃。
+    #[test]
+    fn update_check_args_keeps_proxy_and_force() {
+        let cases: [(HashMap<String, String>, Option<&str>, bool); 5] = [
+            (HashMap::new(), None, false),
+            (
+                HashMap::from([("force".to_string(), "true".to_string())]),
+                None,
+                true,
+            ),
+            (
+                HashMap::from([
+                    ("proxy".to_string(), "http://127.0.0.1:7897".to_string()),
+                    ("force".to_string(), "true".to_string()),
+                ]),
+                Some("http://127.0.0.1:7897"),
+                true,
+            ),
+            (
+                HashMap::from([
+                    ("proxy".to_string(), String::new()),
+                    ("force".to_string(), "false".to_string()),
+                ]),
+                None,
+                false,
+            ),
+            (
+                HashMap::from([("force".to_string(), "1".to_string())]),
+                None,
+                false,
+            ),
+        ];
+        for (query, expected_proxy, expected_force) in cases {
+            let (proxy, force) = update_check_args(&query);
+            assert_eq!(proxy, expected_proxy);
+            assert_eq!(force, expected_force);
+        }
     }
 }

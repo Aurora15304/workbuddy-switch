@@ -14,6 +14,11 @@
 //!
 //! 合成规则（确定性、可解释）：以 `## ` 二级标题切章节；章节按标题归组并保持首次出现
 //! 的顺序；章节正文按空行切段、归一化空白后去重。首个 `## ` 之前的内容作为前言同样去重。
+//!
+//! 另一种互斥的方式是**复制覆盖**：把指定母本账号的 `MEMORY.md` 整份逐字节复制到其余
+//! 账号，不做任何段落合并。它解决「用户手动精简记忆后，旧段落被只增不减的合并逻辑合回来」
+//! 的冲突。覆盖更危险，因此护栏更硬：母本为空/不存在一律拒绝且零写入、源账号绝不改动、
+//! 每个被写账号覆盖前先备份（备份失败就不覆盖）、内容逐字节一致则跳过不制造备份。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,12 +40,212 @@ pub fn personal_dir_at(root: &Path, uid: &str) -> PathBuf {
     root.join(format!("{PERSONAL_PREFIX}{uid}{PERSONAL_SUFFIX}"))
 }
 
+/// 工作记忆同步方式：切号弹窗三选一，两种会写盘的模式语义互斥。
+///
+/// - `Merge`：把本机所有账号的记忆按「只增不减」合成一份再分发（历史行为）；
+/// - `Overwrite`：把指定母本账号的 `MEMORY.md` 整份逐字节复制到其余账号，不做任何合并。
+///
+/// 缺省（`None`）表示不同步。宿主在边界一次性把前端字符串解析成枚举，core 只消费枚举。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemorySyncMode {
+    Merge,
+    Overwrite,
+}
+
+impl MemorySyncMode {
+    /// 边界一次性归一化：字符串 → 枚举。缺省 = 不同步；非法值明确报错，绝不静默回退。
+    pub fn parse(raw: Option<&str>) -> Result<Option<Self>, String> {
+        let Some(raw) = raw else { return Ok(None) };
+        match raw.trim() {
+            "merge" => Ok(Some(Self::Merge)),
+            "overwrite" => Ok(Some(Self::Overwrite)),
+            other => Err(format!(
+                "非法的工作记忆同步模式：{other:?}；只支持 \"merge\" / \"overwrite\"，不传表示不同步"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Overwrite => "overwrite",
+        }
+    }
+}
+
+/// 报告边界归一化：合并与覆盖共用同一形状，`mode` 是新增的判别字段，`sourceUid` 只属于覆盖。
+fn with_mode(mut report: Value, mode: MemorySyncMode, source_uid: Option<&str>) -> Value {
+    report["mode"] = json!(mode.as_str());
+    if let Some(uid) = source_uid.filter(|uid| !uid.trim().is_empty()) {
+        report["sourceUid"] = json!(uid);
+    }
+    report
+}
+
+/// 把指定母本账号的 `MEMORY.md` 整份复制覆盖到所有其他账号，不做任何段落合并。
+///
+/// `source_uid` 由前端算好后传入（core 只认 uid，不猜「当前账号」）。返回与合并模式同形的
+/// 报告；`persona` 恒为空——覆盖模式只动 `MEMORY.md`，不碰人设、专家团与云端缓存。
+pub fn copy_and_overwrite(source_uid: Option<&str>, accounts: &[(String, String)]) -> Value {
+    copy_and_overwrite_at(&wb_data_root(), source_uid, accounts)
+}
+
+/// 路径注入接缝：真实落盘测试传临时 root，不污染用户真实目录。
+fn copy_and_overwrite_at(
+    root: &Path,
+    source_uid: Option<&str>,
+    accounts: &[(String, String)],
+) -> Value {
+    overwrite_at(root, source_uid, accounts, |from, to| std::fs::copy(from, to))
+}
+
+/// 备份原语接缝：注入失败即可确定性验证「备份失败就不覆盖」，核心流程无需脆弱 Mock。
+type BackupFn = fn(&Path, &Path) -> std::io::Result<u64>;
+
+/// 覆盖报告骨架：既有字段一个不删，`persona` 恒为空（本模式不碰人格文件）。
+fn overwrite_report(
+    accounts: usize,
+    sources: Vec<Value>,
+    merged_chars: usize,
+    written: Vec<Value>,
+    unchanged: Vec<Value>,
+    errors: Vec<Value>,
+) -> Value {
+    json!({
+        "accounts": accounts,
+        "sources": sources,
+        "mergedChars": merged_chars,
+        "written": written,
+        "unchanged": unchanged,
+        "persona": { "written": [], "unchanged": [], "errors": [] },
+        "errors": errors,
+    })
+}
+
+fn overwrite_at(
+    root: &Path,
+    source_uid: Option<&str>,
+    accounts: &[(String, String)],
+    backup: BackupFn,
+) -> Value {
+    // 报告在唯一出口贴 mode/sourceUid，成功与拒绝都自描述，注入测试也走同一条路。
+    let finish = |report: Value| {
+        with_mode(report, MemorySyncMode::Overwrite, source_uid.map(str::trim))
+    };
+    let reject = |error: String| {
+        finish(overwrite_report(
+            accounts.len(),
+            vec![],
+            0,
+            vec![],
+            vec![],
+            vec![json!({ "label": "母本", "error": error })],
+        ))
+    };
+
+    // 卫语句：uid 在入口一次性归一化并过信任边界；core 只认 uid，不猜「当前账号」。
+    let Some(uid) = source_uid.map(str::trim).filter(|uid| !uid.is_empty()) else {
+        return reject("复制覆盖必须指定母本账号 uid（memorySourceUid），已跳过且未写入任何文件".to_string());
+    };
+    if !crate::modules::vscode_session::is_safe_uid(uid) {
+        return reject(format!("母本账号 uid 非法（含路径分隔符或保留名）：{uid:?}"));
+    }
+
+    // 卫语句：母本缺失 / 为空 / 不可读一律报错且零写入——绝不能用空记忆抹掉所有账号。
+    let mother_path = personal_dir_at(root, uid).join(MEMORY_FILE);
+    let mother = match std::fs::read_to_string(&mother_path) {
+        Ok(text) if !text.trim().is_empty() => text,
+        Ok(_) => return reject(format!("母本账号 {uid} 的 {MEMORY_FILE} 为空，已跳过且未写入任何文件")),
+        Err(error) => {
+            return reject(format!("读取母本账号 {uid} 的 {MEMORY_FILE} 失败：{error}，已跳过且未写入任何文件"))
+        }
+    };
+
+    let mother_label = accounts
+        .iter()
+        .find(|(account_uid, _)| account_uid.trim() == uid)
+        .map(|(_, label)| label.clone())
+        .unwrap_or_else(|| uid.to_string());
+    let merged_chars = mother.chars().count();
+    let sources = vec![json!({ "label": mother_label, "chars": merged_chars })];
+    let mother_bytes = mother.as_bytes();
+
+    let mut written: Vec<Value> = Vec::new();
+    let mut unchanged: Vec<Value> = Vec::new();
+    let mut errors: Vec<Value> = Vec::new();
+
+    for (account_uid, label) in accounts {
+        if account_uid.trim().is_empty() {
+            errors.push(json!({ "label": label, "error": "账号缺少 uid，无法定位人格目录" }));
+            continue;
+        }
+        if account_uid.trim() == uid {
+            // 源账号文件绝不改动：母本自身就是目标内容。
+            unchanged.push(json!({ "label": label }));
+            continue;
+        }
+        let dir = personal_dir_at(root, account_uid);
+        let path = dir.join(MEMORY_FILE);
+        // 内容逐字节一致则跳过：不写、不制造无意义备份。
+        if std::fs::read(&path).ok().as_deref() == Some(mother_bytes) {
+            unchanged.push(json!({ "label": label }));
+            continue;
+        }
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            errors.push(json!({ "label": label, "error": format!("创建人格目录失败：{error}") }));
+            continue;
+        }
+        let had_content = path.is_file();
+        let backup_saved = if had_content {
+            let backup_dest = backup_path(&path);
+            match backup(&path, &backup_dest) {
+                Ok(_) => Some(backup_dest.to_string_lossy().to_string()),
+                Err(error) => {
+                    // 备份失败就不覆盖：原文不可恢复比不同步更糟。
+                    errors.push(json!({
+                        "label": label,
+                        "error": format!("备份 {MEMORY_FILE} 失败，已跳过：{error}"),
+                    }));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        match atomic_write(&path, &mother) {
+            Ok(()) => written.push(json!({
+                "label": label,
+                "backup": backup_saved,
+                "hadContent": had_content,
+            })),
+            Err(error) => errors.push(json!({
+                "label": label,
+                "error": format!("写入 {MEMORY_FILE} 失败：{error}"),
+            })),
+        }
+    }
+
+    finish(overwrite_report(
+        accounts.len(),
+        sources,
+        merged_chars,
+        written,
+        unchanged,
+        errors,
+    ))
+}
+
 /// 把本机所有账号的记忆合成一份并分发回去。
 ///
 /// `accounts` 是 `[{"uid": "...", "label": "..."}]` 的形状（调用方从账号库投影），
 /// 缺 uid 的账号会被跳过——uid 是目录名的唯一依据，猜不出来。
 pub fn merge_and_distribute(accounts: &[(String, String)]) -> Value {
-    merge_and_distribute_at(&wb_data_root(), accounts)
+    // 只贴一层自描述元数据；合并算法与 `_at` 的既有字段一字未动。
+    with_mode(
+        merge_and_distribute_at(&wb_data_root(), accounts),
+        MemorySyncMode::Merge,
+        None,
+    )
 }
 
 fn merge_and_distribute_at(root: &Path, accounts: &[(String, String)]) -> Value {
@@ -555,6 +760,289 @@ mod tests {
 
     fn pair(uid: &str) -> (String, String) {
         (uid.to_string(), format!("acc-{uid}"))
+    }
+
+    fn read_bytes(dir: &TempDir, uid: &str, file: &str) -> Option<Vec<u8>> {
+        std::fs::read(personal_dir_at(dir.path(), uid).join(file)).ok()
+    }
+
+    fn backup_paths(dir: &TempDir, uid: &str) -> Vec<PathBuf> {
+        let personal = personal_dir_at(dir.path(), uid);
+        let mut found: Vec<PathBuf> = std::fs::read_dir(&personal)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("MEMORY.md.bak-"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        found.sort();
+        found
+    }
+
+    fn never_backup(_: &Path, _: &Path) -> std::io::Result<u64> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "模拟备份失败",
+        ))
+    }
+
+    /// 带 CRLF 与非 ASCII，用来钉死「逐字节复制」而非归一化合并。
+    const MOTHER: &str = "# 精简后的记忆\r\n\r\n- 只保留这一条\r\n- 中文 🚀\n";
+
+    #[test]
+    fn overwrite_copies_source_verbatim_and_backs_up_each_target() {
+        let dir = TempDir::new("overwrite-verbatim");
+        dir.write("a", MEMORY_FILE, MOTHER);
+        dir.write("b", MEMORY_FILE, "## 乙的旧记忆\n\n- 这段应被删掉\n");
+        dir.write("d", MEMORY_FILE, MOTHER); // 与母本完全一致
+        dir.write("b", "SOUL.md", "乙的人格，不得改动\n");
+        let b_before = read_bytes(&dir, "b", MEMORY_FILE).unwrap();
+        let accounts = vec![pair("a"), pair("b"), pair("c"), pair("d")];
+
+        let report = copy_and_overwrite_at(dir.path(), Some("a"), &accounts);
+
+        assert_eq!(report["mode"], "overwrite");
+        assert_eq!(report["sourceUid"], "a");
+        assert_eq!(report["accounts"].as_u64().unwrap(), 4);
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        let sources = report["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1, "覆盖模式 sources 只列母本一份");
+        assert_eq!(sources[0]["label"], "acc-a");
+        assert_eq!(
+            sources[0]["chars"].as_u64().unwrap(),
+            MOTHER.chars().count() as u64
+        );
+        assert_eq!(
+            report["mergedChars"].as_u64().unwrap(),
+            MOTHER.chars().count() as u64
+        );
+        for key in ["written", "unchanged", "errors"] {
+            assert!(report["persona"][key].as_array().unwrap().is_empty(), "{report}");
+        }
+
+        // 写入后目标逐字节等于母本；源账号逐字节不变；人格文件不碰。
+        assert_eq!(read_bytes(&dir, "b", MEMORY_FILE).unwrap(), MOTHER.as_bytes());
+        assert_eq!(read_bytes(&dir, "c", MEMORY_FILE).unwrap(), MOTHER.as_bytes());
+        assert_eq!(read_bytes(&dir, "d", MEMORY_FILE).unwrap(), MOTHER.as_bytes());
+        assert_eq!(read_bytes(&dir, "a", MEMORY_FILE).unwrap(), MOTHER.as_bytes());
+        assert_eq!(
+            read_bytes(&dir, "b", "SOUL.md").unwrap(),
+            "乙的人格，不得改动\n".as_bytes()
+        );
+
+        // 不同账号先备份，且备份逐字节等于原文；一致账号与源账号不产生备份。
+        let b_backups = backup_paths(&dir, "b");
+        assert_eq!(b_backups.len(), 1, "{b_backups:?}");
+        assert_eq!(std::fs::read(&b_backups[0]).unwrap(), b_before);
+        assert!(backup_paths(&dir, "a").is_empty(), "源账号不得备份");
+        assert!(backup_paths(&dir, "c").is_empty(), "全新账号无原文可备份");
+        assert!(backup_paths(&dir, "d").is_empty(), "内容一致不制造无意义备份");
+
+        let written = report["written"].as_array().unwrap();
+        assert_eq!(written.len(), 2, "{report}");
+        let written_labels: Vec<&str> = written
+            .iter()
+            .map(|item| item["label"].as_str().unwrap())
+            .collect();
+        assert!(written_labels.contains(&"acc-b"));
+        assert!(written_labels.contains(&"acc-c"));
+        let unchanged = report["unchanged"].as_array().unwrap();
+        let unchanged_labels: Vec<&str> = unchanged
+            .iter()
+            .map(|item| item["label"].as_str().unwrap())
+            .collect();
+        assert!(unchanged_labels.contains(&"acc-a"));
+        assert!(unchanged_labels.contains(&"acc-d"));
+    }
+
+    #[test]
+    fn overwrite_rejects_missing_or_blank_mother_with_zero_writes() {
+        for source_uid in [None, Some(""), Some("   ")] {
+            let dir = TempDir::new("overwrite-no-uid");
+            dir.write("b", MEMORY_FILE, "## 乙的旧记忆\n");
+            let before = read_bytes(&dir, "b", MEMORY_FILE).unwrap();
+            let report = copy_and_overwrite_at(dir.path(), source_uid, &[pair("a"), pair("b")]);
+            assert_eq!(report["mode"], "overwrite");
+            assert!(!report["errors"].as_array().unwrap().is_empty(), "{source_uid:?}: {report}");
+            assert!(report["written"].as_array().unwrap().is_empty(), "{report}");
+            assert!(report["sources"].as_array().unwrap().is_empty());
+            assert_eq!(report["mergedChars"].as_u64().unwrap(), 0);
+            assert_eq!(read_bytes(&dir, "b", MEMORY_FILE).unwrap(), before);
+            assert!(backup_paths(&dir, "b").is_empty());
+            assert!(!personal_dir_at(dir.path(), "a").exists(), "零写入不得新建目录");
+        }
+
+        // uid 合法但 MEMORY.md 不存在。
+        let dir = TempDir::new("overwrite-no-file");
+        dir.write("b", MEMORY_FILE, "## 乙的旧记忆\n");
+        let before = read_bytes(&dir, "b", MEMORY_FILE).unwrap();
+        let report = copy_and_overwrite_at(dir.path(), Some("a"), &[pair("a"), pair("b")]);
+        assert!(!report["errors"].as_array().unwrap().is_empty(), "{report}");
+        assert!(report["written"].as_array().unwrap().is_empty());
+        assert_eq!(read_bytes(&dir, "b", MEMORY_FILE).unwrap(), before);
+
+        // 母本存在但为空 / 只有空白。
+        for blank in ["", "   \n\n  \t"] {
+            let dir = TempDir::new("overwrite-blank");
+            dir.write("a", MEMORY_FILE, blank);
+            dir.write("b", MEMORY_FILE, "## 乙的旧记忆\n");
+            let before = read_bytes(&dir, "b", MEMORY_FILE).unwrap();
+            let report = copy_and_overwrite_at(dir.path(), Some("a"), &[pair("a"), pair("b")]);
+            assert!(!report["errors"].as_array().unwrap().is_empty(), "{blank:?}: {report}");
+            assert!(report["written"].as_array().unwrap().is_empty());
+            assert_eq!(read_bytes(&dir, "b", MEMORY_FILE).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn overwrite_rejects_unsafe_source_uid_with_zero_writes() {
+        for uid in ["../evil", "a/b", "a\\b", "..", "default", "Public"] {
+            let dir = TempDir::new("overwrite-unsafe-uid");
+            dir.write("b", MEMORY_FILE, "## 乙的旧记忆\n");
+            let before = read_bytes(&dir, "b", MEMORY_FILE).unwrap();
+            let report = copy_and_overwrite_at(dir.path(), Some(uid), &[pair("a"), pair("b")]);
+            assert!(!report["errors"].as_array().unwrap().is_empty(), "{uid}: {report}");
+            assert!(report["written"].as_array().unwrap().is_empty(), "{report}");
+            assert_eq!(read_bytes(&dir, "b", MEMORY_FILE).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn overwrite_backup_failure_blocks_overwrite_and_reports_error() {
+        let dir = TempDir::new("overwrite-backup-fail");
+        dir.write("a", MEMORY_FILE, MOTHER);
+        dir.write("b", MEMORY_FILE, "## 乙的旧记忆\n\n- 不能丢\n");
+        dir.write("c", MEMORY_FILE, "## 丙的旧记忆\n");
+        let b_before = read_bytes(&dir, "b", MEMORY_FILE).unwrap();
+        let c_before = read_bytes(&dir, "c", MEMORY_FILE).unwrap();
+
+        let report = overwrite_at(
+            dir.path(),
+            Some("a"),
+            &[pair("a"), pair("b"), pair("c")],
+            never_backup,
+        );
+
+        assert_eq!(report["mode"], "overwrite");
+        assert!(report["written"].as_array().unwrap().is_empty(), "{report}");
+        let errors = report["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2, "{report}");
+        assert!(
+            errors
+                .iter()
+                .all(|item| item["error"].as_str().unwrap().contains("备份")),
+            "错误必须出现在报告：{report}"
+        );
+        assert_eq!(read_bytes(&dir, "b", MEMORY_FILE).unwrap(), b_before, "备份失败绝不覆盖");
+        assert_eq!(read_bytes(&dir, "c", MEMORY_FILE).unwrap(), c_before);
+        assert_eq!(read_bytes(&dir, "a", MEMORY_FILE).unwrap(), MOTHER.as_bytes());
+        assert!(backup_paths(&dir, "b").is_empty());
+    }
+
+    #[test]
+    fn overwrite_is_idempotent_when_every_target_matches_mother() {
+        let dir = TempDir::new("overwrite-idempotent");
+        for uid in ["a", "b", "c"] {
+            dir.write(uid, MEMORY_FILE, MOTHER);
+        }
+        let accounts = vec![pair("a"), pair("b"), pair("c")];
+        for _ in 0..2 {
+            let report = copy_and_overwrite_at(dir.path(), Some("a"), &accounts);
+            assert!(report["written"].as_array().unwrap().is_empty(), "{report}");
+            assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+            assert_eq!(report["unchanged"].as_array().unwrap().len(), 3);
+        }
+        assert!(backup_paths(&dir, "b").is_empty());
+        assert!(backup_paths(&dir, "c").is_empty());
+    }
+
+    #[test]
+    fn memory_sync_mode_parse_normalizes_and_rejects_illegal_values() {
+        assert_eq!(MemorySyncMode::parse(None).unwrap(), None);
+        assert_eq!(
+            MemorySyncMode::parse(Some("merge")).unwrap(),
+            Some(MemorySyncMode::Merge)
+        );
+        assert_eq!(
+            MemorySyncMode::parse(Some("overwrite")).unwrap(),
+            Some(MemorySyncMode::Overwrite)
+        );
+        assert_eq!(
+            MemorySyncMode::parse(Some("  overwrite  ")).unwrap(),
+            Some(MemorySyncMode::Overwrite)
+        );
+        for illegal in ["", "MERGE", "sync", "overwrite-all", "true", "0", "merge overwrite"] {
+            let error = MemorySyncMode::parse(Some(illegal)).unwrap_err();
+            assert!(error.contains("非法"), "{illegal}: {error}");
+            assert!(error.contains("merge"), "{illegal}: {error}");
+        }
+        assert_eq!(MemorySyncMode::Merge.as_str(), "merge");
+        assert_eq!(MemorySyncMode::Overwrite.as_str(), "overwrite");
+    }
+
+    #[test]
+    fn merge_report_keeps_legacy_fields_and_only_gains_mode() {
+        let dir = TempDir::new("merge-regression");
+        dir.write("a", MEMORY_FILE, "## 偏好\n\n- 简体中文\n\n## 甲独有\n\n- A\n");
+        dir.write("b", MEMORY_FILE, "## 环境\n\n- Debian 13\n\n## 乙独有\n\n- B\n");
+        let seam = merge_and_distribute_at(dir.path(), &[pair("a"), pair("b")]);
+        // 「只增不减」回归：双方独有章节都保留，写回同一份。
+        let merged = dir.read("a", MEMORY_FILE).unwrap();
+        assert!(merged.contains("甲独有") && merged.contains("乙独有"), "{merged}");
+        assert!(merged.contains("- A") && merged.contains("- B"), "{merged}");
+        assert_eq!(dir.read("b", MEMORY_FILE).unwrap(), merged);
+        for key in [
+            "accounts",
+            "sources",
+            "mergedChars",
+            "written",
+            "unchanged",
+            "persona",
+            "errors",
+        ] {
+            assert!(seam.get(key).is_some(), "合并报告缺字段 {key}");
+        }
+        assert!(seam.get("mode").is_none(), "接缝层合并报告逐字不变");
+
+        let report = with_mode(seam.clone(), MemorySyncMode::Merge, None);
+        assert_eq!(report["mode"], "merge");
+        assert!(report.get("sourceUid").is_none());
+        assert_eq!(report["written"], seam["written"]);
+        let overwrite = with_mode(json!({ "written": [] }), MemorySyncMode::Overwrite, Some("u1"));
+        assert_eq!(overwrite["mode"], "overwrite");
+        assert_eq!(overwrite["sourceUid"], "u1");
+    }
+
+    #[test]
+    fn overwrite_concurrent_calls_are_independent_and_never_touch_source() {
+        // 生产环境由 auth_transaction 锁串行化切号（另有集成测试覆盖）；
+        // 这里钉死模块本身无全局可变状态、并发落盘互不串扰。
+        let handles: Vec<_> = (0..6)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let dir = TempDir::new(&format!("overwrite-concurrent-{index}"));
+                    dir.write("a", MEMORY_FILE, MOTHER);
+                    dir.write("b", MEMORY_FILE, "## 旧记忆\n");
+                    let accounts = vec![pair("a"), pair("b"), pair("c")];
+                    for _ in 0..3 {
+                        let report = copy_and_overwrite_at(dir.path(), Some("a"), &accounts);
+                        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+                    }
+                    assert_eq!(read_bytes(&dir, "a", MEMORY_FILE).unwrap(), MOTHER.as_bytes());
+                    assert_eq!(read_bytes(&dir, "b", MEMORY_FILE).unwrap(), MOTHER.as_bytes());
+                    assert_eq!(read_bytes(&dir, "c", MEMORY_FILE).unwrap(), MOTHER.as_bytes());
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("并发覆盖不得 panic");
+        }
     }
 
     #[test]

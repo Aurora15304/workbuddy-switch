@@ -53,6 +53,12 @@ const COMPACT_AFTER_BYTES: u64 = 1024 * 1024;
 /// watcher 轮询间隔：一次 `stat`，hook 事件要求秒级可见（AC1）。
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// 连续 panic 上限：达到即停，避免「每轮必崩」的无限重启风暴。
+const WATCHER_MAX_CONSECUTIVE_PANICS: u32 = 3;
+
+/// 单轮 panic 后的退避；正常轮询节奏仍是 [`POLL_INTERVAL`]（1 秒 stat 快速路径不变）。
+const WATCHER_PANIC_BACKOFF: Duration = Duration::from_secs(2);
+
 /// 模型字段的未知哨兵值（与 IDE 解析同一套）：不得作为模型名展示。
 const MODEL_SENTINELS: [&str; 3] = ["auto", "undefined", "null"];
 
@@ -85,6 +91,16 @@ struct State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+/// 取回 STATE 守卫：锁中毒不应让「限额查询 / 消费」变成 panic 源。
+///
+/// 与 `error_log::record_at` 同一范式：STATE 只持有 offset + 内存台账，中毒说明
+/// 上一个持有者 panic 了，但数据仍可读，取回内部守卫继续服务即可。
+fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
+    STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub fn state_path() -> PathBuf {
     store_dir().join(STATE_FILE_NAME)
@@ -633,7 +649,7 @@ fn compact_if_needed(ctx: &IngestContext, state: &mut State, now: i64) -> bool {
 pub(crate) fn consume_pending() -> bool {
     let events = rate_limit_hook::events_path();
     let state_file = state_path();
-    let mut guard = STATE.lock().unwrap();
+    let mut guard = lock_state();
     let state = guard.get_or_insert_with(|| load_state(&state_file));
     // 快速路径：一次 stat，没有新字节就直接返回（watcher 每秒走这里）。
     if !has_pending_bytes(&events, state.offset) {
@@ -648,7 +664,7 @@ pub(crate) fn consume_pending() -> bool {
 /// 查询路径也能拿到最新状态。
 pub(crate) fn hook_entries(now: i64) -> Vec<Resolved> {
     let _ = consume_pending();
-    let mut guard = STATE.lock().unwrap();
+    let mut guard = lock_state();
     let state = guard.get_or_insert_with(|| load_state(&state_path()));
     live_entries(state, now)
 }
@@ -656,7 +672,7 @@ pub(crate) fn hook_entries(now: i64) -> Vec<Resolved> {
 /// 最近一次入账的 hook 限额事件时刻（诊断用）。
 pub fn last_event_at() -> Option<i64> {
     {
-        let guard = STATE.lock().unwrap();
+        let guard = lock_state();
         if let Some(state) = guard.as_ref() {
             return state.last_event_at;
         }
@@ -664,16 +680,54 @@ pub fn last_event_at() -> Option<i64> {
     load_state(&state_path()).last_event_at
 }
 
+/// 单轮 watcher 工作（可测接缝）：用 `catch_unwind` 隔离本轮，返回是否 panic。
+///
+/// 一次 panic 只跳过这一轮，watcher 线程不退出；`AssertUnwindSafe` 是必需的：
+/// `emit` 由宿主注入，其内部可变状态不保证 `UnwindSafe`。
+fn watcher_tick<F: FnOnce()>(work: F) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err()
+}
+
+/// 连续 panic 预算（纯策略，可测）：返回（新的连续计数，是否继续轮询）。
+///
+/// 成功一轮即清零（孤立 panic 不累积停摆），连续达 [`WATCHER_MAX_CONSECUTIVE_PANICS`]
+/// 即停，避免「每轮必崩」的无限重启风暴。
+fn advance_panic_budget(consecutive: u32, panicked: bool) -> (u32, bool) {
+    let next = if panicked {
+        consecutive.saturating_add(1)
+    } else {
+        0
+    };
+    (next, next < WATCHER_MAX_CONSECUTIVE_PANICS)
+}
+
 /// 启动 watcher：轮询事件文件，有新条目时回调（宿主据此 emit `rate-limits-updated`）。
 ///
 /// 开关（`rate_limit_config.json`）只影响「是否通知前端」：信号照常入账，关闭期间
 /// 发生的限额在重新打开开关后仍在（后端持有）。
 pub fn spawn_watcher(emit: impl Fn() + Send + 'static) {
-    std::thread::spawn(move || loop {
-        if consume_pending() && rate_limit_enabled() {
-            emit();
+    std::thread::spawn(move || {
+        let mut consecutive = 0u32;
+        loop {
+            let panicked = watcher_tick(|| {
+                if consume_pending() && rate_limit_enabled() {
+                    emit();
+                }
+            });
+            let (next, keep_going) = advance_panic_budget(consecutive, panicked);
+            consecutive = next;
+            if !keep_going {
+                eprintln!(
+                    "[rate-limit-watcher] 连续 {WATCHER_MAX_CONSECUTIVE_PANICS} 轮 panic，停止监听以避免重启风暴"
+                );
+                return;
+            }
+            std::thread::sleep(if panicked {
+                WATCHER_PANIC_BACKOFF
+            } else {
+                POLL_INTERVAL
+            });
         }
-        std::thread::sleep(POLL_INTERVAL);
     });
 }
 
@@ -1805,5 +1859,97 @@ mod tests {
     #[test]
     fn watcher_state_path_lives_in_the_store_directory() {
         assert!(state_path().ends_with(STATE_FILE_NAME));
+    }
+
+    // -----------------------------------------------------------------------
+    // T7 锁中毒 / watcher panic 治理
+    // -----------------------------------------------------------------------
+
+    /// 制造 poison：持锁线程 panic（join 返回 Err 即符合预期）。
+    fn poison_state_lock() {
+        let result = std::thread::spawn(|| {
+            let _guard = STATE.lock().unwrap();
+            panic!("simulated poison while holding STATE");
+        })
+        .join();
+        assert!(result.is_err(), "持锁线程必须 panic 才能制造 poison");
+        assert!(STATE.is_poisoned(), "前置条件：STATE 确实被 poison");
+    }
+
+    /// 验收：注入 poison → 查询路径与 watcher 单轮都不 panic，台账仍可读。
+    ///
+    /// `consume_pending` / `hook_entries` / `last_event_at` 三处唯一的 poison
+    /// panic 源都是 `STATE.lock().unwrap()`，现统一收敛到 `lock_state()`。
+    #[test]
+    fn poisoned_state_lock_is_recovered_instead_of_panicking() {
+        poison_state_lock();
+
+        let mut guard = lock_state();
+        let state = guard.get_or_insert_with(State::default);
+        state.offset = 42;
+        drop(guard);
+
+        let guard = lock_state();
+        assert_eq!(guard.as_ref().and_then(|s| s.last_event_at), None);
+        assert_eq!(guard.as_ref().map(|s| s.offset), Some(42));
+        drop(guard);
+
+        assert_eq!(last_event_at(), None, "查询路径不得因 poison panic");
+        assert!(
+            !watcher_tick(|| {
+                let _guard = lock_state();
+            }),
+            "watcher 单轮遇到 poison 不得 panic / 死亡"
+        );
+
+        // 复位全局状态，避免影响同进程其它用例。
+        *lock_state() = None;
+    }
+
+    /// 验收：单轮 panic 被隔离，watcher 不死。
+    #[test]
+    fn watcher_tick_isolates_a_single_panic() {
+        assert!(watcher_tick(|| panic!("boom")), "panic 必须被 catch 并上报");
+        assert!(!watcher_tick(|| {}), "正常一轮不算 panic");
+    }
+
+    /// 验收：连续 panic 有上限、成功一轮即清零（孤立 panic 不累积）。
+    #[test]
+    fn panic_budget_caps_consecutive_restarts_and_resets_on_success() {
+        let (n1, go1) = advance_panic_budget(0, true);
+        assert!(go1, "首次 panic 应允许重启");
+        assert_eq!(n1, 1);
+
+        let (n2, go2) = advance_panic_budget(n1, true);
+        assert!(go2);
+        assert_eq!(n2, 2);
+
+        let (n3, go3) = advance_panic_budget(n2, false);
+        assert!(go3);
+        assert_eq!(n3, 0, "成功一轮必须清零连续计数");
+
+        let (_, go4) = advance_panic_budget(WATCHER_MAX_CONSECUTIVE_PANICS - 1, true);
+        assert!(!go4, "连续 panic 达上限必须停止，避免无限重启风暴");
+    }
+
+    /// 对抗：watcher 反复 panic 时必须在有限轮内停止。
+    #[test]
+    fn repeated_panics_do_not_cause_an_infinite_restart_storm() {
+        let mut consecutive = 0u32;
+        let mut ticks = 0u32;
+        loop {
+            // 模拟每轮 catch_unwind 都返回 true（每轮必崩）。
+            let (next, keep_going) = advance_panic_budget(consecutive, true);
+            consecutive = next;
+            ticks += 1;
+            if !keep_going {
+                break;
+            }
+            assert!(ticks < 100, "必须在有限轮内停止，不得无限重启");
+        }
+        assert!(
+            ticks <= WATCHER_MAX_CONSECUTIVE_PANICS,
+            "重启次数必须有界: {ticks}"
+        );
     }
 }

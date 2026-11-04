@@ -46,17 +46,24 @@ export function useVisibleInterval(callback: () => void, intervalMs: number, ena
     };
     document.addEventListener("visibilitychange", onVisibility);
 
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     if (!api.isWebui()) {
       void listen<boolean>("main-window-visible", (event) => {
         if (event.payload) start();
         else stop();
       }).then((fn) => {
+        // StrictMode / enabled 变化时 Promise 可能晚于清理才 resolve：立即解绑，避免残留监听。
+        if (disposed) {
+          fn();
+          return;
+        }
         unlisten = fn;
       });
     }
 
     return () => {
+      disposed = true;
       stop();
       document.removeEventListener("visibilitychange", onVisibility);
       unlisten?.();

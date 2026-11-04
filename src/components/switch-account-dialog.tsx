@@ -8,6 +8,13 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -22,7 +29,25 @@ import { SessionSyncSection, type SessionLinksMeta } from "@/components/session-
 import { SessionTreeList } from "@/components/session-tree";
 import * as api from "@/lib/api";
 import { displayName } from "@/lib/account-display";
+import {
+  createSwitchProgressPoller,
+  shouldBlockDismiss,
+} from "@/lib/switch-dialog-lifecycle";
 import { accountVariant, variantAppName } from "@/lib/variant";
+import { useAccountsStore } from "@/stores/accounts";
+import {
+  canSubmitMemory,
+  DEFAULT_MEMORY_MODE,
+  initialMemorySelection,
+  memoryAssetLabel,
+  memorySummaryWarning,
+  memoryToasts,
+  resolveMemorySources,
+  showsSourcePicker,
+  toMemorySwitchArgs,
+  type MemoryMode,
+  type MemoryToastLevel,
+} from "@/lib/switch-memory-mode";
 import type {
   AccountMeta,
   Session,
@@ -51,6 +76,17 @@ function tabCount(count: number) {
     <span className="ml-1 text-xs text-muted-foreground tabular-nums">{count}</span>
   ) : null;
 }
+
+/** 记忆结果 toast 的分级出口：表驱动，组件里只做一次遍历调用。 */
+const MEMORY_TOAST_EMIT: Record<
+  MemoryToastLevel,
+  (title: string, options: { description: string }) => void
+> = {
+  success: (title, options) => toast.success(title, options),
+  error: (title, options) => toast.error(title, options),
+  warning: (title, options) => toast.warning(title, options),
+  info: (title, options) => toast.info(title, options),
+};
 
 /**
  * 会话列表区最小高度：加载态、空态与列表共用同一下沿。
@@ -98,8 +134,10 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [tab, setTab] = useState<"links" | "copy" | "sync">("links");
   /** 关联会话区块上报的状态：tab 徽标与常驻提示用。 */
   const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
-  /** 工作记忆：把本机所有账号的 MEMORY.md 合并后分发回去（不给目标账号覆盖式写入）。 */
-  const [mergeMemory, setMergeMemory] = useState(false);
+  /** 工作记忆三选一：不同步（默认）/ 合并 / 用母本复制覆盖。破坏性项永不默认选中。 */
+  const [memoryMode, setMemoryMode] = useState<MemoryMode>(DEFAULT_MEMORY_MODE);
+  /** 用户手动选过的母本 uid；null = 跟随渲染期算出的默认母本（当前登录账号）。 */
+  const [memorySourceUid, setMemorySourceUid] = useState<string | null>(null);
   /** 专家团：把本机各账号已添加的专家团汇总成一份写回每个账号（只增不减）。 */
   const [mergeExperts, setMergeExperts] = useState(false);
   /** 人设：把最完整的一份 SOUL / IDENTITY / USER 同步到所有账号（默认开）。 */
@@ -107,29 +145,71 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   /** 人设覆盖策略：默认只替换仍是客户端默认模板的目标，手改过的保留。 */
   const [personaMode, setPersonaMode] = useState<"safe" | "overwrite">("safe");
 
+  // 账号库与当前登录态：母本下拉的选项与默认值都由此派生，不额外发请求。
+  const accounts = useAccountsStore((s) => s.accounts);
+  const statusCurrent = useAccountsStore((s) => s.status?.current ?? null);
+
   const variant = accountVariant(account);
   const accountId = account?.id;
 
-  // 监听后端切换进度：桌面端走 Tauri 事件，webui 走 HTTP 轮询
+  /**
+   * 母本默认值在渲染期派生，不用 useEffect 同步；用户一旦手动改过
+   * （memorySourceUid !== null）就不再被默认值覆盖。
+   *
+   * 「当前登录账号」只认 status.current：它与账号页 isWorkbuddyCurrent 同口径。
+   * 不用组件里的 currentUid —— 那个来自 listSessions(目标账号档位).current，
+   * 跨档位切号时可能指向另一档位的账号，拿它当母本会静默猜错。
+   * status 缺失时 resolveMemorySources 会退到第一项并置 needsConfirm，界面提示确认。
+   */
+  const memorySources = resolveMemorySources(accounts, [
+    statusCurrent?.uid ?? null,
+    statusCurrent?.email ?? null,
+  ]);
+  const effectiveSourceUid = memorySourceUid ?? memorySources.defaultUid ?? "";
+  const sourceNeedsConfirm = memorySources.needsConfirm && memorySourceUid === null;
+  const sourceLabel =
+    memorySources.options.find((option) => option.uid === effectiveSourceUid)?.label ?? "母本账号";
+
+  /** busy 期间任何路径都不允许关闭弹窗：后端切号不可取消，关掉只会造成状态脱节。 */
+  function handleOpenChange(next: boolean) {
+    if (!next && shouldBlockDismiss(busy)) return;
+    onOpenChange(next);
+  }
+
+  // 桌面端：弹窗打开期间常驻订阅后端进度事件。不随 busy 重建订阅——
+  // listen() 是异步注册，等 busy=true 才注册会漏掉切号刚开始推送的首帧。
   useEffect(() => {
-    if (api.isWebui()) {
-      const timer = setInterval(() => {
-        void api.switchProgress().then((p) => {
-          if (p.progress) setProgress(p.progress);
-        });
-      }, 600);
-      return () => clearInterval(timer);
-    }
+    if (!open || api.isWebui()) return;
+    let disposed = false;
     let unlisten: (() => void) | undefined;
-    listen<{ message: string }>("switch-progress", (e) => {
+    void listen<{ message: string }>("switch-progress", (e) => {
       setProgress(e.payload.message);
     }).then((fn) => {
+      // StrictMode / 弹窗秒关时 Promise 可能晚于清理才 resolve：立即解绑，避免残留监听。
+      if (disposed) {
+        fn();
+        return;
+      }
       unlisten = fn;
     });
     return () => {
+      disposed = true;
       unlisten?.();
     };
-  }, []);
+  }, [open]);
+
+  // webui：没有事件通道，仅在「弹窗打开且切号进行中」轮询进度快照。
+  // 弹窗关闭 / 切号结束即停止，避免常驻组件在后台每 600ms 发一次无效请求。
+  useEffect(() => {
+    if (!open || !busy || !api.isWebui()) return;
+    return createSwitchProgressPoller({
+      fetchProgress: api.switchProgress,
+      onMessage: setProgress,
+      intervalMs: 600,
+      setInterval: (cb, ms) => window.setInterval(cb, ms),
+      clearInterval: (id) => window.clearInterval(id),
+    });
+  }, [open, busy]);
 
   // 立即打开弹框；首次绘制前重置旧内容，两个 tab 各自加载数据。
   useLayoutEffect(() => {
@@ -139,12 +219,19 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setExpanded(new Set());
     setPermCheck(null);
     setError("");
+    // 旧版本允许在切号中关掉弹窗：重开时必须回到可交互的初始态，
+    // 否则遮罩会一直显示「正在处理中」且所有控件禁用。
+    setBusy(false);
+    setProgress("");
     setSessions([]);
     setCurrentUid(null);
     setSyncSelections([]);
     setSyncGroups([]);
     setLinksMeta(null);
-    setMergeMemory(false);
+    // 打开重置：工作记忆回到「不同步」+ 跟随默认母本（initialMemorySelection）。
+    const memorySelection = initialMemorySelection();
+    setMemoryMode(memorySelection.mode);
+    setMemorySourceUid(memorySelection.sourceUid);
     setMergeExperts(false);
     // 人设每次打开都回到「同步 + 只补空白」：上次选的「全部换成同一份」不能
     // 静默延续到下一次切号，否则会连续覆盖所有人设。
@@ -198,6 +285,8 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
 
   async function doSwitch() {
     if (!account) return;
+    // 破坏性操作守卫：覆盖模式没选出母本时不发请求，也不静默降级成合并。
+    if (!canSubmitMemory(memoryMode, effectiveSourceUid)) return;
     setBusy(true);
     setProgress("正在切换账号…");
     setError("");
@@ -209,7 +298,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         copySessionIds: requestedCopy ? [...selected] : undefined,
         // 勾选绑定预览凭据；执行前后端会重新校验，版本变化则跳过该项。
         syncSelections: requestedSync ? syncSelections : undefined,
-        mergeMemory: mergeMemory || undefined,
+        ...toMemorySwitchArgs(memoryMode, effectiveSourceUid),
         mergeExperts: mergeExperts || undefined,
         syncPersona: syncPersona || undefined,
         personaMode: syncPersona ? personaMode : undefined,
@@ -323,31 +412,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           description: `${sidecarIssues.join("；")}。主会话不受影响，缺失的只是子 agent 面板内容。`,
         });
       }
-      // 记忆合并：写入了哪些账号、备份在哪、哪些失败，必须逐项可见。
-      const memoryReport = res.memoryMerge;
-      if (memoryReport) {
-        const memoryIssues = [
-          ...memoryReport.errors.map((item) => `${item.label}：${item.error}`),
-          ...(memoryReport.persona?.errors ?? []).map(
-            (item) => `${item.label} / ${item.file}：${item.error}`,
-          ),
-        ];
-        if (memoryIssues.length > 0) {
-          toast.error("工作记忆没有全部合并", { description: memoryIssues.join("；") });
-        }
-        if (memoryReport.written.length > 0) {
-          toast.success(`工作记忆已合并并写入 ${memoryReport.written.length} 个账号`, {
-            description: `${memoryReport.sources.length} 份记忆合成 ${memoryReport.mergedChars} 字；被覆盖的原文已备份为 MEMORY.md.bak-时间戳`,
-          });
-        } else if (memoryIssues.length === 0 && memoryReport.note) {
-          toast.info("工作记忆未合并", { description: memoryReport.note });
-        } else if (memoryIssues.length === 0 && memoryReport.unchanged.length > 0) {
-          toast.info("工作记忆无需更新", { description: "所有账号的记忆内容已经一致。" });
-        }
-      } else if (mergeMemory) {
-        toast.warning("工作记忆未合并", {
-          description: "没有收到合并结果：当前版本可能不支持该功能，账号已切换，但记忆没有改动。",
-        });
+      // 记忆结果：合并 / 覆盖分级提示全部由纯决策函数给出，按本次请求的 mode 出文案。
+      for (const item of memoryToasts(memoryMode, res.memoryMerge)) {
+        MEMORY_TOAST_EMIT[item.level](item.title, { description: item.description });
       }
       // 专家团同步：失败必须独立提示；成功量已并入上面的汇总，不重复弹第二条成功 toast。
       if (expertsReport) {
@@ -494,10 +561,10 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const linksAvailable = linksMeta?.available ?? true;
   /**
    * 切号时顺带同步的资产（记忆 / 人设 / 专家团）：摘要与勾选说明共用一处措辞，
-   * 避免「只勾资产」时摘要还写「仅切换账号」。
+   * 避免「只勾资产」时摘要还写「仅切换账号」。覆盖模式也计入徽标（memoryAssetLabel 非空）。
    */
   const assetParts = [
-    mergeMemory ? "工作记忆" : null,
+    memoryAssetLabel(memoryMode),
     syncPersona ? "人设" : null,
     mergeExperts ? "专家团" : null,
   ].filter((part): part is string => part !== null);
@@ -531,6 +598,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           : syncCount === 0
             ? "未选择同步会话"
             : null;
+  /** 覆盖模式在底部摘要也醒目提示（切到别的 tab 时仍能看到），不只在区块内。 */
+  const memoryWarning = memorySummaryWarning(memoryMode);
+  const memoryBlocked = !canSubmitMemory(memoryMode, effectiveSourceUid);
   const needsPermission = error.includes("无权限");
   const sessionsEmpty = !loadingSessions && sessions.length === 0;
   const copyHint = loadingSessions
@@ -543,32 +613,116 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           : "未检测到当前登录账号，无法列出会话"
         : "把当前账号勾选的会话复制给目标账号（复制后归属目标账号）；已经复制过的不会重复复制；已置顶的会话会同步置顶到目标账号";
 
-  // 关联 tab 不可用（国际版能力判定不通过）时回落到复制会话，避免停在空 tab。
+  // 关联 tab 不可用（国际版能力判定不通过）时回落到复制会话，避免停在空 tab；
+  // 同时清掉失效勾选，避免摘要 / 提交残留上一轮或不可用状态下的 syncSelections
+  // （后端已兜住不会产生写入，这里保证前端摘要与提交口径一致）。
   useEffect(() => {
-    if (!linksAvailable && tab === "links") setTab("copy");
-  }, [linksAvailable, tab]);
+    if (linksAvailable) return;
+    setSyncSelections([]);
+    setSyncGroups([]);
+    setTab((prev) => (prev === "links" ? "copy" : prev));
+  }, [linksAvailable]);
 
   /** 第三个 tab：跨账号同步（记忆 / 人设 / 专家团）。原来挤在底部，收纳到这里。 */
   const syncTabContent = (
     <div className="space-y-2.5">
       <p className="text-xs text-muted-foreground">
-        这三项都是本地文件操作，与会话无关；勾选后会在写入登录态之前完成，覆盖前都会先备份。
+        这些都是本地文件操作，与会话无关；选定后会在写入登录态之前完成，覆盖前都会先备份。
       </p>
 
-      <label className="flex cursor-pointer items-start gap-2 rounded-md border border-border px-3 py-2.5">
-        <Checkbox
-          checked={mergeMemory}
+      <div className="space-y-2 rounded-md border border-border px-3 py-2.5">
+        <div className="text-sm font-medium">工作记忆</div>
+        <RadioGroup
+          value={memoryMode}
           disabled={busy}
-          onCheckedChange={(value) => setMergeMemory(value === true)}
-          className="mt-0.5"
-        />
-        <div className="min-w-0 space-y-1">
-          <div className="text-sm font-medium">合并工作记忆</div>
-          <div className="text-xs text-muted-foreground">
-            把各账号的 MEMORY.md 合成一份，再写回每个账号；原文件先备份。
+          onValueChange={(value) => setMemoryMode(value as MemoryMode)}
+          className="gap-2"
+        >
+          <label className="flex cursor-pointer items-start gap-2">
+            <RadioGroupItem value="off" className="mt-0.5" />
+            <div className="min-w-0 space-y-0.5">
+              <div className="text-xs font-medium">不同步</div>
+              <div className="text-xs text-muted-foreground">这次只切换账号，不动任何账号的工作记忆。</div>
+            </div>
+          </label>
+          <label className="flex cursor-pointer items-start gap-2">
+            <RadioGroupItem value="merge" className="mt-0.5" />
+            <div className="min-w-0 space-y-0.5">
+              <div className="text-xs font-medium">合并成一份（只增不减）</div>
+              <div className="text-xs text-muted-foreground">
+                把各账号的工作记忆合到一起，再写回每个账号；原有内容不会丢，写入前先备份。
+              </div>
+            </div>
+          </label>
+          <label className="flex cursor-pointer items-start gap-2">
+            <RadioGroupItem value="overwrite" className="mt-0.5" />
+            <div className="min-w-0 space-y-0.5">
+              <div className="text-xs font-medium">用我这份覆盖所有账号</div>
+              <div className="text-xs text-muted-foreground">
+                把指定账号的工作记忆复制给其他所有账号；其他账号原来的记忆会被替换。
+              </div>
+            </div>
+          </label>
+        </RadioGroup>
+
+        {showsSourcePicker(memoryMode) && (
+          <div className="ml-6 space-y-2 border-l border-border pl-3">
+            <Alert variant="destructive" className="min-w-0">
+              <CircleAlert />
+              <AlertTitle>这是覆盖操作</AlertTitle>
+              <AlertDescription className="min-w-0 break-words">
+                「{sourceLabel}」的工作记忆会替换其他账号原有的记忆。覆盖前每个账号都会自动备份为
+                MEMORY.md.bak-时间戳，随时可以还原；只改工作记忆，不动人设、专家团和云端记忆。
+              </AlertDescription>
+            </Alert>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium" htmlFor="memory-source-uid">母本账号</label>
+              <Select
+                value={effectiveSourceUid || undefined}
+                onValueChange={setMemorySourceUid}
+                disabled={busy || memorySources.options.length === 0}
+              >
+                <SelectTrigger
+                  id="memory-source-uid"
+                  size="sm"
+                  className="w-full min-w-0 bg-background text-xs"
+                  aria-label="母本账号"
+                >
+                  <SelectValue
+                    placeholder={
+                      memorySources.options.length === 0
+                        ? "账号库里没有可用作母本的账号"
+                        : "选择母本账号"
+                    }
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  {memorySources.options.map((option) => (
+                    <SelectItem key={option.uid} value={option.uid} className="text-xs">
+                      {option.label}
+                      {option.isCurrent ? "（当前登录）" : ""}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                默认选当前登录账号，可以在这里改成别的账号。
+              </p>
+              {sourceNeedsConfirm && memorySources.options.length > 0 && (
+                <p className="text-xs font-medium text-amber-700 dark:text-amber-400">
+                  请确认母本：没能识别当前登录账号，已默认选列表第一项，请核对后再覆盖。
+                </p>
+              )}
+              {memorySources.options.length === 0 && (
+                <p className="text-xs font-medium text-amber-700 dark:text-amber-400">
+                  覆盖需要至少一个记录了 uid 的账号作为母本，当前无法提交覆盖。
+                </p>
+              )}
+            </div>
           </div>
-        </div>
-      </label>
+        )}
+      </div>
 
       <div className="space-y-2 rounded-md border border-border px-3 py-2.5">
         <label className="flex cursor-pointer items-start gap-2">
@@ -678,9 +832,15 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   );
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
         showCloseButton={!busy}
+        onEscapeKeyDown={(event) => {
+          if (shouldBlockDismiss(busy)) event.preventDefault();
+        }}
+        onInteractOutside={(event) => {
+          if (shouldBlockDismiss(busy)) event.preventDefault();
+        }}
         className="flex max-h-[min(90vh,calc(100vh-2rem))] min-w-0 flex-col gap-0 overflow-hidden p-0"
       >
         <DialogAutoHeight>
@@ -820,12 +980,22 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           <div className="min-w-0 space-y-0.5">
             <div className="text-sm font-medium">{summaryMain}</div>
             {summarySub && <div className="text-xs text-muted-foreground">{summarySub}</div>}
+            {memoryWarning && (
+              <div className="text-xs font-medium text-amber-700 dark:text-amber-400">
+                {memoryWarning}
+              </div>
+            )}
+            {memoryBlocked && (
+              <div className="text-xs text-amber-700 dark:text-amber-400">
+                请先选出母本账号，或改回「不同步 / 合并」再切换。
+              </div>
+            )}
           </div>
           <div className="flex shrink-0 gap-2">
-            <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
+            <Button variant="outline" onClick={() => handleOpenChange(false)} disabled={busy}>
               取消
             </Button>
-            <Button onClick={doSwitch} disabled={busy}>
+            <Button onClick={doSwitch} disabled={busy || memoryBlocked}>
               {busy ? "切换中…" : "确认切换"}
             </Button>
           </div>

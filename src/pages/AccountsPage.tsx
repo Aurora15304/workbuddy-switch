@@ -509,13 +509,22 @@ export default function AccountsPage() {
   // 这一路不看节流：新状态已经在后端，前端只做拉取。
   useEffect(() => {
     if (api.isWebui()) return;
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen("rate-limits-updated", () => {
       void loadRateLimitsRef.current({ force: true });
     }).then((fn) => {
+      // StrictMode 下 Promise 可能晚于清理才 resolve：立即解绑，避免残留监听。
+      if (disposed) {
+        fn();
+        return;
+      }
       unlisten = fn;
     });
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   /**
@@ -526,13 +535,22 @@ export default function AccountsPage() {
    */
   useEffect(() => {
     if (api.isWebui()) return;
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen("codebuddy-cli-updated", () => {
       void refreshCodebuddyCliStatusRef.current();
     }).then((fn) => {
+      // StrictMode 下 Promise 可能晚于清理才 resolve：立即解绑，避免残留监听。
+      if (disposed) {
+        fn();
+        return;
+      }
       unlisten = fn;
     });
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   // 兜底轮询：事件可能因窗口尚未挂载而错过（例如后台刷新先于页面加载完成），

@@ -1563,10 +1563,45 @@ function TokenStatsLoadingSkeleton({
   );
 }
 
+/** 会话内共用一份 Token 统计：切页重挂载不重扫，30 分钟过期或点「刷新统计」才重采。 */
+const TOKEN_STATISTICS_AUTO_REFRESH_MS = 30 * 60 * 1000;
+
+let cachedTokenStatistics: TokenStatistics | null = null;
+/** 本地采集完成时刻；不用后端 generatedAt，避免 webui 服务器与浏览器时钟偏差让 TTL 永不过期。 */
+let cachedTokenStatisticsAt = 0;
+/** 同一时刻只允许一次全量扫描在飞（切页 / StrictMode 双跑 / 连点刷新共用同一份结果）。 */
+let tokenStatisticsInflight: Promise<TokenStatistics> | null = null;
+
+/** 可直接渲染的缓存：未过期，且没有更新的扫描在飞。 */
+function settledTokenStatistics(): TokenStatistics | null {
+  if (tokenStatisticsInflight || !cachedTokenStatistics) return null;
+  return Date.now() - cachedTokenStatisticsAt < TOKEN_STATISTICS_AUTO_REFRESH_MS
+    ? cachedTokenStatistics
+    : null;
+}
+
+function rememberTokenStatistics(next: TokenStatistics): TokenStatistics {
+  cachedTokenStatistics = next;
+  cachedTokenStatisticsAt = Date.now();
+  return next;
+}
+
+/** refresh 只绕过缓存（强制重采）；在飞的扫描始终复用，避免并发两次全量重扫。 */
+export function loadCachedTokenStatistics(refresh: boolean): Promise<TokenStatistics> {
+  const settled = refresh ? null : settledTokenStatistics();
+  if (settled) return Promise.resolve(settled);
+  if (tokenStatisticsInflight) return tokenStatisticsInflight;
+  const pending = api.getTokenStatistics().then(rememberTokenStatistics);
+  tokenStatisticsInflight = pending;
+  return pending.finally(() => {
+    if (tokenStatisticsInflight === pending) tokenStatisticsInflight = null;
+  });
+}
+
 export default function TokenStatsPage() {
-  const [stats, setStats] = useState<TokenStatistics | null>(null);
+  const [stats, setStats] = useState<TokenStatistics | null>(cachedTokenStatistics);
   const [active, setActive] = useState<SourceKey>(readPreferredTokenSource);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => !settledTokenStatistics());
   const [error, setError] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -1578,11 +1613,21 @@ export default function TokenStatsPage() {
   useEffect(() => {
     let disposed = false;
     const requestId = ++statsRequestId.current;
+    // reload === 0 是切页重挂载，可命中会话缓存；> 0 来自「刷新统计」，强制重采。
+    const refresh = reload > 0;
+    const settled = refresh ? null : settledTokenStatistics();
+    if (settled) {
+      // 缓存命中不进入 loading：进度订阅只在扫描期间建立，避免显示上一轮或无扫描的假进度。
+      setStats(settled);
+      setLoading(false);
+      setError(null);
+      setProgress(null);
+      return;
+    }
     setLoading(true);
     setError(null);
     setProgress(null);
-    api
-      .getTokenStatistics()
+    loadCachedTokenStatistics(refresh)
       .then((result) => {
         if (!disposed && statsRequestId.current === requestId) setStats(result);
       })

@@ -2,12 +2,27 @@
 //!
 //! 对照 server.py `load_accounts` / `save_accounts` / `find_account` /
 //! `account_display_name` / `account_meta`。
+//!
+//! ## 持久化与并发（T1 单一根因）
+//! - **写入**：所有写者统一走 [`with_accounts_write`]，在 `accounts.lock` 内完成
+//!   「重读 → 三态判定 → 修改 → 校验 → 持久化写回」全程，杜绝并发 Lost Update。
+//!   锁路径由账号库路径派生，注入路径的写者也自动获得同一把锁。
+//! - **三态**：`Missing`（首次使用，允许初始化）/ `Ready`（含合法 `[]`）
+//!   / `Unavailable`（空串、半截 JSON、非数组、权限失败）——后者拒绝写入并
+//!   原样保留现场，绝不降级成空表覆盖。`*.tmp-*` 残留不是损坏信号，从不参与判定。
+//! - **展示读**：[`load_accounts`] 等纯读接口无锁，依赖 tmp+rename 的原子替换，
+//!   避免把全仓展示读串行化。
+//! - **锁顺序**：`auth-state` → `accounts`（refresh / switch 先持 auth-state，
+//!   再进入本模块写路径）。任何调用方不得反向获取，避免 ABBA。
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::modules::config::{accounts_file, atomic_write, now_ms};
+use crate::modules::session_link::{self, LockError};
 use crate::modules::variant::WbVariant;
 
 /// 判断字段是否为 WorkBuddy 5.6 加密信封对象（`{$wbEncrypted, envelope}`）。
@@ -32,21 +47,130 @@ fn has_unexpired_plain_token(acc: &Value) -> bool {
     }
 }
 
-fn load_accounts_from_path(path: &Path) -> Vec<Value> {
-    if let Ok(text) = std::fs::read_to_string(path) {
-        if let Ok(Value::Array(accounts)) = serde_json::from_str::<Value>(&text) {
-            return accounts;
+/// 账号库读取三态：把「缺失 / 空串 / 半截 JSON / 非数组 / 权限失败 / 合法数组」
+/// 归一为三种写入决策，杜绝把损坏现场误判成空库后覆盖。
+enum AccountsState {
+    /// 首次使用：主文件不存在，允许初始化。
+    Missing,
+    /// 有效（含合法 `[]`：用户确实删光了账号）。
+    Ready(Vec<Value>),
+    /// 不可写：原文件保留，禁止任何覆盖。
+    Unavailable(String),
+}
+
+/// 三态解析：只认主文件，`*.tmp-*` 残留从不参与判定。
+fn read_accounts_state(path: &Path) -> AccountsState {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::NotFound => return AccountsState::Missing,
+        Err(error) => return AccountsState::Unavailable(format!("账号库无法读取：{error}")),
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Array(accounts)) => AccountsState::Ready(accounts),
+        Ok(_) => AccountsState::Unavailable("账号库不是 JSON 数组，原文件已保留".to_string()),
+        Err(error) => {
+            AccountsState::Unavailable(format!("账号库已损坏（{error}），原文件已保留"))
         }
     }
-    vec![]
+}
+
+/// 纯展示型读：无锁（依赖 tmp+rename 的原子替换），不可用一律降级为空列表，
+/// 避免把全仓展示读串行化。写入方必须走 [`with_accounts_write`] 的三态判定。
+fn load_accounts_from_path(path: &Path) -> Vec<Value> {
+    match read_accounts_state(path) {
+        AccountsState::Ready(accounts) => accounts,
+        AccountsState::Missing | AccountsState::Unavailable(_) => Vec::new(),
+    }
+}
+
+/// 写入前校验：产出「即将落盘的完整 JSON 文本」，并回验它确为 JSON 数组。
+///
+/// 旧实现 `to_string_pretty(...).unwrap_or_default()` 在序列化失败时会把**空串**
+/// 写进主文件：调用方拿到 `Ok`，账号却全丢了。这里把失败显式化，只有成功
+/// 产出完整文本后才进入 `atomic_write`——「报告成功 ⟺ 确实落盘」。
+fn serialize_accounts(accounts: &[Value]) -> Result<String, String> {
+    let content = serde_json::to_string_pretty(accounts)
+        .map_err(|error| format!("账号库序列化失败：{error}"))?;
+    match serde_json::from_str::<Value>(&content) {
+        Ok(Value::Array(_)) => Ok(content),
+        Ok(_) => Err("账号库序列化产物不是 JSON 数组".to_string()),
+        Err(error) => Err(format!("账号库序列化产物无效：{error}")),
+    }
+}
+
+/// 把写路径的可读错误统一成 io::Error，保持 `save_accounts` / `upsert_account` /
+/// `save_collected_account` 既有对外签名不变（不牵动全仓调用点）。
+fn as_io_error(reason: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, reason)
 }
 
 fn save_accounts_to_path(path: &Path, accounts: &[Value]) -> std::io::Result<()> {
+    let content = serialize_accounts(accounts).map_err(as_io_error)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let content = serde_json::to_string_pretty(accounts).unwrap_or_default();
     atomic_write(path, &content)
+}
+
+/// 账号库写锁：与账号库同目录的 `accounts.lock`，职责单一。
+///
+/// 刻意不复用 `auth-state.lock`：后者是 refresh / export 的事务锁，
+/// `try_auth` fail-fast、`wait_auth` 最长 30s，会让轻写者收到 AUTH_STATE_BUSY
+/// 或无谓等待。两把锁的生命周期与重试语义都不相同。
+fn accounts_lock_file(path: &Path) -> std::path::PathBuf {
+    path.with_file_name("accounts.lock")
+}
+
+const ACCOUNTS_LOCK_RETRY: usize = 25;
+const ACCOUNTS_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+/// 进程内写串行化：Windows 上同一进程多线程并发 `CreateFile(accounts.lock)` 会
+/// 偶发 `ERROR_ACCESS_DENIED(5)`，被 `try_lock_file` 归类成「无法建立互斥」而
+/// 立即失败（实测并发写必现）。这一层把同进程写者排成队，跨进程仍由文件锁负责。
+/// 两层锁顺序固定「进程内 Mutex → 跨进程文件锁」，所有写者一致，无反向获取。
+static ACCOUNTS_WRITE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 取进程内写锁；前一个写者 panic 时恢复锁而非让整条写队列永久中毒。
+fn lock_accounts_in_process() -> std::sync::MutexGuard<'static, ()> {
+    ACCOUNTS_WRITE_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 有界重试取锁：仅「被占用」重试，「无法建立互斥」立即失败——没有互斥保证
+/// 时绝不继续写。与 `session_link::acquire_link_store_lock` 同一口径。
+fn acquire_accounts_lock(path: &Path) -> Result<session_link::FileLock, String> {
+    let lock_path = accounts_lock_file(path);
+    for _ in 0..ACCOUNTS_LOCK_RETRY {
+        match session_link::try_lock_file(&lock_path) {
+            Ok(lock) => return Ok(lock),
+            Err(LockError::Busy) => std::thread::sleep(ACCOUNTS_LOCK_RETRY_INTERVAL),
+            Err(LockError::Unavailable(reason)) => {
+                return Err(format!("账号库暂时不可用：{reason}"));
+            }
+        }
+    }
+    Err("账号库正被其它操作占用，请稍后重试".to_string())
+}
+
+/// 账号库读改写：在 `accounts.lock` 内重读、三态判定、修改、校验、持久化写回。
+///
+/// 存储不可用时直接失败：不得降级成空表覆盖损坏现场（零数据丢失）。
+/// 纯展示读无需走这里，见 [`load_accounts`]。
+pub fn with_accounts_write<T>(
+    path: &Path,
+    mutate: impl FnOnce(&mut Vec<Value>) -> Result<T, String>,
+) -> Result<T, String> {
+    let _process_guard = lock_accounts_in_process();
+    let _file_guard = acquire_accounts_lock(path)?;
+    let mut accounts = match read_accounts_state(path) {
+        AccountsState::Missing => Vec::new(),
+        AccountsState::Ready(accounts) => accounts,
+        AccountsState::Unavailable(reason) => return Err(reason),
+    };
+    let outcome = mutate(&mut accounts)?;
+    save_accounts_to_path(path, &accounts).map_err(|error| format!("账号库保存失败：{error}"))?;
+    Ok(outcome)
 }
 
 fn find_account_in(accounts: &[Value], account_id: &str) -> Option<Value> {
@@ -60,13 +184,14 @@ fn find_account_in(accounts: &[Value], account_id: &str) -> Option<Value> {
 }
 
 fn delete_account_from_path(path: &Path, account_id: &str) -> Result<(), String> {
-    let mut accounts = load_accounts_from_path(path);
-    let before = accounts.len();
-    accounts.retain(|account| account.get("id").and_then(Value::as_str) != Some(account_id));
-    if accounts.len() == before {
-        return Err("账号不存在".to_string());
-    }
-    save_accounts_to_path(path, &accounts).map_err(|error| error.to_string())
+    with_accounts_write(path, |accounts| {
+        let before = accounts.len();
+        accounts.retain(|account| account.get("id").and_then(Value::as_str) != Some(account_id));
+        if accounts.len() == before {
+            return Err("账号不存在".to_string());
+        }
+        Ok(())
+    })
 }
 
 /// 读取账号库；文件缺失或损坏返回空列表。
@@ -84,9 +209,13 @@ pub fn load_accounts_at(path: &Path) -> Vec<Value> {
     load_accounts_from_path(path)
 }
 
-/// 写回账号库（原子写），保持原 JSON 数组结构。
+/// 写回账号库（锁内三态校验 + 持久化原子写），保持原 JSON 数组结构。
 pub fn save_accounts(accounts: &[Value]) -> std::io::Result<()> {
-    save_accounts_to_path(&accounts_file(), accounts)
+    with_accounts_write(&accounts_file(), |store| {
+        *store = accounts.to_vec();
+        Ok(())
+    })
+    .map_err(as_io_error)
 }
 
 /// 按 id 或 uid 查找账号。
@@ -318,17 +447,19 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
 
 /// 使用统一身份规则保存采集到的账号。
 pub fn save_collected_account(collected: Value) -> std::io::Result<Value> {
-    let mut accounts = load_accounts();
-    let saved = upsert_collected_account(&mut accounts, collected);
-    save_accounts(&accounts)?;
-    Ok(saved)
+    with_accounts_write(&accounts_file(), |accounts| {
+        Ok(upsert_collected_account(accounts, collected))
+    })
+    .map_err(as_io_error)
 }
 
 /// 按 id 覆盖；id 缺失或未命中时按 uid 回退覆盖，仍未命中则补 id 追加。
 pub fn upsert_account(updated: &Value) -> std::io::Result<()> {
-    let mut accounts = load_accounts();
-    upsert_account_in(&mut accounts, updated);
-    save_accounts(&accounts)
+    with_accounts_write(&accounts_file(), |accounts| {
+        upsert_account_in(accounts, updated);
+        Ok(())
+    })
+    .map_err(as_io_error)
 }
 
 /// 备注长度上限（字符数），与前端输入框 maxLength 保持一致。
@@ -339,9 +470,9 @@ const NOTE_MAX_CHARS: usize = 24;
 /// 只触碰本地展示字段，不修改 uid / token / profile_raw 等官方数据。
 /// 先整体校验再写入，避免部分更新。返回更新后的 `account_meta`。
 pub fn update_account_display(account_id: &str, patch: &Value) -> Result<Value, String> {
-    let mut accounts = load_accounts();
-    let updated = update_account_display_in(&mut accounts, account_id, patch)?;
-    save_accounts(&accounts).map_err(|error| error.to_string())?;
+    let updated = with_accounts_write(&accounts_file(), |accounts| {
+        update_account_display_in(accounts, account_id, patch)
+    })?;
     Ok(account_meta(&updated))
 }
 
@@ -1178,6 +1309,290 @@ mod tests {
         upsert_account_in(&mut accounts, &refreshed);
         assert_eq!(accounts[0]["note"], "工作号");
         assert_eq!(accounts[0]["displayField"], "phone");
+    }
+
+    // -----------------------------------------------------------------------
+    // T1：持久化落盘 / 并发锁 / 写入前校验（真实磁盘回归，禁止只断言 is_ok）
+    // -----------------------------------------------------------------------
+
+    fn account_store_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-switch-accounts-t1-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp store root should be creatable");
+        dir
+    }
+
+    fn store_path(dir: &Path) -> std::path::PathBuf {
+        dir.join("accounts.json")
+    }
+
+    fn read_raw(path: &Path) -> String {
+        std::fs::read_to_string(path).expect("accounts.json should be readable")
+    }
+
+    fn tmp_residue(dir: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .expect("store dir should be readable")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".tmp-"))
+            })
+            .collect()
+    }
+
+    /// 五义归三态：空串 / 半截 JSON / 非数组 / 权限失败一律 Unavailable，
+    /// 合法数组（含 `[]`）一律 Ready，仅文件不存在是 Missing。
+    #[test]
+    fn accounts_state_matrix_distinguishes_missing_ready_and_unavailable() {
+        let dir = account_store_dir("state-matrix");
+        let path = store_path(&dir);
+
+        assert!(
+            matches!(read_accounts_state(&path), AccountsState::Missing),
+            "文件不存在 = Missing（允许初始化）"
+        );
+
+        let cases: &[(&str, &str, bool)] = &[
+            ("合法数组", r#"[{"id":"a"}]"#, true),
+            ("合法空数组", "[]", true),
+            ("空串", "", false),
+            ("半截 JSON", r#"[{"id":"a""#, false),
+            ("合法但非数组", r#"{"id":"a"}"#, false),
+            ("空白串", "   \n", false),
+        ];
+        for (label, text, expect_ready) in cases {
+            std::fs::write(&path, text).unwrap();
+            let is_ready = matches!(read_accounts_state(&path), AccountsState::Ready(_));
+            assert_eq!(is_ready, *expect_ready, "{label} 的三态判定错误");
+        }
+
+        // 权限/目录形态同样归入 Unavailable，而不是 Missing（不得重建空表）。
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            matches!(read_accounts_state(&path), AccountsState::Unavailable(_)),
+            "主文件不可读必须 Unavailable，不得当成首次使用"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 合法 `[]` 不误伤；损坏库拒绝写入且主文件逐字节保留（零数据丢失）。
+    #[test]
+    fn empty_store_is_valid_and_corrupt_store_is_never_overwritten() {
+        let dir = account_store_dir("empty-and-corrupt");
+        let path = store_path(&dir);
+
+        std::fs::write(&path, "[]").unwrap();
+        let added = with_accounts_write(&path, |accounts| {
+            accounts.push(account("fresh", Some("uid-fresh"), "新账号", None));
+            Ok(())
+        });
+        assert!(added.is_ok(), "合法空库不得被判为损坏");
+        assert_eq!(load_accounts_from_path(&path).len(), 1);
+
+        let corrupt = r#"[{"id":"half""#;
+        std::fs::write(&path, corrupt).unwrap();
+        let rejected = with_accounts_write(&path, |accounts| {
+            accounts.push(account("intruder", Some("uid-intruder"), "入侵", None));
+            Ok(())
+        });
+        assert!(rejected.is_err(), "损坏库必须拒绝写入");
+        assert_eq!(read_raw(&path), corrupt, "拒绝写入时原文件必须原样保留");
+        assert!(tmp_residue(&dir).is_empty(), "拒绝写入不应产生 tmp 残留");
+        assert!(
+            load_accounts_from_path(&path).is_empty(),
+            "展示读仍安全降级为空，不因损坏崩溃"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 崩在 rename 之前：主文件完好、仅残留 `.tmp-*`；残留不得当损坏信号。
+    #[test]
+    fn tmp_residue_is_not_a_corruption_signal_and_main_file_stays_readable() {
+        let dir = account_store_dir("tmp-residue");
+        let path = store_path(&dir);
+        let valid = serde_json::to_string_pretty(&[account(
+            "kept",
+            Some("uid-kept"),
+            "保留账号",
+            None,
+        )])
+        .unwrap();
+        std::fs::write(&path, &valid).unwrap();
+        std::fs::write(dir.join("accounts.json.tmp-deadbeef"), r#"[{"id":"half""#).unwrap();
+
+        assert_eq!(
+            load_accounts_from_path(&path).len(),
+            1,
+            "tmp 残留不得影响展示读"
+        );
+
+        let result = with_accounts_write(&path, |accounts| {
+            accounts.push(account("added", Some("uid-added"), "新账号", None));
+            Ok(())
+        });
+        assert!(result.is_ok(), "存在 tmp 残留但主文件合法时应正常可写");
+        let persisted = load_accounts_from_path(&path);
+        assert_eq!(persisted.len(), 2, "崩溃后 accounts.json 必须完整可读");
+        assert!(find_account_in(&persisted, "kept").is_some());
+        assert!(find_account_in(&persisted, "added").is_some());
+        assert!(
+            tmp_residue(&dir).len() == 1,
+            "历史 tmp 残留保留，不作损坏信号也不被误删"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 注入写失败（互斥不可用 / rename 被目录占据）：绝不报告成功，主文件完好，
+    /// 无半写 tmp 残留，故障排除后写路径可恢复。
+    #[test]
+    fn injected_write_failure_never_reports_success_and_leaves_main_file_intact() {
+        let dir = account_store_dir("write-failure");
+        let path = store_path(&dir);
+        let original =
+            serde_json::to_string_pretty(&[account("kept", Some("uid-kept"), "保留账号", None)])
+                .unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        std::fs::create_dir(accounts_lock_file(&path)).unwrap();
+        let blocked = with_accounts_write(&path, |accounts| {
+            accounts.push(account("ghost", Some("uid-ghost"), "幽灵", None));
+            Ok(())
+        });
+        assert!(blocked.is_err(), "拿不到互斥时不得报告成功");
+        assert_eq!(read_raw(&path), original, "写失败不得触碰主文件");
+        std::fs::remove_dir(accounts_lock_file(&path)).unwrap();
+
+        let blocked_path = dir.join("blocked/accounts.json");
+        std::fs::create_dir_all(blocked_path.parent().unwrap()).unwrap();
+        std::fs::create_dir(&blocked_path).unwrap();
+        let failed = save_accounts_to_path(&blocked_path, &[account("x", None, "x", None)]);
+        assert!(failed.is_err(), "rename 失败不得报告成功");
+        assert!(
+            tmp_residue(blocked_path.parent().unwrap()).is_empty(),
+            "失败后 tmp 必须清理"
+        );
+        assert!(blocked_path.is_dir(), "目标目录形态未被破坏");
+
+        let recovered = with_accounts_write(&path, |accounts| {
+            accounts.push(account("recovered", Some("uid-recovered"), "恢复", None));
+            Ok(())
+        });
+        assert!(recovered.is_ok(), "故障排除后写路径必须可用");
+        assert_eq!(load_accounts_from_path(&path).len(), 2);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 落盘内容逐条一致、是合法 JSON 数组、成功写入不留 tmp 残留。
+    #[test]
+    fn persisted_store_is_exact_json_with_no_tmp_residue() {
+        let dir = account_store_dir("durable");
+        let path = store_path(&dir);
+        let records = vec![
+            account("a", Some("uid-a"), "甲", None),
+            account("b", Some("uid-b"), "乙", None),
+        ];
+        save_accounts_to_path(&path, &records).expect("durable write should succeed");
+
+        assert_eq!(load_accounts_from_path(&path), records, "落盘内容必须逐条一致");
+        assert!(tmp_residue(&dir).is_empty(), "成功写入不得留下 tmp 残留");
+        assert!(serde_json::from_str::<Value>(&read_raw(&path))
+            .unwrap()
+            .is_array());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 并发 Lost Update：6 个写者在同一把锁下串行提交，一条更新都不能丢。
+    #[test]
+    fn concurrent_writers_do_not_lose_updates() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = account_store_dir("concurrent");
+        let path = store_path(&dir);
+        std::fs::write(&path, "[]").unwrap();
+
+        const WRITERS: usize = 6;
+        let start = Arc::new(Barrier::new(WRITERS + 1));
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|index| {
+                let path = path.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    with_accounts_write(&path, |accounts| {
+                        // 放大 RMW 窗口：无锁实现必然在这里互相覆盖。
+                        std::thread::sleep(Duration::from_millis(2));
+                        let id = format!("writer-{index}");
+                        let uid = format!("uid-{index}");
+                        accounts.push(account(&id, Some(&uid), "并发写", None));
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+        start.wait();
+        for handle in handles {
+            let outcome = handle.join().unwrap();
+            assert!(outcome.is_ok(), "并发写者不得被误拒：{outcome:?}");
+        }
+
+        let persisted = load_accounts_from_path(&path);
+        assert_eq!(persisted.len(), WRITERS, "并发 RMW 不得丢任何一条更新");
+        for index in 0..WRITERS {
+            assert!(
+                find_account_in(&persisted, &format!("writer-{index}")).is_some(),
+                "writer-{index} 的更新丢失"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 外部进程持有 accounts.lock 时：所有写者（含删除）有界失败、不绕过锁，
+    /// 主文件逐字节不动；释放后立即恢复。
+    #[test]
+    fn externally_held_lock_blocks_every_writer_without_bypassing() {
+        let dir = account_store_dir("held-lock");
+        let path = store_path(&dir);
+        let original =
+            serde_json::to_string_pretty(&[account("kept", Some("uid-kept"), "保留账号", None)])
+                .unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        let held = crate::modules::session_link::try_lock_file(&accounts_lock_file(&path))
+            .expect("test should be able to hold the accounts lock");
+        let blocked = with_accounts_write(&path, |accounts| {
+            accounts.push(account("ghost", Some("uid-ghost"), "幽灵", None));
+            Ok(())
+        });
+        assert!(blocked.is_err(), "锁被占用时不得绕过互斥");
+        assert!(
+            delete_account_from_path(&path, "kept").is_err(),
+            "删除同样不得绕过锁"
+        );
+        assert_eq!(read_raw(&path), original, "被阻塞的写不得改动主文件");
+        drop(held);
+
+        let released = with_accounts_write(&path, |accounts| {
+            accounts.push(account("after", Some("uid-after"), "后续", None));
+            Ok(())
+        });
+        assert!(released.is_ok(), "锁释放后必须立即恢复可写");
+        assert_eq!(load_accounts_from_path(&path).len(), 2);
+        delete_account_from_path(&path, "kept").expect("锁释放后删除应成功");
+        assert_eq!(load_accounts_from_path(&path).len(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 

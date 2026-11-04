@@ -160,11 +160,11 @@ pub fn copy_sidecar_dir(
         // 绝大多数会话没有子 agent：没有附属目录是正常情况，不是错误。
         return Ok(outcome);
     }
-    outcome.source_present = true;
     let entries = match std::fs::read_dir(&source_sidecar) {
         Ok(entries) => entries,
         Err(error) => {
             // 根读不了是「读失败」，不能当成「没有附属材料」。
+            outcome.source_present = true;
             outcome.errors.push(format!(
                 "附属目录无法读取（{}）：{error}",
                 display_name(&source_sidecar)
@@ -172,14 +172,82 @@ pub fn copy_sidecar_dir(
             return Ok(outcome);
         }
     };
-    // 稳定顺序：同样的输入产出同样的报告顺序，便于人工核对。
-    let mut names: Vec<OsString> = entries.flatten().map(|entry| entry.file_name()).collect();
-    names.sort();
+    Ok(copy_sidecar_from_entries(
+        &source_sidecar,
+        &target_sidecar,
+        source_cid,
+        target_cid,
+        entries,
+    ))
+}
+
+/// 已确认源目录存在且根 `read_dir` 成功后的整段复制。
+///
+/// 接条目迭代器而非内部直接调 `read_dir`：单测可用真实 [`std::fs::DirEntry`]
+/// 拼出「第 2 项返回 Err」的迭代器，端到端复现迭代期源文件被删的竞态。
+fn copy_sidecar_from_entries(
+    source_sidecar: &Path,
+    target_sidecar: &Path,
+    source_cid: &str,
+    target_cid: &str,
+    entries: impl Iterator<Item = Result<std::fs::DirEntry, std::io::Error>>,
+) -> SidecarOutcome {
+    let mut outcome = SidecarOutcome {
+        source_present: true,
+        ..SidecarOutcome::default()
+    };
     let mut ctx = CopyContext {
         source_cid,
         target_cid,
         outcome: &mut outcome,
     };
+    // 根条目流先归一化成「名字 + 失败原因」，再交给与 read_dir 解耦的复制逻辑。
+    copy_root_entries(
+        source_sidecar,
+        target_sidecar,
+        entries.map(|entry| entry.map(|dir| dir.file_name())),
+        &mut ctx,
+    );
+    outcome
+}
+
+/// 把目录条目流摊平成「成功项 + 失败原因」——单条 `Err` 绝不静默丢弃。
+///
+/// `.flatten()` 会在迭代期把 `Err` 直接吞掉：文件在预枚举后恰被删除/改名时，
+/// 该文件漏复制、`errors` 仍为空、报告全绿，用户只看到子 agent 面板空白。
+/// 这里把每条 `Err` 记进 `errors`（含目录名与 OS 原因，可据以重试），其余项
+/// 照常返回，让复制/同步不因一条失败整体中止（A6 / B7）。
+///
+/// 泛型 `T`/`E` 让这个纯函数成为可测试接缝：单测直接注入含 `Err` 的迭代器，
+/// 不依赖真实文件系统出现竞态。
+fn collect_entries<T, E: std::fmt::Display>(
+    entries: impl Iterator<Item = Result<T, E>>,
+    label: &str,
+    errors: &mut Vec<String>,
+) -> Vec<T> {
+    let mut kept = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(value) => kept.push(value),
+            Err(error) => errors.push(format!("附属目录条目读取失败（{label}）：{error}")),
+        }
+    }
+    kept
+}
+
+/// 根级条目复制：接收已投影的名字流，与 `read_dir` 解耦，便于注入迭代期 `Err`。
+///
+/// 白名单是 [`sidecar_subdir_kind`] 里的表；命中才递归复制，表外条目计数 + 说明。
+fn copy_root_entries(
+    source_sidecar: &Path,
+    target_sidecar: &Path,
+    entries: impl Iterator<Item = Result<OsString, std::io::Error>>,
+    ctx: &mut CopyContext<'_>,
+) {
+    let label = display_name(source_sidecar);
+    // 稳定顺序：同样的输入产出同样的报告顺序，便于人工核对。
+    let mut names = collect_entries(entries, &label, &mut ctx.outcome.errors);
+    names.sort();
     for name in names {
         // 表驱动：命中白名单才处理，表外条目计数 + 说明（绝不静默丢弃）。
         let Some(kind) = sidecar_subdir_kind(&name) else {
@@ -219,9 +287,8 @@ pub fn copy_sidecar_dir(
             ));
             continue;
         }
-        copy_dir(&source_dir, &target_dir, kind, &mut ctx);
+        copy_dir(&source_dir, &target_dir, kind, ctx);
     }
-    Ok(outcome)
 }
 
 /// 表驱动查找：名字命中白名单就返回该子目录的文件类别。
@@ -262,7 +329,25 @@ fn copy_dir(source: &Path, target: &Path, kind: FileKind, ctx: &mut CopyContext)
             return;
         }
     };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    // 路径流同样先归一化；与根目录共用 collect_entries，单条 Err 绝不静默丢弃。
+    copy_dir_entries(
+        target,
+        kind,
+        entries.map(|entry| entry.map(|dir| dir.path())),
+        &display_name(source),
+        ctx,
+    );
+}
+
+/// 目录内条目复制：接收已投影的路径流，与 `read_dir` 解耦，便于注入迭代期 `Err`。
+fn copy_dir_entries(
+    target: &Path,
+    kind: FileKind,
+    entries: impl Iterator<Item = Result<PathBuf, std::io::Error>>,
+    label: &str,
+    ctx: &mut CopyContext<'_>,
+) {
+    let mut paths = collect_entries(entries, label, &mut ctx.outcome.errors);
     // 稳定顺序：同样的输入产出同样的报告顺序，便于人工核对。
     paths.sort();
     for path in paths {
@@ -861,5 +946,232 @@ mod tests {
             String::from_utf8(replaced).unwrap(),
             format!("before {TARGET_CID} after")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 迭代期单条 Err 的护栏：`.flatten()` 会静默丢弃，修复后必须记进 errors。
+    // -----------------------------------------------------------------------
+
+    fn simulated_iteration_error() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "模拟源文件在枚举后被删除",
+        )
+    }
+
+    /// 纯接缝：注入「第 2 项返回 Err」的迭代器，成功项必须全部保留、Err 必须记账。
+    /// 不依赖真实文件系统竞态，可稳定复现 TOCTOU。
+    #[test]
+    fn collect_entries_records_iteration_error_and_keeps_siblings() {
+        let entries = [Ok("a.txt"), Err("读取失败"), Ok("b.txt")];
+        let mut errors = Vec::new();
+        let kept = collect_entries(entries.into_iter(), "tool-results", &mut errors);
+
+        assert_eq!(kept, ["a.txt", "b.txt"], "成功项不得被 Err 牵连丢弃");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("附属目录条目读取失败"), "{errors:?}");
+        assert!(errors[0].contains("tool-results"), "{errors:?}");
+        assert!(errors[0].contains("读取失败"), "OS 原因必须可据以重试: {errors:?}");
+    }
+
+    /// 端到端（真实落盘）：真实 read_dir 出的 DirEntry + 注入一个 Err。
+    /// 断言 errors.len()==1 && has_errors()、其余文件逐字节复制成功、源侧不动。
+    #[test]
+    fn copy_sidecar_iteration_error_is_recorded_and_others_still_copied() {
+        let env = Env::new("iteration-err");
+        env.write_source("subagents/agent-abc.jsonl", "content-a");
+        env.write_source("tool-results/call.txt", "content-b");
+
+        let mut entries: Vec<Result<std::fs::DirEntry, std::io::Error>> =
+            std::fs::read_dir(env.source_sidecar()).unwrap().collect();
+        assert!(entries.len() >= 2, "根下应有 subagents / tool-results");
+        entries.insert(1, Err(simulated_iteration_error()));
+
+        let outcome = copy_sidecar_from_entries(
+            &env.source_sidecar(),
+            &env.target_sidecar(),
+            SOURCE_CID,
+            TARGET_CID,
+            entries.into_iter(),
+        );
+
+        assert!(outcome.source_present);
+        assert_eq!(outcome.errors.len(), 1, "{outcome:?}");
+        assert!(outcome.has_errors(), "报告不得全绿: {outcome:?}");
+        assert!(outcome.errors[0].contains("附属目录条目读取失败"), "{outcome:?}");
+        assert!(outcome.errors[0].contains("模拟源文件在枚举后被删除"), "{outcome:?}");
+        assert_eq!(outcome.ignored_entries, 0, "Err 是失败不是忽略: {outcome:?}");
+        // 其余文件照常复制：真实读回落盘内容。
+        assert_eq!(outcome.agents_copied, 1, "{outcome:?}");
+        assert_eq!(outcome.tool_results_copied, 1, "{outcome:?}");
+        assert_eq!(env.read_target("subagents/agent-abc.jsonl"), "content-a");
+        assert_eq!(env.read_target("tool-results/call.txt"), "content-b");
+        // 加法语义：源侧一个字节都不动。
+        assert_eq!(
+            std::fs::read_to_string(env.source_sidecar().join("subagents/agent-abc.jsonl"))
+                .unwrap(),
+            "content-a"
+        );
+    }
+
+    /// 末尾文件被清理：Err 出现在迭代器最后一项时同样不能静默丢。
+    #[test]
+    fn copy_sidecar_trailing_iteration_error_is_recorded() {
+        let env = Env::new("iteration-err-tail");
+        env.write_source("subagents/agent-abc.jsonl", "content-a");
+
+        let mut entries: Vec<Result<std::fs::DirEntry, std::io::Error>> =
+            std::fs::read_dir(env.source_sidecar()).unwrap().collect();
+        entries.push(Err(simulated_iteration_error()));
+
+        let outcome = copy_sidecar_from_entries(
+            &env.source_sidecar(),
+            &env.target_sidecar(),
+            SOURCE_CID,
+            TARGET_CID,
+            entries.into_iter(),
+        );
+        assert_eq!(outcome.errors.len(), 1, "末尾 Err 不得被吞: {outcome:?}");
+        assert!(outcome.has_errors(), "{outcome:?}");
+        assert_eq!(env.read_target("subagents/agent-abc.jsonl"), "content-a");
+    }
+
+    /// B6：迭代期出错时，目标已有同名文件仍逐字节不变（绝不覆盖）。
+    #[test]
+    fn copy_sidecar_iteration_error_preserves_existing_target_bytes() {
+        let env = Env::new("iteration-err-existing");
+        env.write_source("subagents/agent-abc.jsonl", "content-a");
+        let target_file = env.target_sidecar().join("subagents/agent-abc.jsonl");
+        std::fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+        std::fs::write(&target_file, b"target-owned-bytes").unwrap();
+
+        let mut entries: Vec<Result<std::fs::DirEntry, std::io::Error>> =
+            std::fs::read_dir(env.source_sidecar()).unwrap().collect();
+        entries.insert(0, Err(simulated_iteration_error()));
+
+        let outcome = copy_sidecar_from_entries(
+            &env.source_sidecar(),
+            &env.target_sidecar(),
+            SOURCE_CID,
+            TARGET_CID,
+            entries.into_iter(),
+        );
+        assert_eq!(outcome.errors.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.agents_copied, 0, "{outcome:?}");
+        assert_eq!(outcome.skipped, 1, "{outcome:?}");
+        assert_eq!(
+            std::fs::read(&target_file).unwrap(),
+            b"target-owned-bytes",
+            "目标已有文件必须逐字节保持原样"
+        );
+    }
+
+    /// 递归层（原 :265 的 flatten）同样要记账：注入 Err 的路径流。
+    #[test]
+    fn copy_dir_entries_iteration_error_is_recorded_and_others_still_copied() {
+        let env = Env::new("nested-iteration-err");
+        let source_dir = env.source_sidecar().join("tool-results");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("a.txt"), "A").unwrap();
+        std::fs::write(source_dir.join("b.txt"), "B").unwrap();
+
+        let entries: Vec<Result<PathBuf, std::io::Error>> = vec![
+            Ok(source_dir.join("a.txt")),
+            Err(simulated_iteration_error()),
+            Ok(source_dir.join("b.txt")),
+        ];
+        let mut outcome = SidecarOutcome::default();
+        {
+            let mut ctx = CopyContext {
+                source_cid: SOURCE_CID,
+                target_cid: TARGET_CID,
+                outcome: &mut outcome,
+            };
+            copy_dir_entries(
+                &env.target_sidecar().join("tool-results"),
+                FileKind::ToolResult,
+                entries.into_iter(),
+                "tool-results",
+                &mut ctx,
+            );
+        }
+
+        assert_eq!(outcome.errors.len(), 1, "{outcome:?}");
+        assert!(outcome.has_errors(), "{outcome:?}");
+        assert_eq!(outcome.tool_results_copied, 2, "{outcome:?}");
+        assert_eq!(env.read_target("tool-results/a.txt"), "A");
+        assert_eq!(env.read_target("tool-results/b.txt"), "B");
+    }
+
+    /// 路径逃逸护栏不因接缝重构失效：注入以 `..` 结尾的父目录项时零写入、不越界。
+    #[test]
+    fn copy_dir_entries_does_not_escape_on_parent_dir_component() {
+        let env = Env::new("iteration-err-escape");
+        let source_dir = env.source_sidecar().join("tool-results");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("ok.txt"), "OK").unwrap();
+
+        let entries: Vec<Result<PathBuf, std::io::Error>> = vec![
+            // `file_name()` 为 None（尾部 ..），必须被 `let Some(name)` 卫语句跳过。
+            Ok(PathBuf::from("tool-results").join("..")),
+            Ok(source_dir.join("ok.txt")),
+        ];
+        let mut outcome = SidecarOutcome::default();
+        {
+            let mut ctx = CopyContext {
+                source_cid: SOURCE_CID,
+                target_cid: TARGET_CID,
+                outcome: &mut outcome,
+            };
+            copy_dir_entries(
+                &env.target_sidecar().join("tool-results"),
+                FileKind::ToolResult,
+                entries.into_iter(),
+                "tool-results",
+                &mut ctx,
+            );
+        }
+        assert_eq!(outcome.tool_results_copied, 1, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "父目录项应被卫语句跳过而非报错: {outcome:?}");
+        assert_eq!(env.read_target("tool-results/ok.txt"), "OK");
+        // 目标目录里只应有 ok.txt 一个文件：父目录项没写成任何东西。
+        let written: Vec<_> = std::fs::read_dir(env.target_sidecar().join("tool-results"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(written, vec![OsString::from("ok.txt")], "{written:?}");
+        assert!(!is_safe_component(OsStr::new("../evil")));
+        assert!(!is_safe_component(OsStr::new("..\\evil")));
+    }
+
+    /// 幂等：先成功复制一次，再带着迭代错误重跑，第二次零写入且目标内容不变。
+    #[test]
+    fn copy_sidecar_is_idempotent_after_iteration_error() {
+        let env = Env::new("iteration-err-idempotent");
+        env.write_source("subagents/agent-abc.jsonl", "content-a");
+
+        let first = copy_sidecar_dir(
+            &env.source_body(),
+            &env.target_body(),
+            SOURCE_CID,
+            TARGET_CID,
+        )
+        .unwrap();
+        assert_eq!(first.agents_copied, 1);
+
+        let mut entries: Vec<Result<std::fs::DirEntry, std::io::Error>> =
+            std::fs::read_dir(env.source_sidecar()).unwrap().collect();
+        entries.insert(0, Err(simulated_iteration_error()));
+        let second = copy_sidecar_from_entries(
+            &env.source_sidecar(),
+            &env.target_sidecar(),
+            SOURCE_CID,
+            TARGET_CID,
+            entries.into_iter(),
+        );
+        assert_eq!(second.errors.len(), 1, "每次迭代错误都要如实记录: {second:?}");
+        assert_eq!(second.agents_copied, 0, "第二次零写入: {second:?}");
+        assert_eq!(second.skipped, 1, "{second:?}");
+        assert_eq!(env.read_target("subagents/agent-abc.jsonl"), "content-a");
     }
 }

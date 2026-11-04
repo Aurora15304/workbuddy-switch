@@ -174,7 +174,8 @@ pub fn switch_account(
     share_sessions: bool,
     copy_session_ids: &[String],
     sync_selections: &[SyncSelection],
-    merge_memory: bool,
+    memory_sync: Option<memory::MemorySyncMode>,
+    memory_source_uid: Option<&str>,
     merge_experts: bool,
     sync_persona: bool,
     persona_mode: memory::PersonaMode,
@@ -194,7 +195,13 @@ pub fn switch_account(
         account::find_account(account_id).ok_or_else(|| format!("账号不存在: {account_id}"))?;
     // 档位以账号自身为准：签名里的参数无法表达「用 A 档位操作 B 档位账号」。
     let variant = account::variant_of(&acc);
-    let backup = auth_file::backup_auth_file(variant);
+    // 备份失败必须在这里中止：`?` 之后才允许任何会话/记忆写入与认证覆盖，
+    // 保证「写认证前一定有可回滚的磁盘副本」。Ok(None) 表示原文件本就不存在，
+    // 允许继续，但如实记录：此时无磁盘备份，写后失败靠写前快照自动回滚。
+    let backup = auth_file::backup_auth_file(variant)?;
+    if backup.is_none() {
+        eprintln!("[switch] 切换前认证文件不存在，本次不生成备份；写认证失败时按写前快照自动回滚");
+    }
 
     let mut copy_report: Option<Value> = None;
     let mut session_report: Option<Value> = None;
@@ -309,12 +316,20 @@ pub fn switch_account(
         copy_report = copy;
         sync_report = sync;
     }
-    if merge_memory {
+    if let Some(mode) = memory_sync {
         // 记忆是纯本地 Markdown 文件，与会话写入无关：不受 restart=false 限制，也不参与
         // 「未完成会话写入」的暂停判定。必须在写认证之前执行——那时账号库与各账号的
-        // 人格目录都还是切换前的状态。
-        progress("正在合并并分发工作记忆…");
-        memory_report = Some(memory::merge_and_distribute(&account_pairs()));
+        // 人格目录都还是切换前的状态。两种模式互斥，分派表保持单一出口。
+        memory_report = Some(match mode {
+            memory::MemorySyncMode::Merge => {
+                progress("正在合并并分发工作记忆…");
+                memory::merge_and_distribute(&account_pairs())
+            }
+            memory::MemorySyncMode::Overwrite => {
+                progress("正在复制并覆盖工作记忆…");
+                memory::copy_and_overwrite(memory_source_uid, &account_pairs())
+            }
+        });
     }
     if sync_persona {
         // 人设与记忆解耦：没勾「合并记忆」也能单独同步人设。

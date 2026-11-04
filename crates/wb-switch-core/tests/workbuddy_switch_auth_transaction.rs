@@ -79,7 +79,8 @@ fn worker() {
                 false,
                 &[],
                 &[],
-                false,
+                None,
+                None,
                 false,
                 false,
                 memory::PersonaMode::Safe,
@@ -124,7 +125,8 @@ fn worker() {
                 false,
                 &[],
                 &[],
-                false,
+                None,
+                None,
                 false,
                 false,
                 memory::PersonaMode::Safe,
@@ -152,7 +154,8 @@ fn worker() {
                 false,
                 &[],
                 &[],
-                false,
+                None,
+                None,
                 false,
                 false,
                 memory::PersonaMode::Safe,
@@ -178,7 +181,8 @@ fn worker() {
                 false,
                 &[],
                 &[],
-                false,
+                None,
+                None,
                 false,
                 false,
                 memory::PersonaMode::Safe,
@@ -219,6 +223,47 @@ fn worker() {
                     "Early return leaked the lock"
                 );
             });
+        }
+        "overwrite-busy" => {
+            // 并发切号：auth 事务锁被占用时，覆盖模式也必须在任何记忆写入之前被拒。
+            // 钉死新参数链没有绕过 T2 事务、没有开辟记忆写入的旁路。
+            let mut other = fixture("other");
+            other["id"] = json!("other");
+            other["uid"] = json!("other-user");
+            account::save_accounts(&[fixture("old"), other]).unwrap();
+            let wb = config::wb_data_root();
+            let mother_dir = memory::personal_dir_at(&wb, "fixture-user");
+            let target_dir = memory::personal_dir_at(&wb, "other-user");
+            std::fs::create_dir_all(&mother_dir).unwrap();
+            std::fs::create_dir_all(&target_dir).unwrap();
+            std::fs::write(mother_dir.join("MEMORY.md"), "## 母本\n\n- 权威内容\n").unwrap();
+            std::fs::write(target_dir.join("MEMORY.md"), "## 旧内容\n").unwrap();
+            let before = std::fs::read(target_dir.join("MEMORY.md")).unwrap();
+
+            let guard = state_lock::try_auth().unwrap();
+            let result = switch::switch_account(
+                None,
+                "fixture",
+                false,
+                false,
+                &[],
+                &[],
+                Some(memory::MemorySyncMode::Overwrite),
+                Some("fixture-user"),
+                false,
+                false,
+                memory::PersonaMode::Safe,
+            );
+            assert!(
+                matches!(result, Err(ref e) if e.starts_with(state_lock::BUSY_PREFIX)),
+                "并发切号必须被 auth 事务锁挡下：{result:?}"
+            );
+            assert_eq!(
+                std::fs::read(target_dir.join("MEMORY.md")).unwrap(),
+                before,
+                "切号被拒时不得写任何记忆，也不得留下备份"
+            );
+            drop(guard);
         }
         "lock-unavailable" => {
             let before = account::load_accounts();
@@ -265,6 +310,11 @@ fn export_failure_releases_auth_transaction() {
 #[test]
 fn refresh_waits_and_reloads_credentials_after_export() {
     run("refresh-waits");
+}
+
+#[test]
+fn concurrent_overwrite_switch_is_blocked_before_any_memory_write() {
+    run("overwrite-busy");
 }
 
 #[test]

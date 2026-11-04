@@ -150,12 +150,12 @@ pub fn merge_import_records(
     Ok(result)
 }
 
-/// 导入：读账号库 → 合并 → 写回，返回计数。
+/// 导入：整段读改写必须在 `accounts.lock` 内完成，否则导入的旧快照会覆盖并发刷新。
 pub fn import_accounts(text: &str, indexes: &[usize]) -> Result<ImportResult, String> {
-    let mut accounts = account::load_accounts();
-    let result = merge_import_records(&mut accounts, text, indexes)?;
-    account::save_accounts(&accounts).map_err(|e| format!("保存账号库失败：{e}"))?;
-    Ok(result)
+    account::with_accounts_write(
+        &crate::modules::config::accounts_file(),
+        |accounts| merge_import_records(accounts, text, indexes),
+    )
 }
 
 /// 纯函数：从账号列表中挑出 id 命中的完整记录（含 token）。
