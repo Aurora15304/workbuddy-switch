@@ -20,7 +20,7 @@ webui 界面与桌面 App 一致，功能覆盖下方全部模块。
 
 ### 桌面 App
 
-从 [GitHub Releases](https://github.com/changexbc/workbuddy-switch/releases/latest) 下载 macOS / Windows / Linux 安装包（Tauri，推荐日常使用）。
+从 [GitHub Releases](https://github.com/Binbin-miao/workbuddy-switch-binbinbin/releases/latest) 下载 macOS / Windows / Linux 安装包（Tauri，推荐日常使用）。
 
 > **macOS 提示「已损坏，无法打开」？** 未签名应用会触发隔离机制，在终端执行一次即可：
 >
