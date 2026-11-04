@@ -18,7 +18,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
-import type { AccountMeta, Session, SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupMemberDetail, SessionGroupSummary, SessionGroupUnifyPlan, SessionSyncMode, WbVariant } from "@/lib/types";
+import type { AccountMeta, Session, SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupMemberDetail, SessionGroupSummary, SessionGroupUnifyPlan, SessionSyncMode, SidecarOutcome, WbVariant } from "@/lib/types";
 import { accountVariant, variantLabel } from "@/lib/variant";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -293,7 +293,7 @@ export default function SessionsPage() {
         });
         notifyResult(report);
       } else {
-        const combined: { synced: unknown[]; skipped: unknown[]; errors: { error: string }[]; needsRecovery: boolean } = { synced: [], skipped: [], errors: [], needsRecovery: false };
+        const combined: { synced: SyncItemSidecar[]; skipped: unknown[]; errors: { error: string }[]; needsRecovery: boolean } = { synced: [], skipped: [], errors: [], needsRecovery: false };
         for (const { target, preview, mode } of actions) {
           try {
             const report = await api.syncSessionGroupPair({
@@ -944,7 +944,19 @@ function formatDate(timestamp: number): string {
   return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(timestamp);
 }
 
-function notifyResult(report: { synced?: unknown[]; skipped?: unknown[]; errors?: { error: string }[]; needsRecovery?: boolean; temporaryFiles?: { reason: string }[]; restartedVariants?: WbVariant[]; restartedEditor?: boolean; editorError?: string }, targetName?: string) {
+/**
+ * 同步项里与附属目录（子 agent transcript / 工具结果）相关的最小契约。
+ *
+ * 只取这两个字段而不是整条结果：`notifyResult` 还会承接插件侧的报告，它们的
+ * 附属目录语义各不相同，这里只关心「有没有失败要说」。
+ */
+interface SyncItemSidecar {
+  targetSessionId?: string;
+  sidecar?: SidecarOutcome;
+  sidecarError?: string;
+}
+
+function notifyResult(report: { synced?: SyncItemSidecar[]; skipped?: unknown[]; errors?: { error: string }[]; needsRecovery?: boolean; temporaryFiles?: { reason: string }[]; restartedVariants?: WbVariant[]; restartedEditor?: boolean; editorError?: string }, targetName?: string) {
   const synced = report.synced?.length ?? 0;
   const skipped = report.skipped?.length ?? 0;
   const errors = report.errors ?? [];
@@ -954,7 +966,19 @@ function notifyResult(report: { synced?: unknown[]; skipped?: unknown[]; errors?
   if (synced > 0) toast.success(targetName ? `已同步到「${targetName}」` : `已同步 ${synced} 个会话`, { description: `完成 ${synced} 项${restartHint}` });
   if (skipped > 0) toast.warning(`有 ${skipped} 项跳过`, { description: "预览过期或复核后不再符合安全条件的项不会计为成功。" });
   if (errors.length > 0) toast.error("部分会话同步失败", { description: errors.map((item) => item.error).join("；") });
+  // 附属目录失败：客户端把缺失的子 agent 面板渲染成空白而不报错，所以必须单独提示。
+  // 这些项仍然算「已同步」（正文才是判定依据），因此走 warning 而不是 error。
+  const sidecarIssues: string[] = [];
+  for (const item of report.synced ?? []) {
+    const label = item.targetSessionId ?? "会话";
+    const failed = item.sidecar?.errors?.length ?? 0;
+    if (failed > 0) sidecarIssues.push(`${label}：${failed} 个附属文件未写入`);
+    if (item.sidecarError) sidecarIssues.push(`${label}：${item.sidecarError}`);
+  }
+  if (sidecarIssues.length > 0) {
+    toast.warning("子 agent 内容可能显示不全", { description: `${sidecarIssues.join("；")}。主会话不受影响，缺失的只是子 agent 面板内容。` });
+  }
   if (report.needsRecovery) toast.error("会话操作待恢复", { description: report.temporaryFiles?.map((item) => item.reason).join("；") || "已保留恢复所需材料。" });
   if (report.editorError) toast.warning("VS Code 未能自动重新打开", { description: report.editorError });
-  if (synced === 0 && skipped === 0 && errors.length === 0 && !report.needsRecovery) toast.info("当前没有需要同步的副本");
+  if (synced === 0 && skipped === 0 && errors.length === 0 && sidecarIssues.length === 0 && !report.needsRecovery) toast.info("当前没有需要同步的副本");
 }

@@ -27,6 +27,7 @@ import type {
   Session,
   SessionLinkPreviewGroup,
   SessionSyncSelection,
+  SidecarOutcome,
   TemporaryFileInfo,
 } from "@/lib/types";
 
@@ -283,6 +284,32 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       if (recoveryIssues.length > 0) {
         toast.error("有会话操作没有完成", {
           description: recoveryIssues.map((issue) => issue.reason).join("；"),
+        });
+      }
+      // 附属目录（子 agent transcript / 工具结果）缺失时，客户端把面板渲染成空白而不报错。
+      // 结果挂在单个会话项上（复制 / 同步），恢复的走 sidecarWarnings 列表；三处合并成一条提示。
+      const sidecarLabel = (id: string) => sessions.find((item) => item.id === id)?.title || id;
+      const sidecarIssues: string[] = [];
+      const collectSidecar = (id: string, outcome?: SidecarOutcome) => {
+        if (!outcome) return;
+        const failed = outcome.errors?.length ?? 0;
+        if (failed > 0) sidecarIssues.push(`${sidecarLabel(id)}：${failed} 个附属文件未写入`);
+        const ignored = outcome.ignoredEntries ?? 0;
+        if (ignored > 0) sidecarIssues.push(`${sidecarLabel(id)}：${ignored} 个条目不在同步范围`);
+      };
+      for (const item of copyReport?.copied ?? []) collectSidecar(item.id, item.sidecar);
+      for (const item of syncReport?.synced ?? []) {
+        collectSidecar(item.targetSessionId, item.sidecar);
+        if (item.sidecarError) {
+          sidecarIssues.push(`${sidecarLabel(item.targetSessionId)}：${item.sidecarError}`);
+        }
+      }
+      for (const warning of res.sessionRecovery?.sidecarWarnings ?? []) {
+        sidecarIssues.push(`${sidecarLabel(warning.sessionId)}：${warning.reason}`);
+      }
+      if (sidecarIssues.length > 0) {
+        toast.warning("子 agent 内容可能显示不全", {
+          description: `${sidecarIssues.join("；")}。主会话不受影响，缺失的只是子 agent 面板内容。`,
         });
       }
       // 记忆合并：写入了哪些账号、备份在哪、哪些失败，必须逐项可见。

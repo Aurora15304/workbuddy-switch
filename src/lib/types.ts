@@ -128,6 +128,31 @@ export interface TemporaryFileInfo {
   reason: string;
 }
 
+/**
+ * 会话附属目录（`{cid}/subagents`、`{cid}/tool-results`）的结果摘要。
+ *
+ * 客户端渲染子 agent 面板依赖这些文件；缺失时面板是**静默空白**而不是报错，
+ * 所以复制 / 同步 / 恢复三条路径的结果都必须能带到用户眼前。
+ * 字段对应 core 侧 `SidecarOutcome`（`serde(rename_all = "camelCase")`），
+ * 全部可选：旧后端不返回该字段。`Optional`：`SidecarOutcome` 自身字段非可选。
+ */
+export interface SidecarOutcome {
+  /** 源侧存在附属目录；绝大多数会话没有子 agent。 */
+  sourcePresent?: boolean;
+  agentsCopied?: number;
+  toolResultsCopied?: number;
+  otherCopied?: number;
+  /** 目标已存在而跳过（绝不覆盖）的文件数。 */
+  skipped?: number;
+  /** 其中目标已存在但内容与源不一致的个数——没有被覆盖，副本内容并不完整。 */
+  mismatched?: number;
+  /** 附属目录根下存在但没有复制的条目数（白名单外目录、散落文件、符号链接）。 */
+  ignoredEntries?: number;
+  notes?: string[];
+  /** 单个文件失败的原因；非空即必须让用户看见。 */
+  errors?: string[];
+}
+
 /** 本次新建的副本（目标 UUID 由后端预分配）。 */
 export interface CopyResult {
   id: string;
@@ -139,6 +164,8 @@ export interface CopyResult {
   cleanupState?: SessionBackupCleanupState;
   /** 清理失败原因（`cleanupState` 为 pending 时有值）。 */
   cleanupError?: string;
+  /** 附属目录结果（有内容或失败时才出现）；旧后端缺该字段。 */
+  sidecar?: SidecarOutcome;
 }
 
 /** 目标账号上已有真实有效的副本：复用而不是重复复制。 */
@@ -189,6 +216,16 @@ export interface SessionRecoveryReport {
   needsRecovery: { operationId: string; reason: string; retryable: boolean }[];
   /** 临时备份残留（待清理/待恢复）；无异常时为空数组。 */
   temporaryFiles?: TemporaryFileInfo[];
+  /** 恢复时附属目录补写的失败项；不阻断恢复，但要能看见。 */
+  sidecarWarnings?: SidecarWarning[];
+}
+
+/** 恢复过程中附属目录补写失败的一条记录（后端 `SidecarWarning`）。 */
+export interface SidecarWarning {
+  operationId: string;
+  /** 目标会话 id，供前端定位到具体会话。 */
+  sessionId: string;
+  reason: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +318,10 @@ export interface SessionSyncResultItem {
   /** 成功后立即清理：cleaned 表示临时备份已回收；pending 表示待下次维护重试。 */
   cleanupState?: SessionBackupCleanupState;
   cleanupError?: string;
+  /** 附属目录同步结果（只补目标缺失的，绝不覆盖）；旧后端缺该字段。 */
+  sidecar?: SidecarOutcome;
+  /** 附属目录整体失败的原因（连目录都没读到时）；与逐文件 `errors` 不重叠。 */
+  sidecarError?: string;
   message: string;
 }
 
@@ -304,6 +345,8 @@ export interface SessionSyncReport {
   pinned?: SessionPinnedSyncInfo;
   /** 临时备份残留（待清理/待恢复）；无异常时为空数组。 */
   temporaryFiles?: TemporaryFileInfo[];
+  /** 附属目录同步结果（只补目标缺失的）；失败不阻断正文，但要能看见。 */
+  sidecar?: SidecarOutcome;
 }
 
 // ---------------------------------------------------------------------------

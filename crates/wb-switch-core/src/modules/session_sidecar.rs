@@ -42,23 +42,28 @@
 //! 增强材料。因此单个文件失败只记录进 [`SidecarOutcome::errors`]、不中断整体，
 //! 也不让复制/同步被判死——缺失的只是子 agent 面板内容，主会话照常可用。
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::modules::session_backup;
 
-/// 附属目录里允许复制的子目录名（白名单）：其余一律忽略。
-///
-/// 客户端只读这两个目录；白名单之外的内容既不属于会话附属材料，也会给
-/// 路径逃逸（`..` 之类）留下可乘之机。
-pub const SIDECAR_SUBDIRS: [&str; 2] = ["subagents", "tool-results"];
-
 /// 子 agent transcript 所在子目录名。
-pub const SUBDIR_SUBAGENTS: &str = "subagents";
+const SUBDIR_SUBAGENTS: &str = "subagents";
 /// 工具结果渲染文件所在子目录名。
-pub const SUBDIR_TOOL_RESULTS: &str = "tool-results";
+const SUBDIR_TOOL_RESULTS: &str = "tool-results";
+
+/// 属于会话材料的子目录白名单（唯一真相源，表驱动）。
+///
+/// 客户端只读这两个目录；表外内容既不属于会话附属材料，也是路径逃逸
+/// （`..` 之类）的入口。客户端将来新增目录（例如 `plans/`）时**必须在这里补
+/// 一行**——漏补不会静默消失：它会被计入 [`SidecarOutcome::ignored_entries`]
+/// 并在报告的 `notes` 里留名。
+const SIDECAR_SUBDIRS: &[(&str, FileKind)] = &[
+    (SUBDIR_SUBAGENTS, FileKind::Agent),
+    (SUBDIR_TOOL_RESULTS, FileKind::ToolResult),
+];
 
 /// 一次附属目录复制的结果摘要（供报告与一次性补齐工具使用）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -76,6 +81,12 @@ pub struct SidecarOutcome {
     pub skipped: usize,
     /// 其中「目标已存在但内容与源（替换后）不一致」的个数。
     pub mismatched: usize,
+    /// 附属目录根下存在、但没有复制的条目数（白名单之外的目录、根下的散落
+    /// 文件、符号链接）。
+    ///
+    /// 存在的意义是「不静默」：客户端新增一种子目录时，这里会跳起来，而不是让
+    /// 复制长期漏掉一半材料却永远绿灯。
+    pub ignored_entries: usize,
     /// 跳过/忽略的说明。
     pub notes: Vec<String>,
     /// 单个文件失败的原因（不中断整体）。
@@ -143,37 +154,98 @@ pub fn copy_sidecar_dir(
 ) -> Result<SidecarOutcome, String> {
     let source_sidecar = sidecar_dir_of(source_body_path, source_cid)?;
     let target_sidecar = sidecar_dir_of(target_body_path, target_cid)?;
+    debug_assert_sidecar_named_after(&target_sidecar, target_cid);
     let mut outcome = SidecarOutcome::default();
     if !source_sidecar.is_dir() {
         // 绝大多数会话没有子 agent：没有附属目录是正常情况，不是错误。
         return Ok(outcome);
     }
     outcome.source_present = true;
+    let entries = match std::fs::read_dir(&source_sidecar) {
+        Ok(entries) => entries,
+        Err(error) => {
+            // 根读不了是「读失败」，不能当成「没有附属材料」。
+            outcome.errors.push(format!(
+                "附属目录无法读取（{}）：{error}",
+                display_name(&source_sidecar)
+            ));
+            return Ok(outcome);
+        }
+    };
+    // 稳定顺序：同样的输入产出同样的报告顺序，便于人工核对。
+    let mut names: Vec<OsString> = entries.flatten().map(|entry| entry.file_name()).collect();
+    names.sort();
     let mut ctx = CopyContext {
         source_cid,
         target_cid,
         outcome: &mut outcome,
     };
-    for name in SIDECAR_SUBDIRS {
-        let source_dir = source_sidecar.join(name);
-        if !source_dir.is_dir() {
+    for name in names {
+        // 表驱动：命中白名单才处理，表外条目计数 + 说明（绝不静默丢弃）。
+        let Some(kind) = sidecar_subdir_kind(&name) else {
+            ctx.outcome.ignored_entries += 1;
+            ctx.outcome.notes.push(format!(
+                "忽略白名单之外的附属条目：{}",
+                name.to_string_lossy()
+            ));
             continue;
-        }
-        let target_dir = target_sidecar.join(name);
-        if let Err(error) = std::fs::create_dir_all(&target_dir) {
-            ctx.outcome.errors.push(format!(
-                "附属目录创建失败（{name}）：{error}"
+        };
+        let source_dir = source_sidecar.join(&name);
+        let metadata = match std::fs::symlink_metadata(&source_dir) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                ctx.outcome.errors.push(format!(
+                    "附属条目无法读取（{}）：{error}",
+                    name.to_string_lossy()
+                ));
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            // 白名单名字但形态不对（根下的散落文件、指向别处的符号链接）：
+            // 不跟随、不复制，如实计入忽略。
+            ctx.outcome.ignored_entries += 1;
+            ctx.outcome.notes.push(format!(
+                "忽略非目录或符号链接条目：{}",
+                name.to_string_lossy()
             ));
             continue;
         }
-        let kind = if name == SUBDIR_SUBAGENTS {
-            FileKind::Agent
-        } else {
-            FileKind::ToolResult
-        };
+        let target_dir = target_sidecar.join(&name);
+        if let Err(error) = std::fs::create_dir_all(&target_dir) {
+            ctx.outcome.errors.push(format!(
+                "附属目录创建失败（{}）：{error}",
+                name.to_string_lossy()
+            ));
+            continue;
+        }
         copy_dir(&source_dir, &target_dir, kind, &mut ctx);
     }
     Ok(outcome)
+}
+
+/// 表驱动查找：名字命中白名单就返回该子目录的文件类别。
+fn sidecar_subdir_kind(name: &OsStr) -> Option<FileKind> {
+    SIDECAR_SUBDIRS
+        .iter()
+        .find(|entry| OsStr::new(entry.0) == name)
+        .map(|entry| entry.1)
+}
+
+/// 目标附属目录必须以目标会话 id 为前缀（模块文档硬约束 1）。
+///
+/// 为什么用 `debug_assert` 而不是测试断言：这条不变量由**每一个**调用方
+/// （复制 / 同步 / 补齐三条路径）共享，debug 下当场炸掉能立刻定位到调用点；
+/// 测试只能复验 [`sidecar_dir_of`] 自己的拼接，抓不到「有人给目标目录加了后缀」
+/// 这类改动。release 下 `cfg!(debug_assertions)` 为 false，零运行时成本。
+fn debug_assert_sidecar_named_after(dir: &Path, cid: &str) {
+    debug_assert!(
+        dir.file_name()
+            .and_then(OsStr::to_str)
+            .map_or(false, |name| name.starts_with(cid)),
+        "附属目录必须以目标会话 id 为前缀：{}",
+        dir.display()
+    );
 }
 
 /// 复制一个目录的内容（递归）。
@@ -351,51 +423,6 @@ fn display_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string())
-}
-
-/// 列出附属目录里属于白名单子目录的全部文件（相对附属目录根）。
-///
-/// 与 [`copy_sidecar_dir`] 共用同一套白名单与路径逃逸防护：目录之外的任何内容
-/// 都不算数。相对路径从白名单子目录名开始（如 `subagents/agent-x.jsonl`）。
-pub fn list_sidecar_files(sidecar_dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for name in SIDECAR_SUBDIRS {
-        let dir = sidecar_dir.join(name);
-        if !dir.is_dir() {
-            continue;
-        }
-        collect_files(&dir, Path::new(name), &mut files);
-    }
-    files.sort();
-    files
-}
-
-/// 递归收集目录下的普通文件（相对路径写进 `out`）。
-fn collect_files(dir: &Path, relative: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().map(OsStr::to_os_string) else {
-            continue;
-        };
-        if !is_safe_component(&name) {
-            continue;
-        }
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if metadata.file_type().is_symlink() {
-            continue;
-        }
-        let child = relative.join(&name);
-        if metadata.is_dir() {
-            collect_files(&path, &child, out);
-        } else {
-            out.push(child);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -669,6 +696,51 @@ mod tests {
         assert!(!env.target_exists("evil.txt"));
         assert!(!env.target_exists("other-dir/inside.txt"));
         assert!(!env.target_exists("..evil/inside.txt"));
+        // 三个表外条目（散落文件 + 两个目录）都要被计数，不能静默消失。
+        assert_eq!(outcome.ignored_entries, 3, "{outcome:?}");
+    }
+
+    /// 白名单之外的**目录**（客户端将来新增的 `plans/`）必须可见：
+    /// 不复制进目标，但要计入 `ignored_entries` 并在 notes 里留名。
+    #[test]
+    fn copy_sidecar_counts_unknown_subdir_as_ignored() {
+        let env = Env::new("ignored_subdir");
+        env.write_source("subagents/agent-abc.jsonl", "content-a");
+        env.write_source("plans/plan-1.md", "not session material");
+
+        let outcome =
+            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
+                .unwrap();
+        // 已知目录照常复制。
+        assert_eq!(outcome.agents_copied, 1, "{outcome:?}");
+        // 未知目录不复制……
+        assert!(!env.target_exists("plans/plan-1.md"));
+        // ……但要被如实计数并留说明：新目录不会静默吞掉。
+        assert_eq!(outcome.ignored_entries, 1, "{outcome:?}");
+        assert!(
+            outcome.notes.iter().any(|note| note.contains("plans")),
+            "{outcome:?}"
+        );
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+    }
+
+    /// 白名单**名字**但形态不对（符号链接）不计入复制：绝不跟随到目录之外。
+    #[cfg(unix)]
+    #[test]
+    fn copy_sidecar_does_not_follow_symlinked_subdir() {
+        let env = Env::new("symlink_subdir");
+        let outside = env.root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::fs::create_dir_all(env.source_sidecar()).unwrap();
+        std::os::unix::fs::symlink(&outside, env.source_sidecar().join("subagents")).unwrap();
+
+        let outcome =
+            copy_sidecar_dir(&env.source_body(), &env.target_body(), SOURCE_CID, TARGET_CID)
+                .unwrap();
+        assert_eq!(outcome.agents_copied, 0, "{outcome:?}");
+        assert_eq!(outcome.ignored_entries, 1, "{outcome:?}");
+        assert!(!env.target_exists("subagents/secret.txt"));
     }
 
     #[test]

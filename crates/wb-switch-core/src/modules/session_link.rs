@@ -749,6 +749,20 @@ pub struct RecoveryIssue {
     pub retryable: bool,
 }
 
+/// 附属目录（子 agent transcript / 工具结果）未能完整补齐的上报项。
+///
+/// 刻意与 [`RecoveryIssue`] 分开：附属目录缺失只让子 agent 面板空白，主会话正文
+/// 已经可用，因此它**不**参与 [`RecoveryReport::is_clean`] 与启动阻断判定，
+/// 只作为非阻断提示呈现（宿主忽略它的旧版本也不会误判为「需要人工处理」）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarWarning {
+    pub operation_id: String,
+    /// 目标会话 id（副本/同步目标），供前端定位到具体会话。
+    pub session_id: String,
+    pub reason: String,
+}
+
 /// 临时备份残留的只读上报项（复制/同步/恢复报告共用同一结构）。
 ///
 /// `state` 为 `cleanupPending`（待清理，下次维护入口重试）或 `needsRecovery`
@@ -808,6 +822,8 @@ pub struct RecoveryReport {
     pub abandoned: Vec<String>,
     /// 需要人工处理（中间产物被改动/丢失），不得盲目重放。
     pub needs_recovery: Vec<RecoveryIssue>,
+    /// 附属目录未能完整补齐的说明：非阻断提示（不改变 `is_clean`/启动阻断口径）。
+    pub sidecar_warnings: Vec<SidecarWarning>,
     /// 临时备份残留：待清理与待恢复（不改变 `is_clean`/启动阻断口径）。
     pub temporary_files: Vec<TemporaryFileIssue>,
 }
@@ -818,10 +834,14 @@ impl RecoveryReport {
     }
 
     /// 本次恢复是否什么都没做（宿主据此决定是否回报详情）。
+    ///
+    /// 附属目录提示也算「有话说」：它是恢复过程中真实发生的失败，不能因为没有
+    /// 需要人工处理的项就整份报告被吞掉。
     pub fn is_empty(&self) -> bool {
         self.recovered.is_empty()
             && self.abandoned.is_empty()
             && self.needs_recovery.is_empty()
+            && self.sidecar_warnings.is_empty()
             && self.temporary_files.is_empty()
     }
 }

@@ -75,6 +75,16 @@ pub fn recovery_report_json(report: &RecoveryReport) -> Value {
                 "retryable": issue.retryable,
             }))
             .collect::<Vec<Value>>(),
+        // 附属目录未能完整补齐：非阻断提示，与 needsRecovery 分开，避免被当成阻断项。
+        "sidecarWarnings": report
+            .sidecar_warnings
+            .iter()
+            .map(|warning| json!({
+                "operationId": warning.operation_id,
+                "sessionId": warning.session_id,
+                "reason": warning.reason,
+            }))
+            .collect::<Vec<Value>>(),
         // 待清理/待恢复的临时备份残留：与复制/同步报告同一结构。
         "temporaryFiles": report.temporary_files,
     })
@@ -355,7 +365,7 @@ mod tests {
 
     use super::*;
     use crate::modules::session_link::{
-        save_operation, OpPhase, OperationMember, RecoveryIssue, TemporaryFileIssue,
+        save_operation, OpPhase, OperationMember, RecoveryIssue, SidecarWarning, TemporaryFileIssue,
         OPERATION_VERSION,
     };
 
@@ -423,6 +433,7 @@ mod tests {
             recovered: Vec::new(),
             abandoned: Vec::new(),
             temporary_files: Vec::new(),
+            sidecar_warnings: Vec::new(),
             needs_recovery: vec![RecoveryIssue {
                 operation_id: "op-1".to_string(),
                 reason: "目标内容与操作记录不一致，已停止恢复".to_string(),
@@ -476,6 +487,35 @@ mod tests {
         assert_eq!(value["temporaryFiles"][0]["state"], "cleanupPending");
         assert_eq!(value["temporaryFiles"][0]["sessionId"], "sess-1");
         assert_eq!(value["temporaryFiles"][0]["title"], "标题");
+    }
+
+    /// 附属目录失败属于非阻断提示：不得暂停启动，但必须出现在恢复报告里。
+    ///
+    /// 事实是字段已产出、却没有任何消费方——用户侧不可达，等价于没记。因此这里
+    /// 钉住三件事：不阻断启动、仍算「有话说」、能穿过 IPC 到前端。
+    #[test]
+    fn sidecar_warnings_are_reported_without_blocking_startup() {
+        let mut report = RecoveryReport::default();
+        report.sidecar_warnings.push(SidecarWarning {
+            operation_id: "op-sidecar".to_string(),
+            session_id: "sess-2".to_string(),
+            reason: "subagents/agent-x.jsonl：拒绝访问".to_string(),
+        });
+        assert!(
+            !recovery_blocks_startup(&report),
+            "附属目录失败绝不允许阻断启动"
+        );
+        assert!(report.is_clean(), "附属目录失败不得升级为需要人工处理");
+        assert!(!report.is_empty(), "只有附属目录提示时也必须回传报告");
+        let value = recovery_report_json(&report);
+        assert_eq!(value["sidecarWarnings"][0]["operationId"], "op-sidecar");
+        assert_eq!(value["sidecarWarnings"][0]["sessionId"], "sess-2");
+        assert_eq!(
+            value["sidecarWarnings"][0]["reason"],
+            "subagents/agent-x.jsonl：拒绝访问"
+        );
+        // 不得混进阻断项：前端据此决定是 warning 还是 error。
+        assert_eq!(value["needsRecovery"], json!([]));
     }
 
     /// 本次新留下的未完成写入必须被识别出来：历史残留不算在本次头上，已完成的也不算。
