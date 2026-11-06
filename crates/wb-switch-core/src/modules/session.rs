@@ -1785,17 +1785,55 @@ const IN_FLIGHT_SESSION_STATUSES: [&str; 7] = [
 fn is_in_flight_status(status: &str) -> bool {
     IN_FLIGHT_SESSION_STATUSES.contains(&status)
 }
-/// 允许被传导为归档的**目标状态**白名单。
+/// 允许参与归档状态同步的「干净终态」白名单。
 ///
-/// `active` 也在名单内：目标侧因历史中断停在 `active` 但早已没有后台进程运行时，
-/// 不放行会让这类会话永远留在主列表（issue #204）。安全性由写入侧三重防线保证：
-/// 应用在跑且目标是当前登录账号时整体拒绝写、正文模式下写前重读目标状态、
-/// 归档副作用走事务内条件 UPDATE。
+/// 归档方向：目标必须停在这些状态才允许被归档——`active` 也在名单内，目标侧因历史
+/// 中断停在 `active` 但早已没有后台进程运行时，不放行会让这类会话永远留在主列表
+/// （issue #204）。
+/// 解档方向：来源必须是这些状态之一，才说明用户确实把它恢复成了一个可用终态；
+/// `working`/`streaming` 等运行态不该被顺手解档。
 ///
+/// 安全性由写入侧三重防线保证：应用在跑且目标是当前登录账号时整体拒绝写、
+/// 正文模式下写前重读目标状态、状态副作用走事务内条件 UPDATE。
 /// `working`（生成中）与 NULL、未知值、缺列一律排除——精确匹配而非「非 working 即允许」。
-const ARCHIVE_TARGET_TERMINAL_STATUSES: [&str; 4] = ["completed", "error", "terminated", "active"];
-/// 预览项与预览绑定里的归档动作取值。
+const TERMINAL_SESSION_STATUSES: [&str; 4] = ["completed", "error", "terminated", "active"];
+/// 预览项与预览绑定里的状态动作取值（前端据此渲染勾选框文案）。
 const ARCHIVE_ACTION_STATUS_ONLY: &str = "statusOnly";
+const ARCHIVE_ACTION_UNARCHIVE: &str = "unarchive";
+
+/// 两侧会话状态的归档方向：一次写入只允许一个方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveDirective {
+    /// 来源已归档 → 目标一并归档。
+    Archive,
+    /// 来源已恢复 → 目标解档。
+    Unarchive,
+}
+
+impl ArchiveDirective {
+    /// 预览项与预览凭据里的动作取值。
+    fn action(self) -> &'static str {
+        match self {
+            Self::Archive => ARCHIVE_ACTION_STATUS_ONLY,
+            Self::Unarchive => ARCHIVE_ACTION_UNARCHIVE,
+        }
+    }
+
+    /// 由凭据里的动作取值反解；未知取值一律视为未授权（不继承用户旧选择）。
+    fn from_action(action: &str) -> Option<Self> {
+        [Self::Archive, Self::Unarchive]
+            .into_iter()
+            .find(|directive| directive.action() == action)
+    }
+
+    /// 本次要写入目标的状态。
+    fn new_status(self) -> &'static str {
+        match self {
+            Self::Archive => SESSION_STATUS_ARCHIVED,
+            Self::Unarchive => SESSION_STATUS_COMPLETED,
+        }
+    }
+}
 
 /// 一条 `syncSelections` 入参（取代只传 `syncLinkIds`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1933,23 +1971,29 @@ fn read_member_status(paths: &SessionPaths, cid: &str) -> Result<SessionStatus, 
     }
 }
 
-/// 单向粘滞归档资格：来源已归档，且目标处于允许被归档的终态。
+/// 双方状态的对称比对：只给出一个方向，或什么都不给。
 ///
-/// 不反向传导取消归档；缺列、NULL、未知值与活跃态一律不授权。
-fn archive_qualifies(source: &SessionStatus, target: &SessionStatus) -> bool {
+/// 来源 `archived` → 目标在终态白名单内才归档；来源在终态白名单内 → 目标 `archived`
+/// 才解档。目标 `archived` 不在白名单内，因此「双方都已归档」「双方都已恢复」
+/// 天然返回 None。缺列、NULL、未知值与运行态一律不授权。
+fn archive_action_for(source: &SessionStatus, target: &SessionStatus) -> Option<ArchiveDirective> {
     let SessionStatus::Present(Some(source_status)) = source else {
-        return false;
+        return None;
     };
-    if source_status != SESSION_STATUS_ARCHIVED {
-        return false;
-    }
     let SessionStatus::Present(Some(target_status)) = target else {
-        return false;
+        return None;
     };
-    ARCHIVE_TARGET_TERMINAL_STATUSES.contains(&target_status.as_str())
+    if source_status == SESSION_STATUS_ARCHIVED {
+        return TERMINAL_SESSION_STATUSES
+            .contains(&target_status.as_str())
+            .then_some(ArchiveDirective::Archive);
+    }
+    (TERMINAL_SESSION_STATUSES.contains(&source_status.as_str())
+        && target_status == SESSION_STATUS_ARCHIVED)
+        .then_some(ArchiveDirective::Unarchive)
 }
 
-/// 读取双方会话行状态并算出本次的归档动作；读取失败一律按「不授权」处理，
+/// 读取双方会话行状态并算出本次的状态动作；读取失败一律按「不授权」处理，
 /// 不改变既有正文判定的结果（状态同步是附加能力，不是正文同步的前置条件）。
 fn preview_archive_state(
     source_paths: &SessionPaths,
@@ -1970,7 +2014,7 @@ fn preview_archive_state(
         _ => None,
     };
     let action =
-        archive_qualifies(&source, &target).then(|| ARCHIVE_ACTION_STATUS_ONLY.to_string());
+        archive_action_for(&source, &target).map(|directive| directive.action().to_string());
     PreviewArchiveState {
         source_status,
         target_status,
@@ -1978,12 +2022,12 @@ fn preview_archive_state(
     }
 }
 
-/// 预览时记入凭据的归档状态（双方 status 与本次授权的归档动作）。
+/// 预览时记入凭据的归档状态（双方 status 与本次授权的状态动作）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct PreviewArchiveState {
     source_status: Option<String>,
     target_status: Option<String>,
-    /// `Some("statusOnly")` 或 None。
+    /// `Some("statusOnly")`（归档）、`Some("unarchive")`（解档）或 None。
     action: Option<String>,
 }
 
@@ -2412,10 +2456,11 @@ fn preview_group_item(
         .iter()
         .map(|mode| mode.as_str())
         .collect();
-    // 归档资格：独立于正文判定，只看双方会话行的状态。来源已归档 + 目标处于非活跃
-    // 终态才授权；缺列/NULL/活跃态一律不授权，也不因此影响既有正文判定的结果。
+    // 状态动作：独立于正文判定，只看双方会话行的状态。来源已归档 + 目标处于终态
+    // 才归档；来源处于终态 + 目标已归档才解档。缺列/NULL/运行态一律不授权，
+    // 也不因此影响既有正文判定的结果。
     // 不可验证的判定不提供任何动作：此时既没有正文模式也不会下发凭据，若仍写出
-    // archiveAction，前端摘要会显示「仅同步归档」而用户实际勾不了，等于误导。
+    // archiveAction，前端摘要会显示「仅同步状态」而用户实际勾不了，等于误导。
     let mut archive = preview_archive_state(
         &source_paths,
         &source_member.session_id,
@@ -2426,11 +2471,11 @@ fn preview_group_item(
         archive.action = None;
     }
     let archive_action = archive.action.clone();
-    // 归档状态同步作为可选操作，默认不勾选（防误操作），由用户主动勾选授权；正文动作沿用自身默认值。
+    // 状态同步作为可选操作，默认不勾选（防误操作），由用户主动勾选授权；正文动作沿用自身默认值。
     let default_checked = decision.default_checked;
     // Keep ordinary sync unavailable for Ahead, but bind its verified snapshot so the
     // session-group "use this copy" flow can explicitly request UnifyOverwrite.
-    // 内容一致本身不可勾选，但具备归档资格时要发凭据，否则归档动作无从授权。
+    // 内容一致本身不可勾选，但具备状态动作时要发凭据，否则状态动作无从授权。
     let actionable = !modes.is_empty()
         || decision.verdict == SyncVerdict::Ahead
         || (archive_action.is_some() && decision.verdict == SyncVerdict::Identical);
@@ -2499,8 +2544,8 @@ struct SyncWritePlan {
     incoming: NormalizedContent,
     /// 提交前该成员对的基线引用（清单里记录，便于人工比对）。
     old_baseline_ref: Option<String>,
-    /// 本次是否把目标对齐为 `archived`：状态模式下是唯一动作，正文模式下是副作用。
-    archive_target: bool,
+    /// 本次要施加到目标上的状态方向：状态模式下是唯一动作，正文模式下是副作用。
+    archive_directive: Option<ArchiveDirective>,
     /// 目标行在写入前的 `status`：事务内条件 UPDATE 的前置值；缺列时为 None。
     target_status_before: Option<String>,
     reason: String,
@@ -2616,14 +2661,18 @@ fn plan_sync_selection(
     if !mismatches.is_empty() {
         return skip(format!("检查结果已失效：{}", mismatches.join("；")));
     }
-    // 本次是否随写入把目标对齐为归档：凭据里授权过才允许，且必须在本次重新核验。
-    let archive_authorized = binding.archive_action.as_deref() == Some(ARCHIVE_ACTION_STATUS_ONLY);
+    // 本次是否随写入对齐目标状态：凭据里授权过才允许，且必须在本次重新核验。
+    // 方向由凭据里的动作取值决定，不继承用户上一次的选择。
+    let archive_directive = binding
+        .archive_action
+        .as_deref()
+        .and_then(ArchiveDirective::from_action);
     // 判定已按当前内容重算：mode 必须仍然成立，unknown 不得被覆盖绕过。
-    // `StatusOnly` 不属于任何正文判定（`allows` 恒为 false），走独立的归档资格门禁。
+    // `StatusOnly` 不属于任何正文判定（`allows` 恒为 false），走独立的状态动作门禁。
     if selection.mode == SyncMode::StatusOnly {
-        if !archive_authorized {
+        if archive_directive.is_none() {
             return SyncItemOutcome::Rejected {
-                message: "该组本次不提供仅同步归档的操作，已拒绝".to_string(),
+                message: "该组本次不提供仅同步状态的操作，已拒绝".to_string(),
             };
         }
         if !matches!(
@@ -2631,7 +2680,7 @@ fn plan_sync_selection(
             SyncVerdict::Identical | SyncVerdict::Ahead
         ) {
             return SyncItemOutcome::Rejected {
-                message: format!("该组判定为 {}，不允许仅同步归档", decision.verdict.as_str()),
+                message: format!("该组判定为 {}，不允许仅同步状态", decision.verdict.as_str()),
             };
         }
     } else if !decision.verdict.allows(selection.mode) {
@@ -2649,9 +2698,9 @@ fn plan_sync_selection(
     else {
         return skip("双方内容不可验证，检查结果已失效".to_string());
     };
-    // 归档资格在写入前重新核验（来源仍已归档、目标仍在终态白名单）；任一项不满足
-    // 整体判为预览失效，不静默执行另一组副作用。
-    let target_status_before = if archive_authorized {
+    // 状态方向在写入前重新核验（来源与目标仍处于预览时的同一方向）；任一项不满足
+    // 整体判为预览失效，不静默改成另一个方向。
+    let target_status_before = if let Some(directive) = archive_directive {
         let source_status = match read_member_status(source_paths, &source_member.session_id) {
             Ok(status) => status,
             Err(error) => return SyncItemOutcome::Rejected { message: error },
@@ -2660,7 +2709,7 @@ fn plan_sync_selection(
             Ok(status) => status,
             Err(error) => return SyncItemOutcome::Rejected { message: error },
         };
-        if !archive_qualifies(&source_status, &target_status) {
+        if archive_action_for(&source_status, &target_status) != Some(directive) {
             return skip("会话的归档状态已变化，检查结果已失效".to_string());
         }
         match target_status {
@@ -2706,7 +2755,7 @@ fn plan_sync_selection(
             incoming_text,
             incoming,
             old_baseline_ref: live.baseline_ref,
-            archive_target: archive_authorized,
+            archive_directive,
             target_status_before,
             reason: decision.reason,
         }),
@@ -3464,9 +3513,9 @@ fn create_sync_backup(
     let db_rel = "workbuddy.db".to_string();
     snapshot_workbuddy_db(&paths.workbuddy_db(), &dir.join(&db_rel))?;
     let target_row = session_row_snapshot(paths, &plan.target_member.session_id)?;
-    // 规划与备份之间状态被改动就不按「可归档」继续：条件 UPDATE 的前置值必须来自
+    // 规划与备份之间状态被改动就不按「可同步状态」继续：条件 UPDATE 的前置值必须来自
     // 与规划时一致的现场，不能拿一份已经过期的前置值去写库。
-    if plan.archive_target
+    if plan.archive_directive.is_some()
         && target_row.as_ref().and_then(|row| row.status.clone()) != plan.target_status_before
     {
         return Err("目标会话的状态在校验后发生变化，已停止保存".to_string());
@@ -3511,8 +3560,8 @@ fn create_sync_backup(
             target_row,
             new_updated_at,
             new_status: plan
-                .archive_target
-                .then(|| SESSION_STATUS_ARCHIVED.to_string()),
+                .archive_directive
+                .map(|directive| directive.new_status().to_string()),
         },
         new_baseline_ref: new_baseline_ref.map(str::to_string),
         old_baseline_ref: plan.old_baseline_ref.clone(),
@@ -3847,9 +3896,9 @@ fn status_change_of(manifest: &SyncBackupManifest) -> Result<Option<StatusChange
 
 /// 正文模式下本次实际执行的状态写入。
 ///
-/// 正文模式的归档是副作用：目标已不在可归档的状态（例如被打开后变成 active）时，
-/// 不能为了归档把正文恢复卡成人工处理——跳过状态写入，正文照常补完。
-/// 仅同步归档里状态就是全部动作，必须保留要求，由事务内条件 UPDATE 兜底。
+/// 正文模式的状态写入是副作用：目标已不在本次写入的前置/目标状态（例如被打开后变成
+/// active）时，不能为了对齐状态把正文恢复卡成人工处理——跳过状态写入，正文照常补完。
+/// 仅同步状态里状态就是全部动作，必须保留要求，由事务内条件 UPDATE 兜底。
 fn planned_status_change<'a>(
     paths: &SessionPaths,
     operation: &Operation,
@@ -3863,9 +3912,10 @@ fn planned_status_change<'a>(
     }
     let current =
         session_row_snapshot(paths, &operation.target.session_id)?.and_then(|row| row.status);
-    let still_archivable = current.as_deref() == Some(change.after)
+    // 方向无关的幂等判据：现场的 status 仍是覆盖前值（待写）或已是本次新值（已写）。
+    let still_consistent = current.as_deref() == Some(change.after)
         || current.as_deref() == Some(change.before.as_str());
-    Ok(still_archivable.then_some(change))
+    Ok(still_consistent.then_some(change))
 }
 
 /// 仅同步归档的阶段推进：`Prepared → DbWritten → Completed`。
@@ -3900,9 +3950,9 @@ fn run_status_only_phases(
         SyncBodyState::Gone => return Err("目标内容不存在，状态同步未执行".to_string()),
         SyncBodyState::Unknown(reason) => return Err(reason),
     }
-    // 2) 状态：归档是本次唯一动作，必须带可核验的覆盖前状态。
+    // 2) 状态：状态变更是本次唯一动作，必须带可核验的覆盖前状态。
     let Some(status_change) = status_change_of(manifest)? else {
-        return Err("备份清单未记录本次归档状态，状态同步未执行".to_string());
+        return Err("备份清单未记录本次状态变更，状态同步未执行".to_string());
     };
     update_target_session_row(
         paths,
@@ -4485,14 +4535,14 @@ fn recover_sync_operation(
         SyncBodyState::Unknown(reason) => return needs(reason.clone(), false),
         // 状态同步不写正文，也永远不会推进到 BodyWritten：正文丢失后若按正文口径
         // 拦截，每次启动都会重跑并失败，等于永久阻断启动。已提交的状态予以保留，
-        // 只放弃本次归档意图（不写库、不补正文、不重建文件）。
+        // 只放弃本次状态意图（不写库、不补正文、不重建文件）。
         // 必须排在「已写正文却丢失」的通用拦截之前——DbWritten 晚于 BodyWritten，
-        // 否则归档已提交的现场会先被通用分支截走，永远走不到这里。
+        // 否则状态已提交的现场会先被通用分支截走，永远走不到这里。
         SyncBodyState::Gone if manifest.mode == SyncMode::StatusOnly => {
             abandon_operation_with(
                 paths,
                 &mut operation,
-                "目标内容已不存在，本次仅同步归档已放弃，已提交的状态保持不变",
+                "目标内容已不存在，本次仅同步状态已放弃，已提交的状态保持不变",
             );
             return RecoverOutcome::Abandoned(operation_id);
         }
@@ -9792,19 +9842,39 @@ mod tests {
         )
     }
 
-    /// 目标已归档且来源有可快进的新记录：正文照写、时间照更新，状态保持 archived。
+    /// 造一个「正文一致 + 来源已恢复 + 目标已归档」的可勾选场景（解档方向）。
+    fn unarchive_scene(env: &Env) -> (String, String, String) {
+        let report = copy(env, "uid-b", &["sess-1"]);
+        let target_id = env.first_copy_id(&report);
+        env.set_status("sess-1", "active");
+        env.set_status(&target_id, "archived");
+        let preview = preview(env, "uid-b");
+        let group = &preview["groups"][0];
+        assert_eq!(group["verdict"], "identical", "{preview}");
+        assert_eq!(group["archiveAction"], "unarchive", "{preview}");
+        (
+            group["groupId"].as_str().unwrap().to_string(),
+            group["previewToken"].as_str().unwrap().to_string(),
+            target_id,
+        )
+    }
+
+    /// 目标已归档且来源已恢复：正文有新增时照写、时间照更新，状态随正文一并解档。
     #[test]
-    fn fast_forward_keeps_archived_target_archived() {
-        let env = ready_env_with_status("status-ff-already-archived");
+    fn fast_forward_unarchives_archived_target() {
+        let env = ready_env_with_status("status-ff-unarchive");
         let report = copy(&env, "uid-b", &["sess-1"]);
         let target_id = env.first_copy_id(&report);
         append_records(&env.body_path("sess-1"), "sess-1", 2, 3);
-        env.set_status("sess-1", "completed");
+        env.set_status("sess-1", "active");
         env.set_status(&target_id, "archived");
         let preview = preview(&env, "uid-b");
         let group = &preview["groups"][0];
         assert_eq!(group["verdict"], "fastForward", "{preview}");
-        assert!(group["archiveAction"].is_null(), "{group}");
+        assert_eq!(
+            group["archiveAction"], "unarchive",
+            "正文快进时状态方向同样由预览固定：{group}"
+        );
         let token = group["previewToken"].as_str().unwrap().to_string();
         let group_id = group["groupId"].as_str().unwrap().to_string();
         let updated_before = session_row(&env, &target_id).3;
@@ -9815,7 +9885,11 @@ mod tests {
             &[selection(&group_id, &token, SyncMode::FastForward)],
         );
         assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
-        assert_eq!(env.status_of(&target_id).as_deref(), Some("archived"));
+        assert_eq!(
+            env.status_of(&target_id).as_deref(),
+            Some("completed"),
+            "来源已不在归档态，目标必须跟着解档"
+        );
         assert_eq!(
             std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
             incoming_text(&env, "sess-1", &target_id)
@@ -9892,11 +9966,12 @@ mod tests {
         assert_eq!(env.body_files().len(), 2, "不得产生第二份正文");
     }
 
-    /// 白名单：completed / error / terminated / active 可归档；working 与未知值一律不授权。
+    /// 白名单双向对称：终态既可被归档（目标侧），也表示来源已经恢复（解档侧）；
+    /// `working` 与未知值在任何一个方向都不授权。
     ///
     /// `active` 是历史中断留下的陈旧态，不放行会让这类会话永远留在主列表（issue #204）。
     #[test]
-    fn status_sync_accepts_only_terminal_target_statuses() {
+    fn status_sync_accepts_only_terminal_statuses_in_both_directions() {
         for allowed in ["completed", "error", "terminated", "active"] {
             let env = ready_env_with_status(&format!("status-allow-{allowed}"));
             let (group_id, token, target_id) = archive_scene(&env, allowed);
@@ -9915,6 +9990,33 @@ mod tests {
                 Some("archived"),
                 "{allowed}"
             );
+
+            // 反方向：来源停在该终态、目标已归档 → 解档。
+            let env = ready_env_with_status(&format!("unarchive-allow-{allowed}"));
+            let report = copy(&env, "uid-b", &["sess-1"]);
+            let target_id = env.first_copy_id(&report);
+            env.set_status("sess-1", allowed);
+            env.set_status(&target_id, "archived");
+            let preview_report = preview(&env, "uid-b");
+            let group = &preview_report["groups"][0];
+            assert_eq!(group["archiveAction"], "unarchive", "{allowed}: {group}");
+            let token = group["previewToken"].as_str().unwrap().to_string();
+            let group_id = group["groupId"].as_str().unwrap().to_string();
+            let report = sync(
+                &env,
+                "uid-b",
+                &[selection(&group_id, &token, SyncMode::StatusOnly)],
+            );
+            assert_eq!(
+                report["synced"].as_array().unwrap().len(),
+                1,
+                "{allowed}: {report}"
+            );
+            assert_eq!(
+                env.status_of(&target_id).as_deref(),
+                Some("completed"),
+                "{allowed}"
+            );
         }
         for denied in ["working", "Pending", "unknown-value"] {
             let env = ready_env_with_status(&format!("status-deny-{denied}"));
@@ -9931,26 +10033,271 @@ mod tests {
                 Some(denied),
                 "{denied}: 不得写入状态"
             );
+
+            // 反方向：来源是该状态、目标已归档 → 同样不授权。
+            let env = ready_env_with_status(&format!("unarchive-deny-{denied}"));
+            let report = copy(&env, "uid-b", &["sess-1"]);
+            let target_id = env.first_copy_id(&report);
+            env.set_status("sess-1", denied);
+            env.set_status(&target_id, "archived");
+            let preview_report = preview(&env, "uid-b");
+            let group = &preview_report["groups"][0];
+            assert!(group["archiveAction"].is_null(), "{denied}: {group}");
+            assert!(
+                group["previewToken"].is_null(),
+                "{denied}: 无动作即无凭据 {group}"
+            );
+            assert_eq!(
+                env.status_of(&target_id).as_deref(),
+                Some("archived"),
+                "{denied}: 不得解档"
+            );
         }
     }
 
-    /// 单向粘滞：来源未归档、目标已归档时，绝不反向取消归档。
+    /// 来源运行态（working）、目标已归档：不授权解档，留给用户自己处理。
     #[test]
-    fn status_sync_never_unarchives_target() {
-        let env = ready_env_with_status("status-no-unarchive");
+    fn status_sync_ignores_unarchive_while_source_is_in_flight() {
+        let env = ready_env_with_status("status-unarchive-in-flight");
         let report = copy(&env, "uid-b", &["sess-1"]);
         let target_id = env.first_copy_id(&report);
-        env.set_status("sess-1", "completed");
+        env.set_status("sess-1", "working");
         env.set_status(&target_id, "archived");
+        let updated_before = session_row(&env, &target_id).3;
 
         let preview = preview(&env, "uid-b");
         let group = &preview["groups"][0];
         assert_eq!(group["verdict"], "identical", "{preview}");
         assert!(group["archiveAction"].is_null(), "{group}");
         assert!(group["previewToken"].is_null(), "{group}");
-        let updated_before = session_row(&env, &target_id).3;
         assert_eq!(env.status_of(&target_id).as_deref(), Some("archived"));
-        assert_eq!(session_row(&env, &target_id).3, updated_before);
+        assert_eq!(session_row(&env, &target_id).3, updated_before, "不得刷新时间");
+    }
+
+    /// 正文一致、来源已恢复、目标已归档：只改状态，正文字节/基线/时间戳全不动。
+    #[test]
+    fn status_sync_unarchives_target_without_touching_body() {
+        let env = ready_env_with_status("status-unarchive-identical");
+        let (group_id, token, target_id) = unarchive_scene(&env);
+        let preview_report = preview(&env, "uid-b");
+        let group = &preview_report["groups"][0];
+        assert_eq!(
+            group["availableModes"],
+            json!([]),
+            "正文模式仍为空：解档不是正文覆盖"
+        );
+        assert_eq!(group["defaultChecked"], false);
+
+        let body_before = body_bytes(&env, &target_id);
+        let pairs_before = pair_snapshot(&env);
+        let baselines_before = env.baseline_files();
+        let synced_before = member_last_synced_at(&env, &group_id, "uid-b");
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::StatusOnly)],
+        );
+        assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
+        assert_eq!(report["synced"][0]["mode"], "statusOnly");
+        assert_eq!(
+            env.status_of(&target_id).as_deref(),
+            Some("completed"),
+            "正文一致时状态也必须传导"
+        );
+        assert_eq!(
+            body_bytes(&env, &target_id),
+            body_before,
+            "正文字节不得变化"
+        );
+        assert_eq!(pair_snapshot(&env), pairs_before, "配对基线不得推进");
+        assert_eq!(env.baseline_files(), baselines_before, "不得产生新基线");
+        assert_eq!(
+            member_last_synced_at(&env, &group_id, "uid-b"),
+            synced_before,
+            "正文 lastSyncedAt 保持原值"
+        );
+    }
+
+    /// 预览后来源又变回归档：方向漂移，整组判为预览失效，目标状态零写入。
+    #[test]
+    fn status_sync_skips_when_direction_drifts_after_preview() {
+        let env = ready_env_with_status("status-unarchive-drift");
+        let (group_id, token, target_id) = unarchive_scene(&env);
+        env.set_status("sess-1", "archived");
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::StatusOnly)],
+        );
+        assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["skipped"][0]["reasonCode"], REASON_PREVIEW_STALE);
+        assert_eq!(
+            env.status_of(&target_id).as_deref(),
+            Some("archived"),
+            "不得改成另一个方向"
+        );
+    }
+
+    /// 解档的备份清单必须自带可逆信息（新值 completed、覆盖前值 archived），
+    /// 且中断后能按同一份清单补完（状态落到 completed、正文不动）。
+    #[test]
+    fn unarchive_manifest_is_reversible_and_recovers() {
+        let env = ready_env_with_status("status-unarchive-manifest");
+        let (group_id, token, target_id) = unarchive_scene(&env);
+        let body_before = body_bytes(&env, &target_id);
+        let baselines_before = env.baseline_files();
+
+        // 卡住状态写入：清单留在磁盘上，正好用来核对可逆信息。
+        install_block_update_trigger(&env);
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::StatusOnly)],
+        );
+        assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{report}");
+        assert_eq!(
+            env.status_of(&target_id).as_deref(),
+            Some("archived"),
+            "中断时状态未变"
+        );
+        drop_block_update_trigger(&env);
+
+        let operation = sync_operations(&env)[0].clone();
+        let manifest = load_sync_manifest(
+            Path::new(operation.backup.as_ref().unwrap())
+                .parent()
+                .unwrap(),
+        )
+        .expect("清单必须可读");
+        assert_eq!(manifest.db.new_status.as_deref(), Some("completed"));
+        assert_eq!(
+            manifest
+                .db
+                .target_row
+                .as_ref()
+                .and_then(|row| row.status.clone()),
+            Some("archived".to_string()),
+            "覆盖前状态必须记录，恢复据此还原"
+        );
+        let change = status_change_of(&manifest)
+            .unwrap()
+            .expect("解档同样要有状态写入要求");
+        assert_eq!(change.before, "archived");
+        assert_eq!(change.after, "completed");
+
+        let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert!(
+            recovery.needs_recovery.is_empty(),
+            "{:?}",
+            recovery.needs_recovery
+        );
+        assert_eq!(recovery.recovered.len(), 1, "{:?}", recovery);
+        assert_eq!(env.status_of(&target_id).as_deref(), Some("completed"));
+        assert_eq!(body_bytes(&env, &target_id), body_before, "恢复不得写正文");
+        assert_eq!(env.baseline_files(), baselines_before, "恢复不得产生基线");
+    }
+
+    /// 凭据里的方向与现场相反：按预览失效跳过，绝不改写成另一个方向。
+    ///
+    /// 这里把凭据的双方状态改写成现场值，只留下方向矛盾——状态漂移的更早拦截
+    /// （`verify_preview` 比对 sourceStatus/targetStatus）因此失效，只有方向复核
+    /// 能拦住这次提交。
+    #[test]
+    fn status_sync_skips_when_credential_direction_contradicts_live_state() {
+        let env = ready_env_with_status("status-direction-contradict");
+        let (group_id, token, target_id) = unarchive_scene(&env);
+        // 现场翻成「来源已归档 + 目标已恢复」：live 方向是 Archive，凭据仍是 Unarchive。
+        env.set_status("sess-1", "archived");
+        env.set_status(&target_id, "completed");
+        let stored =
+            session_link::load_preview_token(&env.paths(), &token).expect("凭据必须存在");
+        let mut binding = stored.binding.clone();
+        binding.source_status = Some("archived".to_string());
+        binding.target_status = Some("completed".to_string());
+        let forged = session_link::save_preview_token(&env.paths(), binding).unwrap();
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &forged, SyncMode::StatusOnly)],
+        );
+        assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["skipped"][0]["reasonCode"], REASON_PREVIEW_STALE);
+        assert!(
+            report["skipped"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("可执行的归档同步已变化"),
+            "必须是动作失配这一支拦下的：{report}"
+        );
+        assert_eq!(
+            env.status_of(&target_id).as_deref(),
+            Some("completed"),
+            "不得按凭据方向把目标重新归档"
+        );
+    }
+
+    /// 凭据里的动作取值不可识别：一律按失效处理，零状态写入（fail-closed）。
+    ///
+    /// 未知取值在 `verify_preview` 比对动作时就已失配；即便放过那一层，
+    /// `ArchiveDirective::from_action` 也会返回 None 并让 statusOnly 被拒绝。
+    #[test]
+    fn status_sync_rejects_unknown_credential_action() {
+        let env = ready_env_with_status("status-unknown-action");
+        let (group_id, token, target_id) = unarchive_scene(&env);
+        let stored =
+            session_link::load_preview_token(&env.paths(), &token).expect("凭据必须存在");
+        let mut binding = stored.binding.clone();
+        binding.archive_action = Some("unarchive-v2".to_string());
+        let forged = session_link::save_preview_token(&env.paths(), binding).unwrap();
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &forged, SyncMode::StatusOnly)],
+        );
+        assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["skipped"][0]["reasonCode"], REASON_PREVIEW_STALE);
+        assert_eq!(
+            env.status_of(&target_id).as_deref(),
+            Some("archived"),
+            "未知动作不得产生任何状态写入"
+        );
+    }
+
+    /// 来源已归档：正文快进只写正文，目标保持 archived（归档方向不误伤）。
+    #[test]
+    fn fast_forward_keeps_archived_target_archived() {
+        let env = ready_env_with_status("status-ff-already-archived");
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        let target_id = env.first_copy_id(&report);
+        append_records(&env.body_path("sess-1"), "sess-1", 2, 3);
+        env.set_status("sess-1", "archived");
+        env.set_status(&target_id, "archived");
+        let preview = preview(&env, "uid-b");
+        let group = &preview["groups"][0];
+        assert_eq!(group["verdict"], "fastForward", "{preview}");
+        assert!(
+            group["archiveAction"].is_null(),
+            "双方都已归档即无状态动作：{group}"
+        );
+        let token = group["previewToken"].as_str().unwrap().to_string();
+        let group_id = group["groupId"].as_str().unwrap().to_string();
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
+        assert_eq!(env.status_of(&target_id).as_deref(), Some("archived"));
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            incoming_text(&env, "sess-1", &target_id)
+        );
     }
 
     /// 双方都已归档：无动作、不写库、不抬时间戳。
@@ -10069,6 +10416,51 @@ mod tests {
         );
     }
 
+    /// 冲突 + 来源已恢复：显式覆盖才写正文，解档作为副作用一并生效；仍不默认勾选。
+    #[test]
+    fn diverge_unarchives_archived_target_on_explicit_overwrite() {
+        let env = ready_env_with_status("status-diverge-unarchive");
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        let target_id = env.first_copy_id(&report);
+        // 双方互不为前缀（来源 index 2、目标 index 100）。
+        append_records(&env.body_path("sess-1"), "sess-1", 2, 2);
+        append_records(&env.body_path(&target_id), &target_id, 100, 1);
+        env.set_status("sess-1", "active");
+        env.set_status(&target_id, "archived");
+
+        let preview = preview(&env, "uid-b");
+        let group = &preview["groups"][0];
+        assert_eq!(group["verdict"], "diverge", "{preview}");
+        assert_eq!(
+            group["availableModes"],
+            json!(["overwrite"]),
+            "解档方向不提供纯状态模式，只能随覆盖发生：{group}"
+        );
+        assert_eq!(
+            group["archiveAction"], "unarchive",
+            "预览时即固定，不随勾选变化"
+        );
+        assert_eq!(group["defaultChecked"], false, "冲突仍不默认勾选");
+        let token = group["previewToken"].as_str().unwrap().to_string();
+        let group_id = group["groupId"].as_str().unwrap().to_string();
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::Overwrite)],
+        );
+        assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
+        assert_eq!(
+            env.status_of(&target_id).as_deref(),
+            Some("completed"),
+            "覆盖后目标必须跟着解档"
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            incoming_text(&env, "sess-1", &target_id)
+        );
+    }
+
     /// 预览后来源取消归档：整体判为预览失效，零状态写入。
     #[test]
     fn status_sync_skips_when_source_unarchived_after_preview() {
@@ -10164,7 +10556,7 @@ mod tests {
             report["errors"][0]["error"]
                 .as_str()
                 .unwrap()
-                .contains("不提供仅同步归档"),
+                .contains("不提供仅同步状态"),
             "{report}"
         );
         let _ = target_id;
@@ -10737,6 +11129,65 @@ mod tests {
             env.status_of(&target_id).as_deref(),
             Some("completed"),
             "恢复不得重做已跳过的归档"
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            incoming_text(&env, "sess-1", &target_id),
+            "正文必须已补完"
+        );
+    }
+
+    /// 正文模式下「数据库步骤已提交、解档副作用未落库」：恢复不得补写解档。
+    ///
+    /// 与归档方向的镜像用例同口径：数据库步骤必须恰好执行一次，恢复只看时间戳，
+    /// 不再按当前状态重新推导副作用——否则后人往这段加一句「状态不等于目标值就补写」
+    /// 就能把一个用户当次没同意的解档在恢复里补上。
+    #[test]
+    fn body_mode_recovery_does_not_reapply_unarchive() {
+        let env = ready_env_with_status("body-no-reunarchive");
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        let target_id = env.first_copy_id(&report);
+        append_records(&env.body_path("sess-1"), "sess-1", 2, 3);
+        env.set_status("sess-1", "active");
+        env.set_status(&target_id, "archived");
+        let preview = preview(&env, "uid-b");
+        let group = &preview["groups"][0];
+        assert_eq!(group["archiveAction"], "unarchive", "{preview}");
+        let token = group["previewToken"].as_str().unwrap().to_string();
+        let group_id = group["groupId"].as_str().unwrap().to_string();
+
+        install_block_update_trigger(&env);
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
+        drop_block_update_trigger(&env);
+
+        // 手工构造「数据库已提交、解档未生效」的现场：时间戳是本次值，状态仍是 archived。
+        let mut operation = sync_operations(&env)[0].clone();
+        let manifest = load_sync_manifest(
+            Path::new(operation.backup.as_ref().unwrap())
+                .parent()
+                .unwrap(),
+        )
+        .expect("清单必须可读");
+        env.set_updated_at(&target_id, manifest.db.new_updated_at);
+        operation.phase = OpPhase::DbWritten;
+        session_link::save_operation(&env.paths, &operation).unwrap();
+
+        let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert!(
+            recovery.needs_recovery.is_empty(),
+            "{:?}",
+            recovery.needs_recovery
+        );
+        assert_eq!(recovery.recovered.len(), 1, "{:?}", recovery);
+        assert_eq!(
+            env.status_of(&target_id).as_deref(),
+            Some("archived"),
+            "恢复不得补写已跳过的解档"
         );
         assert_eq!(
             std::fs::read_to_string(env.body_path(&target_id)).unwrap(),

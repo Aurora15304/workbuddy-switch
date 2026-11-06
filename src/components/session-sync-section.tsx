@@ -45,8 +45,9 @@ interface Props {
 /**
  * 切号弹窗「关联会话」tab 的内容：说明卡 + 会话列表（判定徽标 + 一句摘要 + 折叠详情）。
  *
- * - 默认勾选与可选模式全部来自后端：`defaultChecked` 为 true 才预先勾选，
- *   `availableModes` 为空（identical / ahead / unknown / 预览凭据不可用）一律禁选。
+ * - 默认勾选与可选模式全部来自后端：`defaultChecked` 为 true 才预先勾选；
+ *   `availableModes` 为空时只有后端给出的 `archiveAction`（归档 / 取消归档）可勾选，
+ *   其中取消归档绝不预选。
  * - `diverge` 默认不勾，需用户显式选择覆盖；覆盖风险常驻行内，不依赖展开或勾选。
  * - 错误与存储不可用由父组件在 tab 之上常驻提示，本组件只保留对应的空态与重试入口。
  * - 展示件与勾选逻辑与 VS Code 插件侧共用（`session-link-shared.tsx`）。
@@ -171,7 +172,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
   const selectedSyncableCount = syncable.filter((group) => checked.has(group.groupId)).length;
   const allSyncableSelected = syncable.length > 0 && selectedSyncableCount === syncable.length;
 
-  /** 全选/取消全选：涵盖正文快进与仅同步归档；覆盖项必须单独勾选。 */
+  /** 全选/取消全选：涵盖正文快进与纯状态同步（归档 / 取消归档）；覆盖项必须单独勾选。 */
   function toggleAllSyncable() {
     const updated = new Set(checked);
     if (allSyncableSelected) syncable.forEach((group) => updated.delete(group.groupId));
@@ -314,7 +315,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
             ))}
           </div>
           <p className="px-1 text-xs text-muted-foreground">
-            全选包含正文同步与仅同步归档，覆盖需单独勾选。
+            全选包含正文同步与归档状态同步（归档 / 取消归档），覆盖需单独勾选。
           </p>
         </div>
       )}

@@ -261,7 +261,7 @@ export function VscodeSessionSyncSection({
             ))}
           </div>
           <p className="px-1 text-xs text-muted-foreground">
-            全选包含正文同步与仅同步归档，覆盖需单独勾选。
+            全选包含正文同步与归档状态同步（归档 / 取消归档），覆盖需单独勾选。
           </p>
         </div>
       )}

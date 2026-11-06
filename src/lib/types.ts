@@ -265,15 +265,15 @@ export interface SessionLinkPreviewGroup {
   defaultChecked: boolean;
   /**
    * 正文写入模式；为空且没有 `archiveAction` 时才不可勾选
-   * （identical / ahead / unknown / 预览凭据不可用，但仅同步归档仍可勾选）。
+   * （identical / ahead / unknown / 预览凭据不可用，但仅同步状态——归档或取消归档——仍可勾选）。
    */
   availableModes: SessionSyncMode[];
   reason: string;
   /**
-   * 仅同步生命周期状态（把目标对齐为已归档），正文零写入。
-   * 由后端在生成预览时给出，不随用户勾选变化。
+   * 仅同步生命周期状态（正文零写入），方向由后端决定，不随用户勾选变化：
+   * `statusOnly` = 源已归档 → 目标归档；`unarchive` = 源已恢复 → 目标取消归档。
    */
-  archiveAction?: "statusOnly";
+  archiveAction?: "statusOnly" | "unarchive";
   /** 记录数（不是消息数）：不可验证时 source/target 为 0、baseline 为 null。 */
   recordCount: { source: number; target: number; baseline: number | null };
   source: SessionLinkMember | null;

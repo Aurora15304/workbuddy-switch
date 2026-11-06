@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  archiveOnly,
   buildSelections,
   isActionable,
   isDirectlySyncable,
   primaryMode,
   shouldDefaultSelect,
   summarySentence,
+  unarchiveOnly,
 } from "./session-link-shared";
 import type { SessionLinkPreviewGroup, SessionSyncMode } from "@/lib/types";
 
@@ -54,12 +56,49 @@ describe("isActionable", () => {
     expect(isActionable(group({ archiveAction: "statusOnly" }))).toBe(false);
   });
 
+  it("取消归档项（模式为空 + unarchive）有凭据时可勾选", () => {
+    expect(isActionable(group({ archiveAction: "unarchive", previewToken: "t" }))).toBe(true);
+  });
+
+  it("取消归档项没有凭据时不可勾选", () => {
+    expect(isActionable(group({ archiveAction: "unarchive" }))).toBe(false);
+  });
+
+  it("取消归档可勾选，但不进全选（影响面大的动作逐条授权）", () => {
+    const unarchive = group({ archiveAction: "unarchive", previewToken: "t" });
+    expect(isActionable(unarchive)).toBe(true);
+    expect(isDirectlySyncable(unarchive)).toBe(false);
+    // 归档方向仍进全选，否则批量归档退化成逐条点。
+    expect(
+      isDirectlySyncable(group({ archiveAction: "statusOnly", previewToken: "t" })),
+    ).toBe(true);
+  });
+
   it("既无正文模式也无 archiveAction 时不可勾选", () => {
     expect(isActionable(group({ previewToken: "t" }))).toBe(false);
   });
 
   it("正文模式存在但没有凭据时不可勾选", () => {
     expect(isActionable(group({ availableModes: ["overwrite"] }))).toBe(false);
+  });
+});
+
+describe("archiveOnly / unarchiveOnly 互斥", () => {
+  it("statusOnly 只算归档，不算取消归档", () => {
+    const archived = group({ archiveAction: "statusOnly" });
+    expect(archiveOnly(archived)).toBe(true);
+    expect(unarchiveOnly(archived)).toBe(false);
+  });
+
+  it("unarchive 只算取消归档，不算归档（因此不会进自动预选）", () => {
+    const unarchived = group({ archiveAction: "unarchive" });
+    expect(archiveOnly(unarchived)).toBe(false);
+    expect(unarchiveOnly(unarchived)).toBe(true);
+  });
+
+  it("没有 archiveAction 时两者都为 false", () => {
+    expect(archiveOnly(group())).toBe(false);
+    expect(unarchiveOnly(group())).toBe(false);
   });
 });
 
@@ -79,6 +118,36 @@ describe("buildSelections", () => {
     const target = group({ archiveAction: "statusOnly", previewToken: "t" });
     expect(buildSelections([target], new Set(["g-1"]))).toEqual([
       { groupId: "g-1", previewToken: "t", mode: "statusOnly" },
+    ]);
+  });
+
+  it("取消归档项被勾选时同样提交 statusOnly（方向由预览凭据决定）", () => {
+    const target = group({ archiveAction: "unarchive", previewToken: "t" });
+    expect(buildSelections([target], new Set(["g-1"]))).toEqual([
+      { groupId: "g-1", previewToken: "t", mode: "statusOnly" },
+    ]);
+  });
+
+  it("正文模式优先：取消归档项仍只提交正文模式", () => {
+    const target = group({
+      availableModes: ["fastForward"],
+      archiveAction: "unarchive",
+      previewToken: "t",
+    });
+    expect(buildSelections([target], new Set(["g-1"]))).toEqual([
+      { groupId: "g-1", previewToken: "t", mode: "fastForward" },
+    ]);
+  });
+
+  it("diverge 项带 unarchive 时只提交 overwrite，解档交给后端副作用", () => {
+    const target = group({
+      verdict: "diverge",
+      availableModes: ["overwrite"],
+      archiveAction: "unarchive",
+      previewToken: "t",
+    });
+    expect(buildSelections([target], new Set(["g-1"]))).toEqual([
+      { groupId: "g-1", previewToken: "t", mode: "overwrite" },
     ]);
   });
 
@@ -119,6 +188,12 @@ describe("模式优先级与全选口径不变", () => {
     expect(isDirectlySyncable(group({ availableModes: [] }))).toBe(false);
   });
 
+  it("全选排除取消归档项（会把大量历史会话一次性放回主列表）", () => {
+    expect(
+      isDirectlySyncable(group({ availableModes: [], archiveAction: "unarchive", previewToken: "t" })),
+    ).toBe(false);
+  });
+
   it("全选后提交的是正文快进 + 仅归档，覆盖仍被排除", () => {
     const groups = [
       group({ groupId: "ff", availableModes: ["fastForward"], previewToken: "t1" }),
@@ -154,6 +229,31 @@ describe("summarySentence", () => {
     );
     expect(sentence).toContain("将当前账号的新内容同步到「账号B」");
     expect(sentence).toContain("一并归档");
+  });
+
+  it("纯取消归档（identical）说明仅取消归档、保留正文", () => {
+    expect(
+      summarySentence(group({ verdict: "identical", archiveAction: "unarchive" }), "账号B"),
+    ).toBe("仅取消归档，保留正文");
+  });
+
+  it("纯取消归档（ahead）同样说明仅取消归档，不会说成「本次不同步」", () => {
+    expect(summarySentence(group({ verdict: "ahead", archiveAction: "unarchive" }), "账号B")).toBe(
+      "仅取消归档，保留正文",
+    );
+  });
+
+  it("正文快进附带取消归档时，句尾写明目标会话一并取消归档", () => {
+    expect(
+      summarySentence(
+        group({
+          verdict: "fastForward",
+          availableModes: ["fastForward"],
+          archiveAction: "unarchive",
+        }),
+        "账号B",
+      ),
+    ).toBe("将当前账号的新内容同步到「账号B」，目标会话一并取消归档");
   });
 
   it("没有归档动作时文案与旧行为逐字一致", () => {
@@ -217,6 +317,38 @@ describe("shouldDefaultSelect (#165 方案 3)", () => {
       defaultChecked: false,
     });
     // primaryMode 不为 null（为 overwrite），严禁自动勾选，避免意外触发正文覆盖
+    expect(shouldDefaultSelect(divergeGroup, true)).toBe(false);
+  });
+
+  it("偏好开启时：取消归档项绝不预选（即使 autoArchive 开启、无正文模式）", () => {
+    const pureUnarchive = group({
+      archiveAction: "unarchive",
+      previewToken: "tok-1",
+      availableModes: [],
+      defaultChecked: false,
+    });
+    expect(shouldDefaultSelect(pureUnarchive, true)).toBe(false);
+    expect(shouldDefaultSelect(pureUnarchive, false)).toBe(false);
+  });
+
+  it("偏好开启时：正文快进附带取消归档时沿用自身 defaultChecked", () => {
+    const ff = group({
+      availableModes: ["fastForward"],
+      archiveAction: "unarchive",
+      previewToken: "tok-1",
+      defaultChecked: true,
+    });
+    expect(shouldDefaultSelect(ff, true)).toBe(true);
+  });
+
+  it("防覆盖铁律：Diverge 冲突项附带 unarchive 时同样绝不自动预选", () => {
+    const divergeGroup = group({
+      verdict: "diverge",
+      availableModes: ["overwrite"],
+      archiveAction: "unarchive",
+      previewToken: "tok-1",
+      defaultChecked: false,
+    });
     expect(shouldDefaultSelect(divergeGroup, true)).toBe(false);
   });
 

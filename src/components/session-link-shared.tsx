@@ -93,31 +93,59 @@ export function primaryMode(group: SessionLinkPreviewGroup): SessionSyncMode | n
   return group.availableModes.length > 0 ? group.availableModes[0] : null;
 }
 
-/** 仅同步归档：`archiveAction` 由后端给出，不随用户勾选变化。 */
+/**
+ * 归档动作方向：后端一次只给一个值。
+ *
+ * 数据异常同时出现两种取值时按「归档」优先——文案与默认勾选都不能因为脏数据打架。
+ */
+type ArchiveDirection = "archive" | "unarchive";
+
+function archiveDirection(group: SessionLinkPreviewGroup): ArchiveDirection | null {
+  if (group.archiveAction === "statusOnly") return "archive";
+  if (group.archiveAction === "unarchive") return "unarchive";
+  return null;
+}
+
+/** 仅同步归档：源已归档 → 目标归档。`archiveAction` 由后端给出，不随用户勾选变化。 */
 export function archiveOnly(group: SessionLinkPreviewGroup): boolean {
-  return group.archiveAction === "statusOnly";
+  return archiveDirection(group) === "archive";
+}
+
+/** 仅取消归档：源已恢复 → 目标取消归档。方向同样由后端给出。 */
+export function unarchiveOnly(group: SessionLinkPreviewGroup): boolean {
+  return archiveDirection(group) === "unarchive";
 }
 
 /**
- * 该项能否勾选：有正文写入模式，或后端授权了仅同步归档（须带预览凭据）。
+ * 该项能否勾选：有正文写入模式，或后端授权了仅同步状态（归档 / 取消归档，须带预览凭据）。
  *
- * 只归档项的 `availableModes` 为空，必须靠 `archiveAction` 放行，否则内容一致的
- * 会话永远传导不到归档状态。
+ * 纯状态项的 `availableModes` 为空，必须靠 `archiveAction` 放行，否则内容一致的
+ * 会话永远传导不到目标的归档状态。
  */
 export function isActionable(group: SessionLinkPreviewGroup): boolean {
   if (!group.previewToken) return false;
-  return primaryMode(group) !== null || archiveOnly(group);
+  return primaryMode(group) !== null || archiveDirection(group) !== null;
 }
 
 /**
- * 全选口径：正文可快进，或仅同步归档。
+ * 全选口径：正文可快进，或仅同步归档（把目标收起来）。
  *
  * 纯归档项必须进全选——它没有正文模式，逐条勾选在批量归档（一次上百个）时不可用，
- * 导致源账号已归档的会话在目标账号里一直显示为进行中。覆盖（overwrite）仍排除在外：
- * 那是唯一会改写目标正文的动作，必须逐条显式授权。
+ * 导致源账号的归档状态在目标账号里一直对不上。
+ *
+ * 两个动作排除在外，都必须逐条显式授权：
+ * - 覆盖（overwrite）：唯一会改写目标正文的动作；
+ * - 取消归档（unarchive）：会把大量历史会话一次性放回目标账号主列表，事后难复原。
  */
 export function isDirectlySyncable(group: SessionLinkPreviewGroup): boolean {
-  return isActionable(group) && primaryMode(group) !== "overwrite";
+  // 取消归档会让目标账号的主列表一次性涌入大量历史会话（updatedAt 全被顶到最近），
+  // 事后很难逐条恢复归档；按「影响面大的动作逐条授权」处理，与 overwrite 同侧：
+  // 它可勾选，但不进全选。
+  return (
+    isActionable(group) &&
+    primaryMode(group) !== "overwrite" &&
+    !unarchiveOnly(group)
+  );
 }
 
 /**
@@ -130,6 +158,7 @@ export function isDirectlySyncable(group: SessionLinkPreviewGroup): boolean {
  *    - 用户开启了自动同步归档偏好（autoArchive），且该项为纯归档项（具备 archiveAction 且 primaryMode === null）。
  *
  * 绝对边界：Diverge（覆盖模式，primaryMode === "overwrite"）无论是否具备归档资格，绝不自动预选！
+ * 取消归档（unarchive）同样绝不预选：源账号刚恢复，不代表目标账号也该跟着解档。
  */
 export function shouldDefaultSelect(
   group: SessionLinkPreviewGroup,
@@ -153,11 +182,12 @@ export function buildSelections(
   return groups.flatMap((group) => {
     if (!checked.has(group.groupId)) return [];
     if (!group.previewToken) return [];
-    // 正文模式优先：有正文写入就提交该模式，归档作为它的副作用一并由后端处理。
+    // 正文模式优先：有正文写入就提交该模式，归档状态作为它的副作用一并由后端处理。
     const mode = primaryMode(group);
     if (mode) return [{ groupId: group.groupId, previewToken: group.previewToken, mode }];
-    // 没有正文模式时，仅同步归档才是可提交的独立动作。
-    if (archiveOnly(group)) {
+    // 没有正文模式时，仅同步状态（归档 / 取消归档）是可提交的独立动作；
+    // 方向已由预览凭据绑定，提交口只有一个 statusOnly，前端不额外传方向。
+    if (archiveDirection(group) !== null) {
       return [
         { groupId: group.groupId, previewToken: group.previewToken, mode: "statusOnly" as const },
       ];
@@ -166,15 +196,22 @@ export function buildSelections(
   });
 }
 
+/** 两个归档方向在文案里的说法：独立动作说「同步归档」，顺带动作说「一并归档」。 */
+const ARCHIVE_SENTENCE: Record<ArchiveDirection, { only: string; along: string }> = {
+  archive: { only: "仅同步归档，保留正文", along: "目标会话一并归档" },
+  unarchive: { only: "仅取消归档，保留正文", along: "目标会话一并取消归档" },
+};
+
 /** 卡片摘要句：一句人话说清发生了什么；条数与原始原因收进「查看详情」。 */
 export function summarySentence(group: SessionLinkPreviewGroup, targetLabel: string): string {
-  // 只归档项：正文判定会说「无需同步/本次不同步」，但本次确实要改状态，必须说清。
-  if (archiveOnly(group) && primaryMode(group) === null) {
-    return "仅同步归档，保留正文";
+  const direction = archiveDirection(group);
+  // 纯状态项：正文判定会说「无需同步/本次不同步」，但本次确实要改状态，必须说清。
+  if (direction && primaryMode(group) === null) {
+    return ARCHIVE_SENTENCE[direction].only;
   }
   const base = bodySummarySentence(group, targetLabel);
-  // 正文同步附带归档时，在正文句之后补一句，避免用户以为只同步了正文。
-  return archiveOnly(group) ? `${base}，目标会话一并归档` : base;
+  // 正文同步附带改状态时，在正文句之后补一句，避免用户以为只同步了正文。
+  return direction ? `${base}，${ARCHIVE_SENTENCE[direction].along}` : base;
 }
 
 /** 纯按正文判定给出的摘要句（不含归档补充）。 */
