@@ -316,17 +316,14 @@ export default function DataMigrationCard() {
       void refreshAccounts();
       void loadGroups();
     } catch (e) {
-      // 后端失败文案自带「已回滚 / 备份目录」，整条原样展示，别截断。
+      // core 的失败文案自带「已回滚 / 备份目录」，一字不改放进 description：
+      // 标题只做分类（与导出、与全仓其它 toast 的约定一致），绝对路径也不会把标题挤成两三行。
       const message = api.asError(e);
       // 413 时 axum 回的是 text/plain，`httpCall` 的 `res.json()` 解析失败只剩状态码，
       // 所以实际能命中的是「请求失败 (413)」这一句。
       const tooLarge = /\(413\)|length limit exceeded|payload too large|body limit/i.test(message);
-      toast.error(
-        tooLarge
-          ? `${message} —— 备份包过大，无法上传，请减少导出时勾选的分组后重试。`
-          : message,
-        { duration: 15_000 },
-      );
+      const hint = tooLarge ? " —— 备份包过大，无法上传，请减少导出时勾选的分组后重试。" : "";
+      toast.error("导入失败", { description: `${message}${hint}`, duration: 15_000 });
     } finally {
       setImporting(false);
     }

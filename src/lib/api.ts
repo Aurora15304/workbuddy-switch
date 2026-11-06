@@ -262,6 +262,10 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    // 413 是 Axum 的 body 上限（不是我们的业务错误），原文只有 "length limit exceeded"。
+    if (res.status === 413) {
+      throw new Error("数据量超过服务端上限（约 96 MB），请减少勾选后重试，或改用桌面端导入");
+    }
     throw new Error(data.message || data.error || `请求失败 (${res.status})`);
   }
   return data as T;
