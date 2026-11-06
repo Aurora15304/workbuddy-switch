@@ -10,6 +10,7 @@ pub mod codebuddy_ide_session_sync;
 pub mod config;
 pub mod credit_usage;
 pub mod credits;
+pub mod daily_chat;
 pub mod error_log;
 pub mod experts;
 pub mod export_import;

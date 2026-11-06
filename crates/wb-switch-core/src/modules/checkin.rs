@@ -715,22 +715,32 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
     if cfg.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
         return json!({"status": "disabled"});
     }
-    let accounts = auto_checkin_accounts(load_accounts(), &cfg);
-    if accounts.is_empty() {
+    let eligible = auto_checkin_accounts(load_accounts(), &cfg);
+    if eligible.is_empty() {
         return json!({"status": "no_accounts"});
     }
+    // 日常对话与签到窗口无关：只要今天还没发过就先发掉，避免「白天手动签过之后
+    // 定时轮次再也不处理这个账号」导致活跃地图漏记录。
+    let chat = maybe_daily_chat(&eligible, &cfg).await;
     let window = window_minutes(&cfg);
     // 窗口未生效时，不再按时间过滤允许自动签到的账号。
     let accounts = match window {
-        Some(win) => due_accounts(accounts, now_ms(), Some(win), &load_checkin_logs()),
-        None => accounts,
+        Some(win) => due_accounts(eligible, now_ms(), Some(win), &load_checkin_logs()),
+        None => eligible,
     };
     if accounts.is_empty() {
-        // 只有时间段生效时才可能为空：整轮没有任何账号到点，不发任何请求。
+        // 只有时间段生效时才可能为空：整轮没有任何账号到点，不发任何签到请求。
         record_cycle_health(false);
-        return json!({"status": "skipped", "reason": "before_checkin_time", "accounts": []});
+        let mut skipped = json!({"status": "skipped", "reason": "before_checkin_time", "accounts": []});
+        if let Some(chat) = chat {
+            skipped["chat"] = chat;
+        }
+        return skipped;
     }
     let mut summary = json!({"status": "ok", "accounts": []});
+    if let Some(chat) = chat {
+        summary["chat"] = chat;
+    }
     let mut had_errors = false;
     for (index, acc) in accounts.into_iter().enumerate() {
         // 账号之间拉开 3–8 秒：零间隔串行连发是典型的自动化指纹（#199）。
@@ -877,7 +887,31 @@ pub async fn run_checkin_all(variant: Option<WbVariant>, respect_window: bool) -
     if let Some(rows) = manual_window_skip_rows(&accounts, &cfg, respect_window, now_ms()) {
         return json!({"accounts": rows, "status": "skipped", "reason": "outside_checkin_window"});
     }
-    json!({"accounts": checkin_all_rows(accounts, &cfg).await})
+    let rows = checkin_all_rows(accounts.clone(), &cfg).await;
+    let mut summary = json!({"accounts": rows});
+    if let Some(chat) = maybe_daily_chat(&accounts, &cfg).await {
+        summary["chat"] = chat;
+    }
+    summary
+}
+
+/// 签到后是否要顺手发「日常对话」，以及给谁发。
+///
+/// 与自动签到同一批账号（国内版、未被排除）：活跃地图要求「当天完成一次对话」，
+/// 光签到不计数。开关关闭时返回 None，一个请求都不发。
+async fn maybe_daily_chat(accounts: &[Value], cfg: &Value) -> Option<Value> {
+    if cfg.get("chat_on_checkin").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let targets: Vec<Value> = accounts
+        .iter()
+        .filter(|account| allows_auto_checkin(account, cfg))
+        .cloned()
+        .collect();
+    if targets.is_empty() {
+        return None;
+    }
+    Some(crate::modules::daily_chat::ensure_sent_today(targets).await)
 }
 
 /// 批量签到的逐账号结果行；被排除账号不 poll 操作，因此不会发起任何请求。

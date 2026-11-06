@@ -990,6 +990,8 @@ export function checkin(accountId: string): Promise<CheckinResult> {
  */
 export function checkinAll(variant?: WbVariant, respectWindow?: boolean): Promise<{
   accounts: { accountId: string; email: string; result: string; error?: string; inactive?: boolean; reason?: string }[];
+  /** 签到后补发的「日常对话」汇总；开关关闭或没有可发账号时不返回。 */
+  chat?: { sent: number; skipped: number; failed: number };
   status?: string;
   reason?: string;
 }> {

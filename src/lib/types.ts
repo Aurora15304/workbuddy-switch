@@ -574,6 +574,11 @@ export interface CheckinConfig {
   end_hour?: number;
   keepalive_days: number;
   lazy_refresh_hours: number;
+  /**
+   * 签到后给每个账号发一条随机对话（点亮额度活跃地图）。
+   * 老配置缺这个键时按开启处理，与后端默认一致。
+   */
+  chat_on_checkin?: boolean;
 }
 
 export interface CheckinLog {

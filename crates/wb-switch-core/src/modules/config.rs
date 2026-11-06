@@ -305,6 +305,8 @@ fn checkin_config_with_enabled(enabled: bool) -> Value {
         "end_hour": 12,
         "keepalive_days": 0,
         "lazy_refresh_hours": 24,
+        // 签到后给每个账号发一条随机对话，用于点亮月活跃地图（服务端要求当天完成一次对话）。
+        "chat_on_checkin": true,
     })
 }
 
@@ -334,6 +336,10 @@ fn apply_checkin_config(merged: &mut Value, input: &Value) {
     };
     if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
         merged["enabled"] = json!(enabled);
+    }
+    // 签到后自动发对话：老配置没这个键时沿用默认值，不会被静默关掉。
+    if let Some(chat) = map.get("chat_on_checkin").and_then(Value::as_bool) {
+        merged["chat_on_checkin"] = json!(chat);
     }
     // 仅用稳定账号 id 排除自动签到；忽略无效项并去重，旧配置默认全部参与。
     if let Some(ids) = map.get("excluded_account_ids").and_then(Value::as_array) {

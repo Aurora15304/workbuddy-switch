@@ -473,6 +473,19 @@ function AutoCheckinCard() {
     enqueueCheckinSave({ enabled }, { title: enabled ? "自动签到已开启" : "自动签到已关闭" });
   }
 
+  /** 签到后自动发对话：拨动即落盘，失败回滚到上一份已确认配置。 */
+  function onToggleChatOnCheckin(chat: boolean) {
+    const current = draftRef.current;
+    if (!current) return;
+    updateCfg({ ...current, chat_on_checkin: chat });
+    enqueueCheckinSave(
+      { chat_on_checkin: chat },
+      {
+        title: chat ? "已开启：签到后自动发对话" : "已关闭：签到后不再自动发对话",
+      },
+    );
+  }
+
   /** 数字参数：失焦 / 回车提交；空值回退原值，越界收敛，与落盘值相同则不发请求。 */
   function onNumberCommit(key: CheckinNumberKey, raw: string) {
     const current = draftRef.current;
@@ -559,7 +572,9 @@ function AutoCheckinCard() {
         .filter((a) => a.result === "error")
         .map((a) => `${a.email}（${a.error}）`)
         .join("；");
-      const text = `签到完成：成功 ${ok}，已签 ${already}，失败 ${err}，已忽略 ${skipped} 个关闭自动签到的账号${detail ? `。${detail}` : ""}`;
+      const chatSent = res.chat?.sent ?? 0;
+      const chatNote = chatSent > 0 ? `，已发对话 ${chatSent} 个` : "";
+      const text = `签到完成：成功 ${ok}，已签 ${already}，失败 ${err}，已忽略 ${skipped} 个关闭自动签到的账号${chatNote}${detail ? `。${detail}` : ""}`;
       const allFailed = res.accounts.length > 0 && err === res.accounts.length;
       const allSkippedOrUnavailable =
         res.accounts.length === 0 || (ok === 0 && already === 0 && err === 0);
@@ -689,6 +704,20 @@ function AutoCheckinCard() {
                         <p className="text-xs leading-4 text-amber-600">{windowIssue}</p>
                       )}
                     </div>
+                  </SettingsFieldRow>
+
+                  <SettingsFieldRow
+                    className={PANEL_ROW}
+                    label="签到后自动发一条对话"
+                    description="让每个账号当天完成一次对话，点亮「额度活跃地图」；每号每天最多一条，内容随机"
+                  >
+                    <DemoAction>
+                      <Switch
+                        aria-label="签到后自动发一条对话"
+                        checked={cfg.chat_on_checkin !== false}
+                        onCheckedChange={onToggleChatOnCheckin}
+                      />
+                    </DemoAction>
                   </SettingsFieldRow>
 
                   <NumberSettingRow

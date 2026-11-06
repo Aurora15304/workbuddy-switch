@@ -690,6 +690,8 @@ export default function AccountsPage() {
           if (failed > 0) parts.push(`${failed} 个失败`);
           if (skipped > 0) parts.push(`已忽略 ${skipped} 个关闭自动签到的账号`);
           if (outsideWindow > 0) parts.push(`${outsideWindow} 个未到签到时间段`);
+          const chatSent = res.chat?.sent ?? 0;
+          if (chatSent > 0) parts.push(`已发对话 ${chatSent} 个`);
           summary = res.status === "skipped" && res.reason === "already_running"
             ? "签到任务正在进行，本次仅刷新积分"
             : parts.length > 0 ? parts.join("，") : "无账号需要签到";
