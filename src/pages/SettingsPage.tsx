@@ -57,6 +57,7 @@ import { changeCompanionEnabled, reloadCompanionEnabled, useCompanionEnabled } f
 import { cn } from "@/lib/utils";
 import { accountVariant, variantSupportsCheckin, variantSupportsTravel, variantUsesIntlCodebuddyIde } from "@/lib/variant";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
+import DataMigrationCard from "@/components/data-migration-card";
 import { DemoAction } from "@/components/demo-action";
 import { CodeBuddyAiIdeMark, CodeBuddyCnIdeMark, CodeBuddyMark, JetbrainsMark, VscodeExtMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import { useAccountsStore } from "@/stores/accounts";
@@ -1329,6 +1330,8 @@ function UpdateCard() {
   const [restarting, setRestarting] = useState(false);
   const [githubConfig, setGithubConfig] = useState<GithubConfig>({});
   const [proxyUrl, setProxyUrl] = useState("");
+  // 显式代理默认关闭：只有用户自己打开才参与更新请求。
+  const [proxyEnabled, setProxyEnabled] = useState(false);
   const [proxySaving, setProxySaving] = useState(false);
 
   useEffect(() => {
@@ -1339,6 +1342,7 @@ function UpdateCard() {
         if (cancelled) return;
         setGithubConfig(config);
         setProxyUrl(config.proxy ?? "");
+        setProxyEnabled(config.proxy_enabled ?? false);
       })
       .catch((e) => {
         if (!cancelled) toast.error("更新配置加载失败", { description: api.asError(e) });
@@ -1351,7 +1355,8 @@ function UpdateCard() {
   async function check() {
     setChecking(true);
     try {
-      const r = await api.checkUpdate(proxyUrl, true);
+      // 用已保存的地址：输入框里的草稿还没落盘，不该影响这次检查。
+      const r = await api.checkUpdate(proxyEnabled ? (githubConfig.proxy ?? "") : "", true);
       setInfo(r);
       if (!r.ok) {
         toast.error("检查更新失败", { description: r.message || r.error });
@@ -1374,31 +1379,62 @@ function UpdateCard() {
     }
   }
 
-  async function saveProxy() {
-    const value = proxyUrl.trim();
-    if (value) {
-      try {
-        const parsed = new URL(value);
-        if (!parsed.hostname || !["http:", "https:"].includes(parsed.protocol)) {
-          throw new Error("unsupported proxy protocol");
-        }
-      } catch {
-        toast.error("代理地址格式不正确，请填写 HTTP/HTTPS 地址，例如 http://127.0.0.1:7897");
-        return;
-      }
+  /** 代理地址格式校验：只接受 http/https，且必须带主机名。 */
+  function proxyLooksValid(value: string): boolean {
+    try {
+      const parsed = new URL(value);
+      return Boolean(parsed.hostname) && ["http:", "https:"].includes(parsed.protocol);
+    } catch {
+      return false;
     }
+  }
 
+  async function persistProxy(nextProxy: string, nextEnabled: boolean, successText: string) {
+    if (proxySaving) return;
     setProxySaving(true);
     try {
-      const saved = await api.saveGithubConfig({ ...githubConfig, proxy: value });
+      const saved = await api.saveGithubConfig({
+        ...githubConfig,
+        proxy: nextProxy,
+        proxy_enabled: nextEnabled,
+      });
       setGithubConfig(saved);
       setProxyUrl(saved.proxy ?? "");
-      toast.success(value ? "更新代理已保存" : "已关闭更新代理");
+      setProxyEnabled(saved.proxy_enabled ?? false);
+      toast.success(successText);
     } catch (e) {
       toast.error("保存代理失败", { description: api.asError(e) });
     } finally {
       setProxySaving(false);
     }
+  }
+
+  /** 开关即落盘：打开前必须先有合法地址，否则保持关闭。 */
+  async function onToggleProxyEnabled(next: boolean) {
+    if (!next) {
+      await persistProxy(proxyUrl.trim(), false, "已关闭更新代理");
+      return;
+    }
+    const value = proxyUrl.trim();
+    if (!value) {
+      toast.error("请先填写代理地址，再开启代理");
+      return;
+    }
+    if (!proxyLooksValid(value)) {
+      toast.error("代理地址格式不正确，请填写 HTTP/HTTPS 地址，例如 http://127.0.0.1:7897");
+      return;
+    }
+    await persistProxy(value, true, "已启用更新代理");
+  }
+
+  async function saveProxy() {
+    const value = proxyUrl.trim();
+    if (value && !proxyLooksValid(value)) {
+      toast.error("代理地址格式不正确，请填写 HTTP/HTTPS 地址，例如 http://127.0.0.1:7897");
+      return;
+    }
+    // 清空地址等于关闭代理，避免留下「开着但没有地址」的悬空状态。
+    await persistProxy(value, value ? proxyEnabled : false, value ? "更新代理已保存" : "已清空代理地址");
   }
 
   return (
@@ -1427,8 +1463,25 @@ function UpdateCard() {
         </div>
 
         <SettingsFieldRow
+          label="启用更新代理"
+          description="默认关闭。只影响访问 github.com 的更新请求；镜像下载始终直连，不受系统代理干扰。"
+          htmlFor="update-proxy-enabled"
+          className="bg-muted/25"
+        >
+          <DemoAction>
+            <Switch
+              id="update-proxy-enabled"
+              aria-label="启用更新代理"
+              checked={proxyEnabled}
+              onCheckedChange={(next) => void onToggleProxyEnabled(next)}
+              disabled={proxySaving}
+            />
+          </DemoAction>
+        </SettingsFieldRow>
+
+        <SettingsFieldRow
           label="更新代理地址"
-          description="仅用于 GitHub 更新检查和安装包下载；留空表示关闭显式代理。"
+          description={proxyEnabled ? "已启用：更新请求会走这个代理。" : "未启用：地址仅保存备用，不参与任何请求。"}
           htmlFor="update-proxy"
           className="bg-muted/25"
           operational
@@ -1447,7 +1500,7 @@ function UpdateCard() {
         <div className="flex flex-wrap gap-2 border-b border-border/60 bg-muted/25 px-4 py-3 sm:px-5">
           <DemoAction><Button size="sm" variant="outline" onClick={() => void saveProxy()} disabled={proxySaving}>
             {proxySaving ? <Loader2 className="animate-spin" /> : <Save />}
-            保存代理
+            保存代理地址
           </Button></DemoAction>
         </div>
 
@@ -2155,6 +2208,7 @@ export default function SettingsPage() {
         <RateLimitCard />
         {api.isDesktop() && !api.isDemoMode() ? <CompanionCard /> : null}
         {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
+        {api.isDemoMode() ? null : <DataMigrationCard />}
         <NotificationHistoryCard />
         <ErrorLogCard />
         {api.isWebui() && !api.isDemoMode() ? null : <UpdateCard />}

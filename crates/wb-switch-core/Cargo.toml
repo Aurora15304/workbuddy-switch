@@ -24,6 +24,13 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 # 与跨版本都不稳定，无法作为持久化内容身份。
 sha2 = "0.10"
 
+# 整包导出/导入（备份迁移）用 zip。Cargo.lock 里已有 zip 4.6.1 与 flate2 1.1.9，
+# 这里只打开 deflate 压缩 + flate2 的纯 Rust 后端（miniz_oxide）：不引入 C 依赖、
+# 也不新增压缩实现。zip 的 `deflate` 特性会连带 zopfli / zlib-rs（lock 里没有），
+# 故用 `deflate-flate2` 并在本 crate 显式指定 flate2 后端，保证 feature 合并后有实现。
+zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 # CodeBuddy CN IDE Safe Storage (state.vscdb secret inject)
 aes = "0.8"
 cbc = "0.1"

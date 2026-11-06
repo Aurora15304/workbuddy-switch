@@ -398,30 +398,55 @@ pub async fn chat_for_request_id_public(
 /// 成长任务的默认开场白：短、确定、模型一句话就能答完，省额度。
 const DEFAULT_CHAT_PROMPT: &str = "1+1等于几？直接回答。";
 
+/// 成长任务沿用的通用模型。
+const GROWTH_CHAT_MODEL: &str = "fast-model";
+
+/// 日常对话（签到后补的那条）用的模型：Hy3 当前限时免费，消耗倍率 0.00x。
+pub const DAILY_CHAT_MODEL: &str = "hy3";
+
+/// 免费模型下线 / 被拒时的兜底模型，保证签到流程不受影响。
+const FALLBACK_CHAT_MODEL: &str = GROWTH_CHAT_MODEL;
+
 /// 发一次真实对话，从 SSE 流里取服务端返回的 requestId。
 ///
 /// 专家类任务的事件必须携带**服务端返回的真实 id**——自造 UUID 服务端不计数，
 /// 所以这里必须真发一次请求。
 async fn chat_for_request_id(account: &Value, expert_id: &str) -> Result<(String, String), String> {
-    chat_with_prompt_inner(account, expert_id, DEFAULT_CHAT_PROMPT).await
+    chat_with_prompt_inner(account, expert_id, DEFAULT_CHAT_PROMPT, GROWTH_CHAT_MODEL).await
 }
 
 /// 用指定开场白发一次真实对话（签到后的「日常对话」走这里）。
+///
+/// 默认走限时免费的 [`DAILY_CHAT_MODEL`]；服务端不认这个模型时退回通用模型，
+/// 只降级一次，不会无限重试。
 pub async fn chat_with_prompt(
     account: &Value,
     prompt: &str,
 ) -> Result<(String, String), String> {
-    chat_with_prompt_inner(account, "", prompt).await
+    match chat_with_prompt_inner(account, "", prompt, DAILY_CHAT_MODEL).await {
+        Ok(outcome) => Ok(outcome),
+        Err(error) if model_rejected(&error) => {
+            eprintln!("[日常对话] 模型 {DAILY_CHAT_MODEL} 不可用（{error}），改用 {FALLBACK_CHAT_MODEL}");
+            chat_with_prompt_inner(account, "", prompt, FALLBACK_CHAT_MODEL).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// 400/422 才视为「模型不被接受」；401/429/5xx 换模型也没用，直接返回原错误。
+fn model_rejected(error: &str) -> bool {
+    error.contains("HTTP 400") || error.contains("HTTP 422")
 }
 
 async fn chat_with_prompt_inner(
     account: &Value,
     expert_id: &str,
     prompt: &str,
+    model: &str,
 ) -> Result<(String, String), String> {
     let conversation_id = new_conversation_id();
     let body = json!({
-        "model": "fast-model",
+        "model": model,
         "messages": [
             {"role": "system", "content": "You are a helpful assistant. 当前处于中文环境，使用简体中文回答。"},
             {"role": "user", "content": prompt}
@@ -1807,6 +1832,22 @@ mod tests {
         assert_eq!(expert_id_from_jump_url(""), None);
         // 非 ex_ 前缀不算专家 id。
         assert_eq!(expert_id_from_jump_url("https://x/?expertId=abc"), None);
+    }
+
+    #[test]
+    fn model_fallback_only_triggers_on_rejection_statuses() {
+        assert!(model_rejected("对话失败（HTTP 400）：model not found"));
+        assert!(model_rejected("对话失败（HTTP 422）：invalid model"));
+        // 换模型解决不了的问题：直接返回原错误，别白烧一次请求。
+        assert!(!model_rejected("对话失败（HTTP 401）：unauthorized"));
+        assert!(!model_rejected("对话失败（HTTP 429）：rate limited"));
+        assert!(!model_rejected("对话失败（HTTP 500）：server error"));
+        assert!(!model_rejected("连接失败：dns error"));
+    }
+
+    #[test]
+    fn daily_chat_uses_free_model() {
+        assert_eq!(DAILY_CHAT_MODEL, "hy3");
     }
 
     #[test]

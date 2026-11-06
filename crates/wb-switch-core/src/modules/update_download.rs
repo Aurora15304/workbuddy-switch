@@ -6,7 +6,8 @@
 //! 再把同一份字节交给 `install`，安装语义与插件完全一致。
 //!
 //! 三层保障：
-//! 1. **镜像优先**：前缀改写 GitHub 下载地址，直连放最后兜底；
+//! 1. **镜像优先**：前缀改写 GitHub 下载地址，直连放最后兜底；镜像请求显式
+//!    `no_proxy`，不受系统代理影响（否则会被带去海外节点，比直连还慢）；
 //! 2. **分段并发**：4 路 Range 请求并行拉取，按「空闲超时」而不是总超时判死，
 //!    避免慢速但可用的线路被误杀；
 //! 3. **签名兜底**：任何一个镜像返回脏数据 / 半截文件，都会在验签这步被拒，
@@ -35,8 +36,11 @@ pub const SEGMENT_CONNECTIONS: usize = 4;
 /// 小于这个体积不值得分段（小文件握手开销比并发收益大）。
 const MIN_SEGMENT_BYTES: u64 = 1 << 20;
 
-/// 建连超时。镜像或代理不可达时快速失败，别让用户干等。
+/// 建连超时。走代理时不可达要快速失败，别让用户干等。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 镜像直连的建连超时（更短：镜像不通就马上换下一个候选）。
+const MIRROR_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// 空闲超时：连续这么久没收到任何字节就判定这条线路已死。
 /// 用「空闲」而不是「总时长」，慢速线路才能跑完（8.5 MB 走 50 KB/s 需要近 3 分钟）。
@@ -46,7 +50,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const SEGMENT_RETRIES: usize = 2;
 
 /// 探测请求（`Range: bytes=0-0`）的超时。
-const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 把 GitHub 下载地址改写成镜像地址；前缀为空时原样返回。
 pub fn mirror_url(url: &str, prefix: &str) -> String {
@@ -128,11 +132,16 @@ fn describe(error: &dyn std::error::Error) -> String {
     text
 }
 
-fn build_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
+fn build_client(proxy: Option<&str>, direct: bool) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .user_agent(DEFAULT_HTTP_USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT);
-    if let Some(proxy) = proxy.map(str::trim).filter(|value| !value.is_empty()) {
+    if direct {
+        // 镜像站强制直连：系统代理会把镜像流量带去海外节点，实测能把
+        // 6.7 MB/s 拖到 25 秒零字节。镜像本来就该绕开代理。
+        // 连接超时也收短：镜像被墙时要快点落到下一个候选，而不是干等 15 秒。
+        builder = builder.no_proxy().connect_timeout(MIRROR_CONNECT_TIMEOUT);
+    } else if let Some(proxy) = proxy.map(str::trim).filter(|value| !value.is_empty()) {
         builder = builder.proxy(
             reqwest::Proxy::all(proxy).map_err(|error| format!("更新代理地址无效：{error}"))?,
         );
@@ -140,6 +149,17 @@ fn build_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
     builder
         .build()
         .map_err(|error| format!("初始化下载器失败：{error}"))
+}
+
+/// 是否是我们内置的镜像地址。
+///
+/// 只有**已知镜像**才强制直连：自定义更新源（第三方自建 CDN）在必须走代理的
+/// 网络里还得靠代理，不能因为「不是 github.com」就把它绕过去。
+pub fn is_mirror_url(url: &str) -> bool {
+    MIRROR_PREFIXES.iter().any(|prefix| {
+        url.strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 struct Probe {
@@ -183,7 +203,7 @@ pub async fn fetch(
     proxy: Option<&str>,
     progress: Progress,
 ) -> Result<Vec<u8>, String> {
-    let client = build_client(proxy)?;
+    let client = build_client(proxy, is_mirror_url(url))?;
     let probe = probe(&client, url).await?;
     let total = probe.total;
     let use_segments =
@@ -372,6 +392,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_known_mirrors_bypass_the_proxy() {
+        assert!(is_mirror_url(
+            "https://gh-proxy.com/https://github.com/o/r/releases/download/a.exe"
+        ));
+        assert!(is_mirror_url(
+            "https://ghproxy.net/https://github.com/o/r/releases/download/a.exe"
+        ));
+        // GitHub 直连与第三方自建源都保留系统/显式代理。
+        assert!(!is_mirror_url(
+            "https://github.com/o/r/releases/download/a.exe"
+        ));
+        assert!(!is_mirror_url("https://cdn.example.com/wb-switch/a.exe"));
+    }
+
+    #[test]
+    fn build_client_accepts_empty_and_direct_modes() {
+        assert!(build_client(None, false).is_ok());
+        assert!(build_client(Some("http://127.0.0.1:7897"), false).is_ok());
+        // 直连模式会忽略代理参数：镜像永远不该被系统代理接管。
+        assert!(build_client(Some("http://127.0.0.1:7897"), true).is_ok());
+    }
+
+    #[test]
     fn mirror_url_trims_trailing_slash_and_keeps_original_on_empty_prefix() {
         assert_eq!(
             mirror_url("https://github.com/o/r/releases/download/a.exe", "https://gh-proxy.com/"),
@@ -541,11 +584,9 @@ mod tests {
         mode: RangeMode,
         range_requests: &AtomicU64,
     ) {
-        use std::io::{Read, Write};
+        use std::io::Write;
 
-        let mut buffer = [0u8; 4096];
-        let read = stream.read(&mut buffer).unwrap_or(0);
-        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let request = read_request_head(stream);
         let range = match mode {
             RangeMode::Ignore => None,
             RangeMode::Honest => parse_request_range(&request),
@@ -581,6 +622,28 @@ mod tests {
         };
         let _ = stream.write_all(&response);
         let _ = stream.flush();
+    }
+
+    /// 读到空行为止：请求头可能被拆成多个 TCP 段，只读一次会漏掉 `Range`。
+    fn read_request_head(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut buffer = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if buffer.windows(4).any(|window| window == b"\r\n\r\n") || buffer.len() >= 8192 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buffer).to_string()
     }
 
     fn parse_request_range(request: &str) -> Option<(u64, u64)> {
@@ -637,5 +700,45 @@ mod tests {
             .await
             .expect("分段失败后应该退回单连接");
         assert_eq!(downloaded, body);
+    }
+
+    /// 真机自检（默认不跑）：镜像下载必须无视系统代理。
+    ///
+    /// ```text
+    /// cargo test -p wb-switch-core --lib live_mirror_ignores_system_proxy -- --ignored --test-threads=1
+    /// ```
+    ///
+    /// 它会把进程代理指到一个死端口，所以必须单线程跑——别和别的用例并行。
+    /// 通过即证明 `.no_proxy()` 生效：系统代理开着（或被墙）也不会拖垮镜像下载。
+    #[tokio::test]
+    #[ignore]
+    async fn live_mirror_ignores_system_proxy() {
+        const KEYS: [&str; 6] = [
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "ALL_PROXY",
+            "https_proxy",
+            "http_proxy",
+            "all_proxy",
+        ];
+        let url = "https://gh-proxy.com/https://github.com/Binbin-miao/workbuddy-switch-binbinbin/releases/latest/download/latest.json";
+        let previous: Vec<(&str, Option<std::ffi::OsString>)> =
+            KEYS.iter().map(|key| (*key, std::env::var_os(key))).collect();
+        for key in KEYS {
+            std::env::set_var(key, "http://127.0.0.1:1");
+        }
+        let progress: Progress = Arc::new(|_, _| {});
+        let result = fetch(url, None, progress).await;
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let body = result.expect("镜像应当绕开系统代理直连成功");
+        assert!(
+            String::from_utf8_lossy(&body).contains("version"),
+            "下载内容看起来不是更新清单"
+        );
     }
 }

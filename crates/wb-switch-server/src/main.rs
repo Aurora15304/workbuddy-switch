@@ -4,15 +4,21 @@
 //! workbuddy-switch              # 启动本地服务 + 打开浏览器 webui
 //! workbuddy-switch serve        # 只起服务不开浏览器（--port / --no-open）
 //! workbuddy-switch status       # 终端输出当前账号
+//! workbuddy-switch archive list                          # 各分组的数据量
+//! workbuddy-switch archive export --groups accounts,logs --out ~/bk.zip
+//! workbuddy-switch archive import --in ~/bk.zip
 //! workbuddy-switch version      # 版本号
 //! ```
 
 mod api;
 
+use std::path::{Path, PathBuf};
+
 use serde_json::json;
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, config, process, rotate, travel, update, variant::WbVariant,
+    account, archive, auth_file, checkin, config, process, rotate, travel, update,
+    variant::WbVariant,
 };
 
 fn default_port() -> u16 {
@@ -126,12 +132,121 @@ fn print_status(variant: WbVariant) {
     println!("账号数: {}", account::load_accounts().len());
 }
 
+// ---------------------------------------------------------------------------
+// archive 子命令：整包备份 / 迁移（与 webui、桌面端同一套 core 实现）
+// ---------------------------------------------------------------------------
+
+/// `--key value` / `--key=value` 取值；空值当作没传。
+fn flag_value(args: &[String], key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    args.iter()
+        .enumerate()
+        .find_map(|(index, arg)| {
+            if let Some(value) = arg.strip_prefix(&prefix) {
+                return Some(value.to_string());
+            }
+            arg.eq(key)
+                .then(|| args.get(index + 1).cloned().unwrap_or_default())
+        })
+        .filter(|value| !value.is_empty())
+}
+
+/// `--groups a,b --groups c` 合并成列表；一个都不传 = 全部（core 的语义）。
+fn groups_arg(args: &[String]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        let raw = if let Some(value) = arg.strip_prefix("--groups=") {
+            value.to_string()
+        } else if arg == "--groups" {
+            args.get(index + 1).cloned().unwrap_or_default()
+        } else {
+            continue;
+        };
+        ids.extend(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(String::from),
+        );
+    }
+    ids
+}
+
+fn archive_list() {
+    let groups = archive::groups();
+    if groups.is_empty() {
+        println!("没有可备份的数据分组。");
+        return;
+    }
+    for group in groups {
+        let flag = if group.sensitive {
+            " [含明文凭据]"
+        } else {
+            ""
+        };
+        println!(
+            "{:<9} {:<10} {:>3} 个文件 {:>10} 字节{}",
+            group.id, group.title, group.files, group.bytes, flag
+        );
+    }
+}
+
+fn archive_command(args: &[String]) -> Result<(), String> {
+    match args.get(2).map(String::as_str).unwrap_or("") {
+        "list" => {
+            archive_list();
+            Ok(())
+        }
+        "export" => {
+            let selected = groups_arg(args);
+            let dest = match flag_value(args, "--out") {
+                Some(path) => PathBuf::from(path),
+                // 缺省落在主目录，文件名带日期，和 webui 下载的文件名一致。
+                None => config::home_dir().join(format!(
+                    "wb-switch-backup-{}.zip",
+                    chrono::Local::now().format("%Y%m%d")
+                )),
+            };
+            let outcome = archive::export(&selected, &dest)?;
+            println!(
+                "已导出 {} 个分组 → {}（{} 字节）",
+                outcome.groups.len(),
+                outcome.path,
+                outcome.bytes
+            );
+            Ok(())
+        }
+        "import" => {
+            let path = flag_value(args, "--in").ok_or_else(|| {
+                "缺少 --in 参数：workbuddy-switch archive import --in <归档路径>".to_string()
+            })?;
+            let outcome = archive::import(Path::new(&path), &groups_arg(args))?;
+            println!("已恢复分组：{}", outcome.groups.join(", "));
+            println!(
+                "账号：新增 {} 个，更新 {} 个",
+                outcome.accounts_added, outcome.accounts_updated
+            );
+            println!("导入前的文件已备份到 {}", outcome.backup_dir);
+            Ok(())
+        }
+        other => Err(format!(
+            "未知的 archive 子命令：{other}\n用法：archive list | export [--groups a,b] [--out 路径] | import --in 路径 [--groups a,b]"
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("serve");
     match cmd {
         "status" => print_status(variant_arg(&args)),
+        "archive" => {
+            if let Err(error) = archive_command(&args) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
         "version" | "--version" | "-V" => {
             println!("workbuddy-switch {}", env!("CARGO_PKG_VERSION"));
         }
@@ -195,11 +310,51 @@ fn open_browser(addr: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::variant_arg;
+    use super::{flag_value, groups_arg, variant_arg};
     use wb_switch_core::modules::variant::WbVariant;
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--groups` 支持逗号分隔、多次出现、空值忽略；不传 = 全部（空列表）。
+    #[test]
+    fn archive_groups_flag_merges_and_trims() {
+        assert!(groups_arg(&args(&["archive", "export"])).is_empty());
+        assert_eq!(
+            groups_arg(&args(&["archive", "export", "--groups", "accounts, logs"])),
+            vec!["accounts".to_string(), "logs".to_string()]
+        );
+        assert_eq!(
+            groups_arg(&args(&[
+                "archive", "export", "--groups=accounts", "--groups", "memory,"
+            ])),
+            vec!["accounts".to_string(), "memory".to_string()]
+        );
+        assert!(groups_arg(&args(&["archive", "export", "--groups="])).is_empty());
+    }
+
+    /// `--out` / `--in` 的两种写法都要认，空值当作没传（走缺省）。
+    #[test]
+    fn archive_flag_value_accepts_space_and_equals_forms() {
+        assert_eq!(
+            flag_value(&args(&["archive", "export", "--out", "a.zip"]), "--out"),
+            Some("a.zip".to_string())
+        );
+        assert_eq!(
+            flag_value(&args(&["archive", "export", "--out=b.zip"]), "--out"),
+            Some("b.zip".to_string())
+        );
+        assert_eq!(flag_value(&args(&["archive", "export"]), "--out"), None);
+        assert_eq!(
+            flag_value(&args(&["archive", "export", "--out="]), "--out"),
+            None
+        );
+        assert_eq!(
+            flag_value(&args(&["archive", "export", "--out"]), "--out"),
+            None,
+            "缺少值的尾巴不能被当成路径"
+        );
     }
 
     /// 不传档位时必须仍是国内版（改造前行为）。

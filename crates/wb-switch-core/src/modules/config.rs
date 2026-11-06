@@ -283,14 +283,16 @@ pub fn clear_codebuddy_ide_app_cache() {
 
 /// 默认签到配置。旧时间窗口字段仅为配置文件兼容保留，调度不再读取。
 ///
-/// `enabled` 默认关闭：全新安装需用户在设置页显式开启；已有用户在
-/// [`load_checkin_config`] 中沿用历史默认（开启），升级不改其状态。
+/// `enabled` 默认开启：全新安装装完即可用，不想用的用户在设置页按账号关闭即可。
+/// 显式写入的非布尔值按「关闭」处理（见 [`apply_checkin_config`]）。
 /// `checkin_start` / `checkin_end` 为空串 = 不限制签到时间段（与改动前行为一致）。
 pub fn default_checkin_config() -> Value {
-    checkin_config_with_enabled(false)
+    checkin_config_with_enabled(true)
 }
 
 /// 历史默认签到配置（`enabled: true`）：已有用户没有显式值时沿用。
+///
+/// 与新装默认一致；保留这个函数是为了「已有用户 / 新装」两条判定路径读起来清楚。
 fn legacy_default_checkin_config() -> Value {
     checkin_config_with_enabled(true)
 }
@@ -334,8 +336,10 @@ fn apply_checkin_config(merged: &mut Value, input: &Value) {
     let Some(map) = input.as_object() else {
         return;
     };
-    if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
-        merged["enabled"] = json!(enabled);
+    // 键存在但不是布尔（"no"/0/null）时按**关闭**处理：默认已改成开启，
+    // 这里再 fail-open 会让一个写坏的配置把自动签到打开。
+    if let Some(raw) = map.get("enabled") {
+        merged["enabled"] = json!(raw.as_bool().unwrap_or(false));
     }
     // 签到后自动发对话：老配置没这个键时沿用默认值，不会被静默关掉。
     if let Some(chat) = map.get("chat_on_checkin").and_then(Value::as_bool) {
@@ -572,9 +576,9 @@ pub fn add_checkin_log(entry: &Value) {
 // 派猫猫旅行配置 / 缓存
 // ---------------------------------------------------------------------------
 
-/// 默认自动旅行配置（全新安装默认关闭）。
+/// 默认自动旅行配置：默认开启，与自动签到保持一致。
 pub fn default_travel_config() -> Value {
-    travel_config_with_enabled(false)
+    travel_config_with_enabled(true)
 }
 
 /// 历史默认自动旅行配置（`enabled: true`）：已有用户没有显式值时沿用。
@@ -588,8 +592,8 @@ fn travel_config_with_enabled(enabled: bool) -> Value {
 
 /// 读取自动旅行配置（缺失/损坏时合并默认值）。
 ///
-/// 与签到同理：配置只在显式保存时落盘，按使用痕迹（配置文件或旅行缓存）判定已有用户，
-/// 没有显式值时沿用历史默认（开启）；全新安装默认关闭。
+/// 与签到同理：配置只在显式保存时落盘，按使用痕迹（配置文件或旅行缓存）判定已有用户。
+/// 新装与已有用户都默认开启；显式写入的非布尔值按「关闭」处理。
 pub fn load_travel_config() -> Value {
     load_travel_config_at(&travel_config_file(), &travel_cache_file())
 }
@@ -607,12 +611,12 @@ fn resolve_travel_config(input: Option<&Value>, existing_install: bool) -> Value
     } else {
         default_travel_config()
     };
-    if let Some(enabled) = input
+    // 与签到同规则：键存在但值非法 → 关闭，不回落默认（默认已是开启）。
+    if let Some(raw) = input
         .and_then(Value::as_object)
         .and_then(|map| map.get("enabled"))
-        .and_then(Value::as_bool)
     {
-        cfg["enabled"] = json!(enabled);
+        cfg["enabled"] = json!(raw.as_bool().unwrap_or(false));
     }
     cfg
 }
@@ -1040,6 +1044,23 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
+/// 直连客户端（显式 `no_proxy`）。
+///
+/// 系统代理（Clash / v2rayN 等）会把**镜像站**流量也带去海外节点：实测同一个
+/// 8.9 MB 安装包，`gh-proxy.com` 直连 1.3 秒下完，走系统代理 25 秒一个字节都没回来。
+/// 镜像存在的意义就是「不用代理也能通」，所以这类请求必须绕开系统代理。
+fn http_client_direct() -> &'static reqwest::Client {
+    static DIRECT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    DIRECT.get_or_init(|| {
+        // 连不上就快点失败：镜像被墙时不该让用户等满 30 秒再换下一个通道。
+        http_client_builder()
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("failed to build reqwest client")
+    })
+}
+
 /// 通用 HTTP 请求，返回解析后的 JSON。
 ///
 /// 行为对齐 Python 版：
@@ -1063,7 +1084,6 @@ pub async fn http_request_with_proxy(
     headers: Option<&HashMap<String, String>>,
     proxy: Option<&str>,
 ) -> Value {
-    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
         Some(proxy) => match http_client_builder()
             .proxy(match reqwest::Proxy::all(proxy) {
@@ -1077,6 +1097,27 @@ pub async fn http_request_with_proxy(
         },
         None => http_client().clone(),
     };
+    send_json(client, url, method, body, headers).await
+}
+
+/// 直连（不走系统代理）的 JSON 请求：镜像站清单走这里。
+pub async fn http_request_direct(
+    url: &str,
+    method: &str,
+    body: Option<Value>,
+    headers: Option<&HashMap<String, String>>,
+) -> Value {
+    send_json(http_client_direct().clone(), url, method, body, headers).await
+}
+
+async fn send_json(
+    client: reqwest::Client,
+    url: &str,
+    method: &str,
+    body: Option<Value>,
+    headers: Option<&HashMap<String, String>>,
+) -> Value {
+    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let mut req = client.request(method, url);
     req = req.header("Content-Type", "application/json");
     if let Some(h) = headers {
@@ -1230,14 +1271,14 @@ mod tests {
     }
 
     #[test]
-    fn auto_checkin_defaults_disabled_and_preserves_legacy_fields() {
+    fn auto_checkin_defaults_enabled_and_preserves_legacy_fields() {
         let cfg = default_checkin_config();
-        assert_eq!(cfg.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(cfg.get("enabled").and_then(Value::as_bool), Some(true));
         assert_eq!(cfg["excluded_account_ids"], json!([]));
         assert_eq!(cfg.get("start_hour").and_then(Value::as_i64), Some(6));
         assert_eq!(cfg.get("end_hour").and_then(Value::as_i64), Some(12));
 
-        // 历史默认仍保留开启，供已有用户在读取路径上沿用。
+        // 历史默认同样开启：新装与升级后的行为一致。
         let legacy = legacy_default_checkin_config();
         assert_eq!(legacy.get("enabled").and_then(Value::as_bool), Some(true));
         assert_eq!(
@@ -1297,7 +1338,8 @@ mod tests {
         let input = json!({"excluded_account_ids": ["account-a", "account-a", null]});
         for existing_install in [false, true] {
             let resolved = resolve_checkin_config(Some(&input), existing_install);
-            assert_eq!(resolved["enabled"], json!(existing_install));
+            // 新装与已有用户默认都开启，痕迹不再改变开关。
+            assert_eq!(resolved["enabled"], json!(true));
             assert_eq!(resolved["excluded_account_ids"], json!(["account-a"]));
             // 保存已解析配置后，新老安装均保留开关状态和账号排除列表。
             assert_eq!(merge_checkin_config(&resolved), resolved);
@@ -1306,11 +1348,11 @@ mod tests {
 
     #[test]
     fn checkin_default_follows_usage_trace() {
-        // 全新安装（无配置文件、无签到日志）：默认关闭。
+        // 全新安装（无配置文件、无签到日志）：默认开启。
         let fresh = resolve_checkin_config(None, false);
-        assert_eq!(fresh.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(fresh.get("enabled").and_then(Value::as_bool), Some(true));
 
-        // 已有用户（签到日志即使用痕迹）：沿用历史默认开启，升级不改状态。
+        // 已有用户（签到日志即使用痕迹）：同样开启，升级不改状态。
         let existing = resolve_checkin_config(None, true);
         assert_eq!(existing.get("enabled").and_then(Value::as_bool), Some(true));
         // 痕迹只影响 enabled，其余字段仍与默认一致。
@@ -1337,15 +1379,15 @@ mod tests {
         let config_path = dir.join("auto_checkin_config.json");
         let logs_path = dir.join("auto_checkin_logs.json");
 
-        // 两者皆无 → 全新安装，默认关闭。
+        // 两者皆无 → 全新安装，默认开启。
         assert_eq!(
             load_checkin_config_at(&config_path, &logs_path)
                 .get("enabled")
                 .and_then(Value::as_bool),
-            Some(false)
+            Some(true)
         );
 
-        // 只有签到日志（使用痕迹）→ 已有用户，保持开启。
+        // 只有签到日志（使用痕迹）→ 已有用户，同样开启。
         std::fs::write(&logs_path, "[]").unwrap();
         assert_eq!(
             load_checkin_config_at(&config_path, &logs_path)
@@ -1378,12 +1420,12 @@ mod tests {
 
     #[test]
     fn travel_default_follows_usage_trace() {
-        // 全新安装默认关闭，已有用户（旅行缓存痕迹）沿用开启。
+        // 全新安装与已有用户（旅行缓存痕迹）默认都开启。
         assert_eq!(
             resolve_travel_config(None, false)
                 .get("enabled")
                 .and_then(Value::as_bool),
-            Some(false)
+            Some(true)
         );
         assert_eq!(
             resolve_travel_config(None, true)
@@ -1406,6 +1448,7 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            // 键存在但值非法 → 关闭（fail-closed）；键缺失才用默认开启。
             resolve_travel_config(Some(&json!({"enabled": "no"})), false)
                 .get("enabled")
                 .and_then(Value::as_bool),
@@ -1421,15 +1464,15 @@ mod tests {
         let config_path = dir.join("auto_travel_config.json");
         let cache_path = dir.join("travel_cache.json");
 
-        // 两者皆无 → 全新安装，默认关闭。
+        // 两者皆无 → 全新安装，默认开启。
         assert_eq!(
             load_travel_config_at(&config_path, &cache_path)
                 .get("enabled")
                 .and_then(Value::as_bool),
-            Some(false)
+            Some(true)
         );
 
-        // 只有旅行缓存（使用痕迹）→ 已有用户，保持开启。
+        // 只有旅行缓存（使用痕迹）→ 已有用户，同样开启。
         std::fs::write(&cache_path, "{}").unwrap();
         assert_eq!(
             load_travel_config_at(&config_path, &cache_path)
@@ -1470,8 +1513,12 @@ mod tests {
             Some(7)
         );
 
+        // 键存在但值非法 → 关闭（fail-closed），不回落默认。
         let corrupt = merge_checkin_config(&json!({"enabled": "no", "lazy_refresh_hours": null}));
         assert_eq!(corrupt.get("enabled").and_then(Value::as_bool), Some(false));
+        // 键缺失才用默认（开启）。
+        let missing = merge_checkin_config(&json!({"lazy_refresh_hours": 12}));
+        assert_eq!(missing.get("enabled").and_then(Value::as_bool), Some(true));
         assert_eq!(
             corrupt.get("lazy_refresh_hours").and_then(Value::as_i64),
             Some(24)

@@ -12,5 +12,10 @@ path = "src/main.rs"
 wb-switch-core = { path = "../wb-switch-core" }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+serde = "1"
 serde_json = "1"
+# 归档接口在浏览器侧只能走 base64（webui 没有文件系统）；版本与 core 对齐。
+base64 = "0.22"
+# 导出的下载文件名要带日期（`wb-switch-backup-YYYYMMDD.zip`）；版本与 core 对齐。
+chrono = "0.4"
 rust-embed = "8"

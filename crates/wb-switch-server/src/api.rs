@@ -4,26 +4,44 @@
 //! token 不出本机。
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 #[cfg(target_os = "windows")]
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Query, RawQuery};
+use axum::extract::{DefaultBodyLimit, Query, RawQuery};
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use rust_embed::RustEmbed;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
+    account, archive, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
     export_import, jetbrains, limits, memory, notifications, oauth, process, rate_limit_events,
     rate_limit_hook, refresh, rotate, session, session_groups, switch, token_stats, travel, update,
     variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
 };
+
+/// 归档接口的请求体上限。
+///
+/// 取值由 core 的限额倒推：`archive::zip::MAX_TOTAL_BYTES` 是 **64 MiB 原始字节**，
+/// 而浏览器只能传 base64（体积 ×4/3 ≈ 85.3 MiB），再留一点 JSON 包装余量 → 96 MiB。
+/// 若这里比「64 MiB × 4/3」小，就会出现「导出成功、同一个包导不回来」：请求在
+/// JSON 解析前就被 axum 413 掉，前端只能看到「导入失败」。本机真实数据（session-links
+/// 的 baselines 整包约 37 MiB）已经踩过这条线，所以别再往下调。
+///
+/// 只挂在这三条 POST 上，不动全局上限——切号这类小接口仍是 axum 默认的 2 MiB，
+/// 免得大 body 也被无谓地读进内存。代价是导入时单请求峰值内存约 96 MiB（body）
+/// + 解码后 zip（≤64 MiB），可接受：同一时刻只会有一个浏览器在导入。
+const ARCHIVE_BODY_LIMIT: usize = 96 * 1024 * 1024;
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
 /// 前端切 tab 频繁触发命令行导致卡顿/闪窗。按档位分别缓存。
@@ -303,10 +321,23 @@ pub fn router() -> Router {
             "/api/update/config",
             get(api_update_config).post(api_save_update_config),
         )
+        .route("/api/archive/groups", get(api_archive_groups))
+        .route(
+            "/api/archive/export",
+            post(api_archive_export).layer(DefaultBodyLimit::max(ARCHIVE_BODY_LIMIT)),
+        )
+        .route(
+            "/api/archive/inspect",
+            post(api_archive_inspect).layer(DefaultBodyLimit::max(ARCHIVE_BODY_LIMIT)),
+        )
+        .route(
+            "/api/archive/import",
+            post(api_archive_import).layer(DefaultBodyLimit::max(ARCHIVE_BODY_LIMIT)),
+        )
         .fallback(static_handler)
 }
 
-fn json_ok(v: Value) -> Response {
+fn json_ok<T: Serialize>(v: T) -> Response {
     Json(v).into_response()
 }
 
@@ -850,6 +881,157 @@ async fn api_import(Json(body): Json<Value>) -> Response {
             "overwritten": result.overwritten,
         })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 整包备份 / 迁移（archive）
+//
+// 浏览器没有文件系统：导出把 zip 读成 base64 塞进 JSON 由前端下载，导入把
+// base64 写成临时文件再交给 core。`data` 体积可能很大，任何错误信息里都不带它。
+// ---------------------------------------------------------------------------
+
+/// 临时 zip 路径：`{temp}/wb-switch-archive-{tag}-{pid}-{seq}.zip`。
+///
+/// 并发请求靠自增序号区分——毫秒时间戳在同一批请求里会撞名。
+fn temp_archive_path(tag: &str) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "wb-switch-archive-{tag}-{}-{}.zip",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// 临时归档文件的 RAII 清理：成功、失败、handler 在中途被 drop 都会删掉。
+#[derive(Debug)]
+struct TempArchive(PathBuf);
+
+impl TempArchive {
+    fn new(tag: &str) -> Self {
+        Self(temp_archive_path(tag))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempArchive {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// 请求体里的 `selected`：缺失或非数组一律当「全部」（core 的语义）。
+fn archive_selection(body: &Value) -> Vec<String> {
+    body.get("selected")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 把前端传来的 base64 落成临时 zip；空串直接拒绝，别名见 `TempArchive`。
+fn decode_archive(tag: &str, data: &str) -> Result<TempArchive, String> {
+    if data.is_empty() {
+        return Err("请先选择要导入的归档文件".to_string());
+    }
+    let bytes = BASE64
+        .decode(data)
+        .map_err(|error| format!("归档数据不是合法的 base64：{error}"))?;
+    let temp = TempArchive::new(tag);
+    std::fs::write(temp.path(), &bytes)
+        .map_err(|error| format!("写入临时归档失败（{}）：{error}", temp.path().display()))?;
+    Ok(temp)
+}
+
+/// 浏览器下载用的文件名：`wb-switch-backup-YYYYMMDD.zip`。
+fn backup_file_name() -> String {
+    format!(
+        "wb-switch-backup-{}.zip",
+        chrono::Local::now().format("%Y%m%d")
+    )
+}
+
+/// 阻塞段：导出到临时文件 → 读回 → base64。临时文件由 `TempArchive` 兜底删除。
+fn export_archive(selected: &[String]) -> Result<Value, String> {
+    let temp = TempArchive::new("export");
+    let outcome = archive::export(selected, temp.path())?;
+    let bytes = std::fs::read(temp.path())
+        .map_err(|error| format!("读取临时归档失败（{}）：{error}", temp.path().display()))?;
+    Ok(json!({
+        "fileName": backup_file_name(),
+        "bytes": outcome.bytes,
+        "groups": outcome.groups,
+        "data": BASE64.encode(bytes),
+    }))
+}
+
+/// GET /api/archive/groups —— 各数据分组的文件数与体积（勾选面板用）。
+async fn api_archive_groups() -> Response {
+    json_ok(json!({ "groups": archive::groups() }))
+}
+
+/// POST /api/archive/export —— body `{ selected: [...] }`，回 base64 归档。
+async fn api_archive_export(Json(body): Json<Value>) -> Response {
+    let selected = archive_selection(&body);
+    match tokio::task::spawn_blocking(move || export_archive(&selected)).await {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("导出任务异常终止：{error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/archive/inspect —— body `{ data: "<base64>" }`，只读清单。
+async fn api_archive_inspect(Json(body): Json<Value>) -> Response {
+    let data = body
+        .get("data")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match tokio::task::spawn_blocking(move || {
+        let temp = decode_archive("inspect", &data)?;
+        archive::inspect(temp.path())
+    })
+    .await
+    {
+        Ok(Ok(info)) => json_ok(info),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("读取归档信息失败：{error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/archive/import —— body `{ data: "<base64>", selected: [...] }`。
+async fn api_archive_import(Json(body): Json<Value>) -> Response {
+    let data = body
+        .get("data")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let selected = archive_selection(&body);
+    match tokio::task::spawn_blocking(move || {
+        let temp = decode_archive("import", &data)?;
+        archive::import(temp.path(), &selected)
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => json_ok(outcome),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("导入任务异常终止：{error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1914,12 +2096,15 @@ async fn api_clear_notifications() -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        body_variant, checkin_status_item, links_preview_progress_snapshot, query_variant,
-        static_handler, submitted_config, update_check_args, ProgressReset, SwitchStateGuard,
-        LINKS_PREVIEW_CROSS_PROGRESS, LINKS_PREVIEW_PROGRESS, SWITCH_PROGRESS, SWITCH_RUNNING,
+        archive_selection, backup_file_name, body_variant, checkin_status_item, decode_archive,
+        links_preview_progress_snapshot, query_variant, static_handler, submitted_config,
+        temp_archive_path, update_check_args, ProgressReset, SwitchStateGuard, TempArchive, BASE64,
+        ARCHIVE_BODY_LIMIT, LINKS_PREVIEW_CROSS_PROGRESS, LINKS_PREVIEW_PROGRESS, SWITCH_PROGRESS,
+        SWITCH_RUNNING,
     };
     use axum::http::{header, StatusCode, Uri};
     use axum::Json;
+    use base64::Engine as _;
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -2169,5 +2354,72 @@ mod tests {
             assert_eq!(proxy, expected_proxy);
             assert_eq!(force, expected_force);
         }
+    }
+
+    /// `selected` 缺省 / 非数组 / 混入非字符串 → 只保留字符串，其余当「全部」。
+    #[test]
+    fn archive_selection_tolerates_missing_and_dirty_input() {
+        assert!(archive_selection(&json!({})).is_empty());
+        assert!(archive_selection(&json!({ "selected": "accounts" })).is_empty());
+        assert_eq!(
+            archive_selection(&json!({ "selected": ["accounts", 1, null, "logs"] })),
+            vec!["accounts".to_string(), "logs".to_string()]
+        );
+    }
+
+    /// 同一瞬间的并发请求不能撞到同一个临时文件名（否则互相删/覆盖）。
+    #[test]
+    fn temp_archive_paths_are_unique() {
+        let first = temp_archive_path("export");
+        let second = temp_archive_path("export");
+        assert_ne!(first, second);
+        assert!(first.to_string_lossy().contains("wb-switch-archive-export-"));
+    }
+
+    /// 临时归档必须「用完即删」：无论正常返回还是提前出错都不留垃圾。
+    #[test]
+    fn temp_archive_is_removed_on_drop() {
+        let guarded = TempArchive::new("test");
+        let path = guarded.path().to_path_buf();
+        std::fs::write(&path, b"zip").unwrap();
+        drop(guarded);
+        assert!(!path.exists());
+    }
+
+    /// base64 → 临时文件 → core 读回，字节必须原样；空串与坏 base64 要给中文错误。
+    #[test]
+    fn decode_archive_round_trips_bytes_and_rejects_bad_input() {
+        assert!(decode_archive("test", "").unwrap_err().contains("请先选择"));
+        assert!(decode_archive("test", "not base64!!")
+            .unwrap_err()
+            .contains("base64"));
+
+        let raw = b"PK\x03\x04not-a-real-zip";
+        let encoded = BASE64.encode(raw);
+        let temp = decode_archive("test", &encoded).unwrap();
+        assert_eq!(std::fs::read(temp.path()).unwrap(), raw);
+    }
+
+    /// 下载文件名必须带日期且是 zip，前端直接用它在浏览器落盘。
+    #[test]
+    fn backup_file_name_is_dated_zip() {
+        let name = backup_file_name();
+        assert!(name.starts_with("wb-switch-backup-"), "{name}");
+        assert!(name.ends_with(".zip"), "{name}");
+        assert_eq!(name.len(), "wb-switch-backup-YYYYMMDD.zip".len(), "{name}");
+    }
+
+    /// body 上限必须装得下「core 允许的最大归档 × base64 膨胀」，否则会出现
+    /// 「导出成功、同一个包导不回来」（真正卡在 axum 413，而不是 core 的限额提示）。
+    /// core 的 `MAX_TOTAL_BYTES` 是 `pub(crate)`，这里只能写死 64 MiB 并留注释对齐。
+    #[test]
+    fn archive_body_limit_fits_largest_base64_archive() {
+        const CORE_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+        // base64 最坏膨胀 4/3（向上取整），再加 JSON 外层与转义余量。
+        let needed = CORE_MAX_TOTAL_BYTES / 3 * 4 + 4096;
+        assert!(
+            ARCHIVE_BODY_LIMIT >= needed,
+            "ARCHIVE_BODY_LIMIT={ARCHIVE_BODY_LIMIT} 小于 base64 后的最大归档 {needed}"
+        );
     }
 }

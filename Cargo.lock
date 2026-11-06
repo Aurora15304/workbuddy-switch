@@ -5651,6 +5651,7 @@ dependencies = [
  "cbc",
  "chrono",
  "dirs 5.0.1",
+ "flate2",
  "minisign-verify",
  "pbkdf2",
  "reqwest 0.12.28",
@@ -5663,6 +5664,7 @@ dependencies = [
  "uuid",
  "windows 0.58.0",
  "zbus",
+ "zip",
 ]
 
 [[package]]
@@ -5695,7 +5697,10 @@ name = "wb-switch-server"
 version = "0.1.75"
 dependencies = [
  "axum",
+ "base64 0.22.1",
+ "chrono",
  "rust-embed",
+ "serde",
  "serde_json",
  "tokio",
  "wb-switch-core",
@@ -6717,6 +6722,7 @@ checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
 dependencies = [
  "arbitrary",
  "crc32fast",
+ "flate2",
  "indexmap 2.14.0",
  "memchr",
 ]

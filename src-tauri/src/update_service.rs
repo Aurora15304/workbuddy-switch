@@ -5,8 +5,8 @@
 //! 主窗口关闭（轻量模式、隐藏到托盘）时托盘仍可独立走完 检查 → 下载 → 重启。
 //!
 //! 检查复用 `wb_switch_core::modules::update::update_check`（release 资产端点 + 302 兜底，
-//! 不占 GitHub API 配额）；下载走 tauri-plugin-updater 的 Rust API（签名校验在
-//! `Update::download` 内部完成），代理取自 `update::load_github_config()` 的 `proxy`。
+//! 不占 GitHub API 配额）；下载自己走镜像 + 分段并发（见 `update_download`），
+//! 只把验签后的字节交给 `Update::install`；代理仅在用户显式开启时才生效。
 //!
 //! **安装时机**：下载完成的包暂存在内存（`PACKAGE`），由用户点「重启以完成升级」时才
 //! 安装。Windows NSIS 安装器要求应用退出后才能完成安装，下载即安装等于强制自动重启；
@@ -98,6 +98,9 @@ static BUSY: AtomicBool = AtomicBool::new(false);
 static MENU_PROGRESS_BUCKET: AtomicU8 = AtomicU8::new(u8::MAX);
 /// 本轮下载是否已打过「进度开始上报」日志（排障用，一次下载只打一行）。
 static PROGRESS_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// 没有总量（服务端不回 Content-Length）时，是否已经写过「正在下载…」文案。
+static NO_TOTAL_TOOLTIP_SET: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // 互斥
@@ -224,6 +227,7 @@ fn apply_check_result(result: &Value) -> UpdateSnapshot {
 fn begin_download(latest: &str) -> UpdateSnapshot {
     MENU_PROGRESS_BUCKET.store(0, Ordering::Release);
     PROGRESS_REPORTED.store(false, Ordering::Release);
+    NO_TOTAL_TOOLTIP_SET.store(false, Ordering::Release);
     with_snapshot(|snapshot| {
         snapshot.phase = UpdatePhase::Downloading;
         snapshot.latest = Some(latest.to_string());
@@ -439,21 +443,7 @@ async fn download_package<R: Runtime>(
     app: &AppHandle<R>,
 ) -> Result<Option<DownloadedPackage>, String> {
     let proxy = configured_proxy();
-    let builder = app.updater_builder();
-    let builder = match proxy.as_deref() {
-        Some(proxy) => builder.proxy(
-            tauri::Url::parse(proxy).map_err(|error| format!("更新代理地址无效：{error}"))?,
-        ),
-        None => builder,
-    };
-    let updater = builder
-        .build()
-        .map_err(|error| format!("初始化更新器失败：{error}"))?;
-    let update = updater
-        .check()
-        .await
-        .map_err(|error| format!("检查更新包失败：{error}"))?;
-    let Some(update) = update else {
+    let Some(update) = check_package(app, proxy.as_deref()).await? else {
         return Ok(None);
     };
 
@@ -473,6 +463,61 @@ async fn download_package<R: Runtime>(
         bytes,
         update,
     }))
+}
+
+/// 检查更新包：清单按「镜像 → GitHub」拉，失败再换另一条代理通道。
+///
+/// 插件的 `check()` 默认走系统代理且**没有超时**：系统代理指向死端口时会一直挂着，
+/// 用户看到的就是「检查说有新版，点下载却永远停在 0%」。这里换成与
+/// [`update::update_check`] 同一份候选（镜像优先），并给 20 秒上限。
+async fn check_package<R: Runtime>(
+    app: &AppHandle<R>,
+    proxy: Option<&str>,
+) -> Result<Option<tauri_plugin_updater::Update>, String> {
+    // 有显式代理就先用它；没有则先直连——系统代理会把镜像流量带去海外节点。
+    let first_with_proxy = proxy.is_some();
+    let first_error = match build_updater(app, proxy, first_with_proxy)?.check().await {
+        Ok(update) => return Ok(update),
+        Err(error) => error,
+    };
+    eprintln!("[更新] 清单检查失败（{first_error}），换另一条通道重试");
+    build_updater(app, proxy, !first_with_proxy)?
+        .check()
+        .await
+        .map_err(|error| format!("检查更新包失败：{first_error}；重试：{error}"))
+}
+
+/// 构造 updater：清单端点复用下载候选（镜像优先），并按需决定走不走代理。
+fn build_updater<R: Runtime>(
+    app: &AppHandle<R>,
+    proxy: Option<&str>,
+    use_proxy: bool,
+) -> Result<tauri_plugin_updater::Updater, String> {
+    let cfg = update::load_github_config();
+    let owner = cfg.get("owner").and_then(Value::as_str).unwrap_or("");
+    let repo = cfg.get("repo").and_then(Value::as_str).unwrap_or("");
+    let base = format!("https://github.com/{owner}/{repo}/releases/latest/download/latest.json");
+    let endpoints: Vec<tauri::Url> = update_download::download_candidates(&base)
+        .iter()
+        .filter_map(|url| tauri::Url::parse(url).ok())
+        .collect();
+
+    let mut builder = app.updater_builder().timeout(Duration::from_secs(20));
+    if !endpoints.is_empty() {
+        builder = builder
+            .endpoints(endpoints)
+            .map_err(|error| format!("更新清单地址无效：{error}"))?;
+    }
+    builder = match (use_proxy, proxy) {
+        (true, Some(proxy)) => builder.proxy(
+            tauri::Url::parse(proxy).map_err(|error| format!("更新代理地址无效：{error}"))?,
+        ),
+        (true, None) => builder,
+        (false, _) => builder.no_proxy(),
+    };
+    builder
+        .build()
+        .map_err(|error| format!("初始化更新器失败：{error}"))
 }
 
 /// 依次尝试「内置镜像 → GitHub 直连」，每个候选都验签，任一成功即返回。
@@ -548,10 +593,19 @@ fn updater_pubkey<R: Runtime>(app: &AppHandle<R>) -> Result<String, String> {
 
 /// 单个下载分包的回调：tooltip 实时更新；快照与事件按整数百分比；菜单跨 10% 才重建。
 fn on_download_chunk<R: Runtime>(app: &AppHandle<R>, downloaded: u64, total: Option<u64>) {
-    set_tooltip(app, &download_tooltip(percent_of(downloaded, total)));
-    let Some(percent) = advance_progress(downloaded, total) else {
+    // 先判百分比有没有变：8.8 MB 的包会回调上千次，每次都改托盘 tooltip
+    // 等于把下载线程拖去做上千次 UI 调用。
+    let Some(percent) = percent_of(downloaded, total) else {
+        // 极少数服务端不回 Content-Length：没有百分比，但至少把文案推进到「正在下载」。
+        if !NO_TOTAL_TOOLTIP_SET.swap(true, Ordering::AcqRel) {
+            set_tooltip(app, &download_tooltip(None));
+        }
         return;
     };
+    if advance_progress(downloaded, total).is_none() {
+        return;
+    }
+    set_tooltip(app, &download_tooltip(Some(percent)));
     if !PROGRESS_REPORTED.swap(true, Ordering::AcqRel) {
         eprintln!("[更新] 进度开始上报：{percent}%（total={total:?}）");
     }
@@ -569,14 +623,12 @@ fn download_tooltip(percent: Option<u8>) -> String {
     }
 }
 
-/// 更新代理：`update::load_github_config()` 的 `proxy` 注入 updater builder；留空表示不设置。
+/// 更新代理：只有用户在设置里显式开启时才注入 updater builder。
+///
+/// 读的是 `update::effective_proxy()`（带 `proxy_enabled` 判定），不是裸的
+/// `proxy` 字段——历史地址失效时不能让整条更新链跟着挂掉。
 fn configured_proxy() -> Option<String> {
-    update::load_github_config()
-        .get("proxy")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|proxy| !proxy.is_empty())
-        .map(str::to_string)
+    update::effective_proxy()
 }
 
 fn store_package(package: DownloadedPackage) {

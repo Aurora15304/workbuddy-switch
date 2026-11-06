@@ -14,9 +14,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::modules::config::{
-    atomic_write, http_request_raw, http_request_with_proxy, now_secs, store_dir,
+    atomic_write, http_request_direct, http_request_raw, http_request_with_proxy, now_secs,
+    store_dir,
 };
-use crate::modules::update_download::{mirror_url, MIRROR_PREFIXES};
+use crate::modules::update_download::{is_mirror_url, mirror_url, MIRROR_PREFIXES};
 
 /// 应用当前版本（来自 Cargo.toml package.version）。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -44,6 +45,9 @@ pub fn load_github_config() -> Value {
     let mut owner = GITHUB_OWNER.to_string();
     let mut repo = GITHUB_REPO.to_string();
     let mut proxy = String::new();
+    // 显式代理默认关闭：地址可以留着，但只有用户自己打开开关才生效。
+    // 老配置没有这个键 → false，升级后不会继续把更新请求塞进一个可能已经失效的代理。
+    let mut proxy_enabled = false;
     let f = github_config_file();
     let mut should_normalize = false;
     if f.exists() {
@@ -62,6 +66,11 @@ pub fn load_github_config() -> Value {
                 if let Some(value) = v.get("proxy").and_then(|v| v.as_str()) {
                     proxy = value.trim().to_string();
                 }
+                if let Some(value) = v.get("proxy_enabled").and_then(Value::as_bool) {
+                    proxy_enabled = value;
+                }
+                // 只在需要清理历史 token 时写盘；`proxy_enabled` 缺失按 false 处理即可，
+                // 不在「读配置」时顺手改文件。
                 should_normalize = v.get("token").is_some();
             }
         }
@@ -71,7 +80,12 @@ pub fn load_github_config() -> Value {
         repo = GITHUB_REPO.to_string();
         should_normalize = true;
     }
-    let normalized = json!({"owner": owner, "repo": repo, "proxy": proxy});
+    let normalized = json!({
+        "owner": owner,
+        "repo": repo,
+        "proxy": proxy,
+        "proxy_enabled": proxy_enabled,
+    });
     if should_normalize {
         let _ = atomic_write(
             &f,
@@ -79,6 +93,33 @@ pub fn load_github_config() -> Value {
         );
     }
     normalized
+}
+
+/// 生效的显式代理：只有用户显式打开开关、且地址非空时才返回。
+///
+/// 所有「自动发生」的更新请求都必须走这里，别直接读 `proxy` 字段——否则一个
+/// 已经失效的历史地址会把清单和镜像一起拖死。
+pub fn effective_proxy() -> Option<String> {
+    effective_proxy_from(&load_github_config())
+}
+
+/// 同一份配置已经在手上时用它，别为了取代理再读一次磁盘。
+fn effective_proxy_from(cfg: &Value) -> Option<String> {
+    let enabled = cfg.get("proxy_enabled").and_then(Value::as_bool) == Some(true);
+    let proxy = cfg.get("proxy").and_then(Value::as_str).unwrap_or("");
+    enabled_proxy(enabled, proxy)
+}
+
+/// 纯判定：开关打开且地址非空才算生效。
+fn enabled_proxy(enabled: bool, proxy: &str) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let proxy = proxy.trim();
+    if proxy.is_empty() {
+        return None;
+    }
+    Some(proxy.to_string())
 }
 
 /// 保存更新源配置；公开仓库不需要也不保存 GitHub token。
@@ -98,7 +139,21 @@ pub fn save_github_config(cfg: &Value) -> std::io::Result<()> {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .unwrap_or("");
-    let clean = json!({"owner": owner, "repo": repo, "proxy": proxy});
+    // 没带这个键（老客户端只发 owner/repo/proxy）时保留磁盘上的状态，
+    // 不能按 PATCH 语义把用户已经打开的开关悄悄关掉。
+    let proxy_enabled = match cfg.get("proxy_enabled").and_then(Value::as_bool) {
+        Some(value) => value,
+        None => load_github_config()
+            .get("proxy_enabled")
+            .and_then(Value::as_bool)
+            == Some(true),
+    };
+    let clean = json!({
+        "owner": owner,
+        "repo": repo,
+        "proxy": proxy,
+        "proxy_enabled": proxy_enabled,
+    });
     std::fs::create_dir_all(store_dir())?;
     atomic_write(
         &github_config_file(),
@@ -176,7 +231,12 @@ async fn fetch_manifest_version(
     headers.insert("User-Agent".to_string(), "wb-switch".to_string());
     let mut last_err = "更新清单解析失败".to_string();
     for url in updater_manifest_urls(owner, repo, std::env::consts::OS, std::env::consts::ARCH) {
-        let resp = http_request_with_proxy(&url, "GET", None, Some(&headers), proxy).await;
+        // 镜像直连：系统代理会把镜像也带去海外节点，反而更慢甚至不通。
+        let resp = if is_mirror_url(&url) {
+            http_request_direct(&url, "GET", None, Some(&headers)).await
+        } else {
+            http_request_with_proxy(&url, "GET", None, Some(&headers), proxy).await
+        };
         let version = resp.get("version").and_then(|v| v.as_str()).unwrap_or("");
         if !version.trim().is_empty() {
             return Ok(resp);
@@ -261,12 +321,9 @@ pub async fn update_check(proxy: Option<&str>, force: bool) -> Value {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let configured_proxy = cfg
-        .get("proxy")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    let proxy = proxy.or(configured_proxy);
+    // 已保存但未开启的代理一律不参与：地址失效时不该拖死整条更新链。
+    let configured_proxy = effective_proxy_from(&cfg);
+    let proxy = proxy.or(configured_proxy.as_deref());
     let release_url = format!("https://github.com/{owner}/{repo}/releases/latest");
     let current = APP_VERSION.to_string();
 
@@ -379,10 +436,10 @@ fn transport_hint(proxy: Option<&str>, raw: &str) -> Option<String> {
     }
     Some(match proxy {
         Some(proxy) => format!(
-            "连不上 GitHub：代理（{}）未生效。请确认代理已启动、端口正确，且规则放行了 github.com。",
+            "连不上 GitHub：代理（{}）未生效。请确认代理已启动、端口正确，或到「设置 → 更新」关掉代理再试（镜像下载不需要代理）。",
             mask_proxy(proxy)
         ),
-        None => "连不上 GitHub（网络不通或被拦截）。如需代理，请到「设置 → 更新代理」填入地址（例如 http://127.0.0.1:7897）后重试。".to_string(),
+        None => "连不上 GitHub（网络不通或被拦截）。镜像也不通时，可到「设置 → 自动更新」打开「启用更新代理」并填入地址后重试。".to_string(),
     })
 }
 
@@ -479,6 +536,16 @@ mod tests {
         assert!(
             !message.contains("code=-1"),
             "网络错误不该再把 code 抛给用户"
+        );
+    }
+
+    #[test]
+    fn enabled_proxy_requires_both_switch_and_address() {
+        assert_eq!(enabled_proxy(false, "http://127.0.0.1:7897"), None);
+        assert_eq!(enabled_proxy(true, "   "), None);
+        assert_eq!(
+            enabled_proxy(true, " http://127.0.0.1:7897 ").as_deref(),
+            Some("http://127.0.0.1:7897")
         );
     }
 

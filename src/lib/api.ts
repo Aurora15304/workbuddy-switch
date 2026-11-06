@@ -2,6 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountMeta,
   AccountRecord,
+  ArchiveExportResult,
+  ArchiveGroupInfo,
+  ArchiveImportResult,
+  ArchiveInspect,
   AppNotification,
   AppStatus,
   AutoRotateConfig,
@@ -200,6 +204,10 @@ const ROUTES: Record<string, Route> = {
   save_github_config: { method: "POST", path: "/api/update/config" },
   check_update: { method: "GET", path: "/api/update/check" },
   switch_progress: { method: "GET", path: "/api/switch/progress" },
+  archive_groups: { method: "GET", path: "/api/archive/groups" },
+  archive_export: { method: "POST", path: "/api/archive/export" },
+  archive_inspect: { method: "POST", path: "/api/archive/inspect" },
+  archive_import: { method: "POST", path: "/api/archive/import" },
 };
 
 /**
@@ -546,6 +554,41 @@ export function previewImportAccounts(
 
 export function importAccounts(fileText: string, indexes: number[]): Promise<ImportResult> {
   return call("import_accounts", { fileText, indexes });
+}
+
+// ---------------------------------------------------------------------------
+// 数据迁移（整包 zip）
+// ---------------------------------------------------------------------------
+
+/** 可打包的数据组清单（含各组文件数与体积）；演示模式不可用。 */
+export function archiveGroups(): Promise<{ groups: ArchiveGroupInfo[] }> {
+  return call("archive_groups");
+}
+
+/**
+ * 导出选中的数据组。
+ *
+ * 桌面端必须传 `dest`（系统保存对话框产物），后端写盘并回传 `path`；
+ * webui 不传 `dest`，后端回传 base64 `data` 由前端触发浏览器下载。
+ */
+export function archiveExport(selected: string[], dest?: string): Promise<ArchiveExportResult> {
+  return call("archive_export", dest ? { selected, dest } : { selected });
+}
+
+/** 读取 zip 清单：桌面端传 `path`，webui 传 base64 `data`。 */
+export function archiveInspect(source: {
+  path?: string;
+  data?: string;
+}): Promise<ArchiveInspect> {
+  return call("archive_inspect", source);
+}
+
+/** 按选中的数据组导入；导入前后端会自动备份，`backupDir` 为备份目录。 */
+export function archiveImport(
+  source: { path?: string; data?: string },
+  selected: string[],
+): Promise<ArchiveImportResult> {
+  return call("archive_import", { ...source, selected });
 }
 
 export function switchAccount(args: {

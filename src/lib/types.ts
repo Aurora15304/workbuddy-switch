@@ -947,6 +947,8 @@ export interface GithubConfig {
   owner?: string;
   repo?: string;
   proxy?: string;
+  /** 显式代理开关：默认关闭。地址可以留着，只有打开才生效。 */
+  proxy_enabled?: boolean;
 }
 
 export interface UpdateInfo {
@@ -1251,4 +1253,45 @@ export interface GrowthAutoResult {
   /** 非致命提示（例如补领阶段的失败项）。 */
   note?: string;
   error?: string;
+}
+
+// ---------------------------------------------------------------------------
+// 数据迁移（整包 zip 备份 / 还原）
+// ---------------------------------------------------------------------------
+
+/** 一个可打包的数据组（账号 / 设置 / 日志 / 统计 / 记忆 / 关联）。 */
+export interface ArchiveGroupInfo {
+  /** accounts | settings | logs | stats | memory | links */
+  id: string;
+  title: string;
+  description: string;
+  /** 含登录凭据：zip 内为明文，导出后不可外传。 */
+  sensitive: boolean;
+  files: number;
+  bytes: number;
+}
+
+/** 打开一个 zip 后的清单（导入前展示给用户确认）。 */
+export interface ArchiveInspect {
+  formatVersion: number;
+  appVersion: string;
+  exportedAt: number;
+  groups: ArchiveGroupInfo[];
+}
+
+/** 导出结果：桌面端写盘返回 `path`；webui 返回 base64 `data` 由浏览器下载。 */
+export interface ArchiveExportResult {
+  path?: string;
+  fileName: string;
+  bytes: number;
+  groups: string[];
+  data?: string;
+}
+
+/** 导入结果计数；`backupDir` 是导入前自动备份所在目录。 */
+export interface ArchiveImportResult {
+  groups: string[];
+  backupDir: string;
+  accountsAdded: number;
+  accountsUpdated: number;
 }

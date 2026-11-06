@@ -3,12 +3,14 @@
 //! 阶段 1 覆盖：get_status / get_accounts / delete_account / oauth_start /
 //! oauth_status / import_local。
 
+use std::path::Path;
+
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
+    account, archive, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, credit_usage, credits, error_log,
     export_import, growth_tasks, jetbrains, limits, memory, notifications, oauth, process,
     rate_limit_events, rate_limit_hook, refresh, rotate, session, session_groups, switch,
@@ -509,6 +511,70 @@ pub fn import_accounts(file_text: String, indexes: Vec<usize>) -> Result<Value, 
         "skipped": result.skipped,
         "overwritten": result.overwritten,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// 整包备份 / 迁移（archive）
+// ---------------------------------------------------------------------------
+
+/// 校验用户选的归档路径：不能为空，文件类操作要求它确实是个文件。
+fn existing_archive(path: &str) -> Result<&Path, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("请先选择归档文件".to_string());
+    }
+    let path = Path::new(trimmed);
+    if !path.is_file() {
+        return Err(format!("归档文件不存在：{}", path.display()));
+    }
+    Ok(path)
+}
+
+/// GET /api/archive/groups —— 各数据分组在当前磁盘上的文件数与体积（勾选面板用）。
+#[tauri::command]
+pub fn archive_groups() -> Result<Value, String> {
+    Ok(json!({ "groups": archive::groups() }))
+}
+
+/// POST /api/archive/export —— 把选中的分组打成 zip 写到 `dest`（空选择 = 全部）。
+///
+/// 只校验「core 不管、前端又能传错」的部分：路径非空、不能是目录、父目录必须
+/// 已存在（不替用户凭空造目录）。分组白名单与落盘细节全在 core。
+#[tauri::command]
+pub fn archive_export(
+    selected: Vec<String>,
+    dest: String,
+) -> Result<archive::ExportOutcome, String> {
+    let trimmed = dest.trim();
+    if trimmed.is_empty() {
+        return Err("请先选择导出位置".to_string());
+    }
+    let path = Path::new(trimmed);
+    if path.is_dir() {
+        return Err("导出路径不能是目录，请指定文件名".to_string());
+    }
+    if let Some(parent) = path.parent() {
+        // 相对路径的父目录是空串：交给 core 报「必须是绝对路径」。
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            return Err(format!("导出目录不存在：{}", parent.display()));
+        }
+    }
+    archive::export(&selected, path)
+}
+
+/// POST /api/archive/inspect —— 只读归档清单（不解压、不落盘）。
+#[tauri::command]
+pub fn archive_inspect(path: String) -> Result<archive::ArchiveInspect, String> {
+    archive::inspect(existing_archive(&path)?)
+}
+
+/// POST /api/archive/import —— 按分组恢复归档（空选择 = 归档里的全部组）。
+#[tauri::command]
+pub fn archive_import(
+    path: String,
+    selected: Vec<String>,
+) -> Result<archive::ImportOutcome, String> {
+    archive::import(existing_archive(&path)?, &selected)
 }
 
 /// 打开系统设置授权面板。默认「完全磁盘访问」（该 anchor 各版本均有效）；
