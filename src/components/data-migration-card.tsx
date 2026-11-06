@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
+  ARCHIVE_MAX_FILE_BYTES,
   ARCHIVE_MAX_RAW_BYTES,
   archiveBackupFileName,
   base64ToBytes,
@@ -26,6 +27,7 @@ import {
   formatBytes,
   isAllArchiveSelected,
   isExportOverLimit,
+  isGroupTooLarge,
   summarizeSelection,
   toggleAllArchiveSelection,
   trimSelectionToLimit,
@@ -74,25 +76,28 @@ function GroupRow({
   onToggle: () => void;
 }) {
   const empty = group.files <= 0;
+  // 单文件超过 core 上限：整组必然导不出去，直接禁用比让用户吃 400 好。
+  const tooLarge = isGroupTooLarge(group);
+  const disabled = empty || tooLarge;
   const inputId = `archive-group-${group.id}`;
   return (
     <div
       className={cn(
         "flex min-w-0 items-start gap-2.5 px-4 py-2.5 sm:px-5",
-        empty ? "opacity-50" : "hover:bg-foreground/[0.03]",
+        disabled ? "opacity-50" : "hover:bg-foreground/[0.03]",
       )}
     >
       <Checkbox
         id={inputId}
         className="mt-0.5"
         checked={checked}
-        disabled={empty}
+        disabled={disabled}
         onCheckedChange={onToggle}
         aria-label={group.title}
       />
       <label
         htmlFor={inputId}
-        className={cn("min-w-0 flex-1", empty ? "cursor-not-allowed" : "cursor-pointer")}
+        className={cn("min-w-0 flex-1", disabled ? "cursor-not-allowed" : "cursor-pointer")}
       >
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
           <span className="text-[13px] font-medium leading-4">{group.title}</span>
@@ -105,7 +110,11 @@ function GroupRow({
         </div>
         <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">{group.description}</p>
         <p className="mt-0.5 text-[11px] leading-4 text-muted-foreground/60">
-          {empty ? "暂无可打包内容" : `${group.files} 个文件 · ${formatBytes(group.bytes)}`}
+          {empty
+            ? "暂无可打包内容"
+            : tooLarge
+              ? `单文件超过 ${formatBytes(ARCHIVE_MAX_FILE_BYTES)}，无法打包`
+              : `${group.files} 个文件 · ${formatBytes(group.bytes)}`}
         </p>
       </label>
     </div>

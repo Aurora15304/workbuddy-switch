@@ -22,9 +22,17 @@ function trimZero(value: number): string {
   return value.toFixed(1).replace(/\.0$/, "");
 }
 
-/** 有内容的组才值得勾选：空组导不进任何文件，只是噪音。 */
+/** core 的单文件上限：超过它的组一定导不出去（后端会整包拒绝）。 */
+export const ARCHIVE_MAX_FILE_BYTES = 16 * 1024 * 1024;
+
+/** 组内是否有文件超过 core 的单文件上限。 */
+export function isGroupTooLarge(group: ArchiveGroupInfo): boolean {
+  return group.largestFileBytes > ARCHIVE_MAX_FILE_BYTES;
+}
+
+/** 有内容、且不会被单文件上限卡住的组才值得勾选。 */
 export function selectableGroups(groups: ArchiveGroupInfo[]): ArchiveGroupInfo[] {
-  return groups.filter((group) => group.files > 0);
+  return groups.filter((group) => group.files > 0 && !isGroupTooLarge(group));
 }
 
 /** 默认勾选：全部有内容的组（整包备份的语义）。 */

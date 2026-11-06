@@ -13,6 +13,7 @@ import {
   formatBytes,
   isAllArchiveSelected,
   isExportOverLimit,
+  isGroupTooLarge,
   summarizeSelection,
   toggleAllArchiveSelection,
   trimSelectionToLimit,
@@ -26,6 +27,7 @@ function group(overrides: Partial<ArchiveGroupInfo> & { id: string }): ArchiveGr
     sensitive: false,
     files: 1,
     bytes: 100,
+    largestFileBytes: 0,
     ...overrides,
   };
 }
@@ -171,6 +173,22 @@ describe("base64 往返", () => {
     const text = bytesToBase64(new Uint8Array([1, 2, 3, 4, 5, 6]));
     const wrapped = `${text.slice(0, 4)}\n${text.slice(4)}`;
     expect(Array.from(base64ToBytes(wrapped))).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+});
+
+describe("单文件上限", () => {
+  it("组内最大文件超过 16 MiB 时不可勾选", () => {
+    const huge = group({
+      id: "logs",
+      files: 1,
+      bytes: 20 * 1024 * 1024,
+      largestFileBytes: 20 * 1024 * 1024,
+    });
+    const normal = group({ id: "settings", files: 1, bytes: 1024, largestFileBytes: 1024 });
+    expect(isGroupTooLarge(huge)).toBe(true);
+    expect(isGroupTooLarge(normal)).toBe(false);
+    // 默认勾选要跳过必然失败的组，否则用户点导出必定吃 400。
+    expect(defaultArchiveSelection([huge, normal])).toEqual(["settings"]);
   });
 });
 

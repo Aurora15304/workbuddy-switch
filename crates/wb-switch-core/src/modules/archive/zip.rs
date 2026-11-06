@@ -165,6 +165,9 @@ pub(crate) fn read_archive(path: &Path) -> Result<BTreeMap<String, Vec<u8>>, Str
 
     let mut out: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut total: u64 = 0;
+    // 声明大小可以造假：再用实际读到的字节复核一次总量，否则「每个条目都谎报 1 KB」
+    // 的 zip 能绕过总量上限把内存打爆。
+    let mut actual_total: u64 = 0;
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -199,6 +202,13 @@ pub(crate) fn read_archive(path: &Path) -> Result<BTreeMap<String, Vec<u8>>, Str
         if bytes.len() as u64 > MAX_FILE_BYTES {
             return Err(format!(
                 "归档条目 {name} 实际大小超过单文件上限（{MAX_FILE_BYTES} 字节）"
+            ));
+        }
+        actual_total = actual_total.saturating_add(bytes.len() as u64);
+        if actual_total > MAX_TOTAL_BYTES {
+            return Err(format!(
+                "归档实际解压总量超过上限（{} 字节）",
+                MAX_TOTAL_BYTES
             ));
         }
         if out.insert(name.clone(), bytes).is_some() {

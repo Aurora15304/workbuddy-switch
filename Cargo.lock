@@ -5703,6 +5703,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
  "wb-switch-core",
 ]
 

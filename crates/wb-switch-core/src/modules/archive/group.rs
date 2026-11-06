@@ -19,7 +19,7 @@ use crate::modules::{account, config, export_import};
 use super::{ArchiveEnv, DATA_ROOT_AI, DATA_ROOT_CN, NAMESPACE_AI, NAMESPACE_CN};
 
 // 分组 id 是前后端契约的一部分，不允许改名。
-const ACCOUNTS_ID: &str = "accounts";
+pub(crate) const ACCOUNTS_ID: &str = "accounts";
 const SETTINGS_ID: &str = "settings";
 const LOGS_ID: &str = "logs";
 const STATS_ID: &str = "stats";
@@ -81,6 +81,9 @@ pub struct ArchiveGroup {
     pub sensitive: bool,
     pub files: u64,
     pub bytes: u64,
+    /// 组内最大单文件字节数：超过 core 的单文件上限（16 MiB）时这一组必然导不出去，
+    /// 前端据此提前禁用勾选，而不是让用户点了导出再吃一个 400。
+    pub largest_file_bytes: u64,
 }
 
 /// 一个待打包的文件：zip 内相对路径 + 磁盘来源。

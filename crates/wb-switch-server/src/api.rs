@@ -891,35 +891,38 @@ async fn api_import(Json(body): Json<Value>) -> Response {
 // base64 写成临时文件再交给 core。`data` 体积可能很大，任何错误信息里都不带它。
 // ---------------------------------------------------------------------------
 
-/// 临时 zip 路径：`{temp}/wb-switch-archive-{tag}-{pid}-{seq}.zip`。
+/// 每次请求独占一个临时目录。
 ///
-/// 并发请求靠自增序号区分——毫秒时间戳在同一批请求里会撞名。
-fn temp_archive_path(tag: &str) -> PathBuf {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "wb-switch-archive-{tag}-{}-{}.zip",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ))
+/// 不用 `{temp}/固定名.zip`：那个路径可以被提前摆好的符号链接劫持，`fs::write`
+/// 会跟着写到别处。目录名带 uuid，且用 `create_dir`（不是 `create_dir_all`）
+/// 保证「必须是新建的」；`DROP` 时整目录删除，成功、失败、请求中途取消都不留垃圾。
+#[derive(Debug)]
+struct TempArchive {
+    dir: PathBuf,
+    file: PathBuf,
 }
 
-/// 临时归档文件的 RAII 清理：成功、失败、handler 在中途被 drop 都会删掉。
-#[derive(Debug)]
-struct TempArchive(PathBuf);
-
 impl TempArchive {
-    fn new(tag: &str) -> Self {
-        Self(temp_archive_path(tag))
+    fn new(tag: &str) -> Result<Self, String> {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-switch-archive-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&dir)
+            .map_err(|error| format!("创建临时目录失败（{}）：{error}", dir.display()))?;
+        let file = dir.join("archive.zip");
+        Ok(Self { dir, file })
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        &self.file
     }
 }
 
 impl Drop for TempArchive {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -944,8 +947,15 @@ fn decode_archive(tag: &str, data: &str) -> Result<TempArchive, String> {
     let bytes = BASE64
         .decode(data)
         .map_err(|error| format!("归档数据不是合法的 base64：{error}"))?;
-    let temp = TempArchive::new(tag);
-    std::fs::write(temp.path(), &bytes)
+    let temp = TempArchive::new(tag)?;
+    // create_new：目标文件必须由我们新建，不会跟随已有的符号链接。
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp.path())
+        .map_err(|error| format!("创建临时归档失败（{}）：{error}", temp.path().display()))?;
+    use std::io::Write;
+    file.write_all(&bytes)
         .map_err(|error| format!("写入临时归档失败（{}）：{error}", temp.path().display()))?;
     Ok(temp)
 }
@@ -960,7 +970,7 @@ fn backup_file_name() -> String {
 
 /// 阻塞段：导出到临时文件 → 读回 → base64。临时文件由 `TempArchive` 兜底删除。
 fn export_archive(selected: &[String]) -> Result<Value, String> {
-    let temp = TempArchive::new("export");
+    let temp = TempArchive::new("export")?;
     let outcome = archive::export(selected, temp.path())?;
     let bytes = std::fs::read(temp.path())
         .map_err(|error| format!("读取临时归档失败（{}）：{error}", temp.path().display()))?;

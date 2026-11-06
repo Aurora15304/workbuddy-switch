@@ -1261,7 +1261,7 @@ export interface GrowthAutoResult {
 
 /** 一个可打包的数据组（账号 / 设置 / 日志 / 统计 / 记忆 / 关联）。 */
 export interface ArchiveGroupInfo {
-  /** accounts | settings | logs | stats | memory | links */
+  /** accounts | settings | logs | stats | memory | experts | links */
   id: string;
   title: string;
   description: string;
@@ -1269,6 +1269,8 @@ export interface ArchiveGroupInfo {
   sensitive: boolean;
   files: number;
   bytes: number;
+  /** 组内最大单文件字节数；超过 core 的 16 MiB 上限时这一组无法导出。 */
+  largestFileBytes: number;
 }
 
 /** 打开一个 zip 后的清单（导入前展示给用户确认）。 */

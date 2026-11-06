@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::modules::{config, update};
+use crate::modules::session_link::{try_lock_file, LockError};
+use crate::modules::{account, config, update};
 
 pub use group::ArchiveGroup;
 
@@ -38,6 +39,9 @@ pub(crate) const DATA_ROOT_AI: &str = ".workbuddy-ai";
 /// 两个数据根在 zip 条目名里的命名空间（不带前导点，避免与相对路径混淆）。
 pub(crate) const NAMESPACE_CN: &str = "workbuddy";
 pub(crate) const NAMESPACE_AI: &str = "workbuddy-ai";
+
+/// 导入互斥：同一进程内一次只允许一个导入。
+static IMPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 导出环境的两个根目录。
 ///
@@ -124,18 +128,20 @@ fn groups_in(env: &ArchiveEnv) -> Vec<ArchiveGroup> {
         .map(|spec| {
             let (id, title, description, sensitive) = spec.meta();
             let entries = spec.collect(env);
-            let bytes: u64 = entries
-                .iter()
-                .filter_map(|entry| std::fs::metadata(&entry.source).ok())
-                .map(|meta| meta.len())
-                .sum();
+            let sizes = || {
+                entries
+                    .iter()
+                    .filter_map(|entry| std::fs::metadata(&entry.source).ok())
+                    .map(|meta| meta.len())
+            };
             ArchiveGroup {
                 id: id.to_string(),
                 title: title.to_string(),
                 description: description.to_string(),
                 sensitive,
                 files: entries.len() as u64,
-                bytes,
+                bytes: sizes().sum(),
+                largest_file_bytes: sizes().max().unwrap_or(0),
             }
         })
         .collect()
@@ -206,12 +212,13 @@ fn export_in(env: &ArchiveEnv, selected: &[String], dest: &Path) -> Result<Expor
         .and_then(|name| name.to_str())
         .ok_or_else(|| "导出文件名不合法".to_string())?;
     let tmp = dest.with_file_name(format!("{file_name}.tmp"));
-    zip::write_archive(&tmp, &all)?;
-    // Windows 的 rename 不会覆盖已存在的文件：先删旧包再换名（旧包本来就要被替换）。
-    if dest.exists() {
-        std::fs::remove_file(dest)
-            .map_err(|e| format!("覆盖已有归档失败（{}）：{e}", dest.display()))?;
+    if let Err(error) = zip::write_archive(&tmp, &all) {
+        // 写一半失败也要把 tmp 清掉，别在用户选的目录里留垃圾。
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
+    // `std::fs::rename` 在 Windows 上走 MOVEFILE_REPLACE_EXISTING，本身就会覆盖旧包；
+    // 先删再换会留下「旧包已删、新包还没就位」的空窗（崩溃时备份直接没了）。
     if let Err(error) = std::fs::rename(&tmp, dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("归档落盘失败（{}）：{error}", dest.display()));
@@ -292,6 +299,8 @@ fn inspect_in(archive: &Path) -> Result<ArchiveInspect, String> {
                     sensitive,
                     files: record.files,
                     bytes: record.bytes,
+                    // 清单里不记单文件大小：导入侧只按「组」勾选，用不到这个值。
+                    largest_file_bytes: 0,
                 }
             }
             // 未来版本新增的组：如实展示 id 与统计，让用户知道包里还有东西，
@@ -303,6 +312,7 @@ fn inspect_in(archive: &Path) -> Result<ArchiveInspect, String> {
                 sensitive: false,
                 files: record.files,
                 bytes: record.bytes,
+                largest_file_bytes: 0,
             },
         })
         .collect();
@@ -334,6 +344,19 @@ fn import_with_registry(
     selected: &[String],
     registry: Vec<Box<dyn DataGroupSpec>>,
 ) -> Result<ImportOutcome, String> {
+    // 两级互斥：进程内 Mutex 拦同进程并发（Windows 上并发 CreateFile 会偶发 ACCESS_DENIED），
+    // 文件锁拦桌面端与 webui/CLI 同时导入。锁覆盖「备份 + 写入 + 回滚」全过程。
+    let _process_guard = IMPORT_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_guard = match try_lock_file(&env.store.join("imports.lock")) {
+        Ok(lock) => lock,
+        Err(LockError::Busy) => {
+            return Err("另一个导入正在进行中，请稍后再试".to_string());
+        }
+        Err(LockError::Unavailable(error)) => {
+            return Err(format!("无法建立导入互斥（{}）：{error}", env.store.display()));
+        }
+    };
+
     let files = zip::read_archive(archive)?;
     let raw_manifest = files
         .get(MANIFEST_NAME)
@@ -344,20 +367,22 @@ fn import_with_registry(
     let wanted: Vec<String> = if selected.is_empty() {
         manifest.groups.iter().map(|g| g.id.clone()).collect()
     } else {
+        // 未知 id 静默丢掉：老版本读到新版本备份时，前端会把清单里的组全部勾上，
+        // 其中「当前版本不认识的组」本来就不该阻断其余组的导入。只有全都不认识才报错。
+        let mut ids: Vec<String> = Vec::new();
         for raw in selected {
             let id = raw.trim();
-            if id.is_empty() {
+            if id.is_empty() || !known.contains(&id) {
                 continue;
             }
-            if !known.contains(&id) {
-                return Err(format!("未知的数据分组：{id}"));
+            if !ids.iter().any(|kept| kept == id) {
+                ids.push(id.to_string());
             }
         }
-        selected
-            .iter()
-            .map(|raw| raw.trim().to_string())
-            .filter(|id| !id.is_empty())
-            .collect()
+        if ids.is_empty() {
+            return Err("所选分组当前版本都无法识别，请升级应用后再导入".to_string());
+        }
+        ids
     };
     if wanted.is_empty() {
         return Err("未选择任何数据分组".to_string());
@@ -400,7 +425,7 @@ fn import_with_registry(
     for spec in &plan {
         if let Err(error) = spec.apply(&mut ctx) {
             // 已经写过的组（含当前组写了一半的）按备份还原；导入新建的文件删除。
-            return Err(rollback_error(error, &backup_dir, &group_plans));
+            return Err(rollback_error(env, error, &backup_dir, &group_plans));
         }
     }
 
@@ -510,7 +535,7 @@ fn backup_targets(backup_dir: &Path, group_plan: &GroupPlan) -> Result<(), Strin
 ///
 /// 逐个文件尽力而为：单个文件恢复失败不阻止其它文件回滚，最后一次性报告，
 /// 让用户能按提示手动补齐。
-fn rollback(backup_dir: &Path, group_plans: &[GroupPlan]) -> Vec<String> {
+fn rollback(env: &ArchiveEnv, backup_dir: &Path, group_plans: &[GroupPlan]) -> Vec<String> {
     let mut failures: Vec<String> = Vec::new();
     for group_plan in group_plans {
         for planned in &group_plan.targets {
@@ -526,7 +551,7 @@ fn rollback(backup_dir: &Path, group_plans: &[GroupPlan]) -> Vec<String> {
                         continue;
                     }
                 }
-                if let Err(error) = std::fs::copy(&backup, &planned.target) {
+                if let Err(error) = restore_file(env, &group_plan.id, &backup, &planned.target) {
                     failures.push(format!(
                         "{}：恢复 {} 失败（{error}）",
                         group_plan.id,
@@ -548,9 +573,38 @@ fn rollback(backup_dir: &Path, group_plans: &[GroupPlan]) -> Vec<String> {
     failures
 }
 
+/// 单个文件回滚。
+///
+/// 不用 `fs::copy`：它先截断目标再写，回滚途中崩溃会把 `accounts.json` 变成空文件；
+/// 账号文件还必须持 `with_accounts_write` 的锁，避免覆盖同时发生的额度刷新。
+fn restore_file(
+    env: &ArchiveEnv,
+    group_id: &str,
+    backup: &Path,
+    target: &Path,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(backup)
+        .map_err(|error| format!("读取备份失败（{}）：{error}", backup.display()))?;
+    if group_id == group::ACCOUNTS_ID {
+        let records: Vec<serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|error| format!("备份里的账号文件无法解析：{error}"))?;
+        return account::with_accounts_write(&env.accounts_file(), move |accounts| {
+            *accounts = records;
+            Ok(())
+        });
+    }
+    config::atomic_write(target, &text)
+        .map_err(|error| format!("写入 {} 失败：{error}", target.display()))
+}
+
 /// 把「导入失败 + 回滚结果」拼成给用户看的错误文案。
-fn rollback_error(error: String, backup_dir: &Path, group_plans: &[GroupPlan]) -> String {
-    let failures = rollback(backup_dir, group_plans);
+fn rollback_error(
+    env: &ArchiveEnv,
+    error: String,
+    backup_dir: &Path,
+    group_plans: &[GroupPlan],
+) -> String {
+    let failures = rollback(env, backup_dir, group_plans);
     if failures.is_empty() {
         format!(
             "导入失败：{error}；已回滚到导入前状态（备份保留在 {}）",
@@ -858,17 +912,29 @@ mod tests {
     }
 
     #[test]
-    fn unknown_group_is_rejected_on_both_sides() {
+    fn unknown_group_is_rejected_on_export_but_skipped_on_import() {
         let root = TempRoot::new("unknown");
         let env = root.env();
         seed(&env);
         let dest = root.path().join("a.zip");
+        // 导出：未知 id 说明调用方拼错了，直接报错。
         assert!(export_in(&env, &["nope".to_string()], &dest).is_err());
 
         let export = export_in(&env, &[], &dest).unwrap();
         assert!(!export.groups.is_empty());
+
+        // 导入：老版本读到新版本备份时，前端会把清单里的组全勾上；不认识的组应跳过，
+        // 而不是把整次导入拖死。只有「一个都不认识」才报错。
+        let outcome = import_in(
+            &env,
+            &dest,
+            &["nope".to_string(), "settings".to_string()],
+        )
+        .unwrap();
+        assert_eq!(outcome.groups, vec!["settings".to_string()]);
+
         let err = import_in(&env, &dest, &["nope".to_string()]).unwrap_err();
-        assert!(err.contains("未知的数据分组"), "{err}");
+        assert!(err.contains("无法识别"), "{err}");
     }
 
     #[test]
