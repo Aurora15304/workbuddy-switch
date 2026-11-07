@@ -11,6 +11,7 @@ import {
   memoryAssetLabel,
   memorySummaryWarning,
   memoryToasts,
+  mirrorSubmitBlockReason,
   resolveMemorySources,
   showsSourcePicker,
   toMirrorSwitchArgs,
@@ -441,5 +442,67 @@ describe("镜像切换 — 母本 uid 由登录态确定，defaultUid 禁止代�
       experts: true,
       sessionSelectAll: true,
     });
+  });
+});
+
+/**
+ * 软删 0 条不是错误状态：目标账号的会话若全在含母本的关联组内，后端算出的 targets
+ * 就是 0，但此时仍可能要复制母本独有会话、覆盖 MEMORY.md。
+ * 本机实测 2c41d2bd / 3b0de806 两账号正是这种状态——旧逻辑把按钮永久锁死。
+ */
+describe("镜像切换 — 软删 0 条必须可执行（曾因 targets>0 前置导致按钮永久禁用）", () => {
+  const ready = {
+    motherUid: "u2",
+    acknowledged: true,
+    confirmed: true,
+    enabled: true,
+  };
+
+  function previewWith(targets: MirrorPreview["targets"], copiedCount: number): MirrorPreview {
+    return {
+      ...mirrorPreviewFixture("u2"),
+      targets,
+      sessionCount: targets.length,
+      copiedCount,
+    };
+  }
+
+  it("待软删 0 条但仍有会话要复制：可提交，且能产出 mirrorPlan", () => {
+    const preview = previewWith([], 13);
+    expect(mirrorSubmitBlockReason(ready, preview)).toBeNull();
+    expect(canSubmitMirror(ready, preview)).toBe(true);
+    expect(toMirrorSwitchArgs(ready, preview).mirrorPlan).toBeDefined();
+  });
+
+  it("软删与复制同时为 0 也不拦：前端看不到 MEMORY.md 是否已一致，交后端 no-op 判定", () => {
+    const preview = previewWith([], 0);
+    // 回归锁：曾把 0/0 当成「已与母本一致」直接禁用按钮，那是假陈述——
+    // 目标账号的 MEMORY.md 可能与母本不同，后端仍会执行覆盖。
+    expect(mirrorSubmitBlockReason(ready, preview)).toBeNull();
+    expect(canSubmitMirror(ready, preview)).toBe(true);
+  });
+
+  it("阻塞原因逐条可读：未启用 / 无母本 / 未预览 / 空凭证 / 母本变化 / 未勾备份", () => {
+    const preview = previewWith(mirrorPreviewFixture("u2").targets, 0);
+    expect(mirrorSubmitBlockReason({ ...ready, enabled: false }, preview)).toContain(
+      "启用镜像切换",
+    );
+    expect(mirrorSubmitBlockReason({ ...ready, motherUid: null }, preview)).toContain("登录账号");
+    expect(mirrorSubmitBlockReason(ready, null)).toContain("预览");
+    expect(mirrorSubmitBlockReason(ready, { ...preview, previewToken: "   " })).toContain(
+      "预览已失效",
+    );
+    expect(mirrorSubmitBlockReason(ready, mirrorPreviewFixture("u1"))).toContain(
+      "登录账号已变化",
+    );
+    expect(mirrorSubmitBlockReason({ ...ready, acknowledged: false }, preview)).toContain(
+      "我已知会先备份",
+    );
+  });
+
+  it("条件齐备时原因为 null，但未二次确认仍不可提交", () => {
+    const preview = previewWith(mirrorPreviewFixture("u2").targets, 0);
+    expect(mirrorSubmitBlockReason(ready, preview)).toBeNull();
+    expect(canSubmitMirror({ ...ready, confirmed: false }, preview)).toBe(false);
   });
 });

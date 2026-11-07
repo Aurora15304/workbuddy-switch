@@ -48,6 +48,7 @@ import { useAccountsStore } from "@/stores/accounts";
 import {
   assetSyncSuppressedByMirror,
   canSubmitMirror,
+  mirrorSubmitBlockReason,
   canSubmitMemory,
   initialMirrorSelection,
   initialSwitchExtras,
@@ -66,6 +67,11 @@ import {
   hasMirrorRiskAcknowledged,
   rememberMirrorRiskAcknowledged,
 } from "@/lib/mirror-risk-ack";
+import {
+  forgetMirrorBackup,
+  lastMirrorBackup,
+  rememberMirrorBackup,
+} from "@/lib/mirror-backup";
 import type {
   AccountMeta,
   MirrorPreview,
@@ -153,7 +159,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [syncSelections, setSyncSelections] = useState<SessionSyncSelection[]>([]);
   const [syncGroups, setSyncGroups] = useState<SessionLinkPreviewGroup[]>([]);
   /** 当前 tab：默认关联会话；该 tab 不可用时回落到复制会话。 */
-  const [tab, setTab] = useState<"links" | "copy" | "sync">("links");
+  const [tab, setTab] = useState<"links" | "copy" | "sync" | "mirror">("links");
   /** 关联会话区块上报的状态：tab 徽标与常驻提示用。 */
   const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
   /** 工作记忆三选一：不同步（默认）/ 合并 / 用母本复制覆盖。破坏性项永不默认选中。 */
@@ -300,7 +306,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setMirrorPreviewBusy(false);
     setMirrorError("");
     setMirrorConfirmOpen(false);
-    setMirrorBackup(null);
+    // 上次备份路径持久化在 localStorage：切号会重启应用、弹窗会关，
+    // 只放 state 里等于还原入口永远不再出现（承诺可还原却找不到入口）。
+    setMirrorBackup(lastMirrorBackup());
     setTab("links");
     setLoadingSessions(true);
     void api.listSessions(variant)
@@ -352,6 +360,12 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     memorySources.options.find((option) => option.uid === mirror.motherUid)?.label ??
     mirrorPreview?.motherLabel ??
     "母本账号";
+
+  /**
+   * 二次确认按钮的唯一阻塞原因：按钮 `disabled` 与下方文案都由此派生。
+   * `null` = 可以点；非空 = 逐字告诉用户还缺什么，绝不静默禁用。
+   */
+  const mirrorSubmitBlocker = mirrorSubmitBlockReason(mirror, mirrorPreview);
 
   /** 独立只读预览：母本由后端取自登录态，返回的 motherUid 只做只读校验与回显。 */
   async function loadMirrorPreview() {
@@ -425,6 +439,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       .then((r) => {
         if (r.ok) {
           toast.success("已还原镜像切换前的备份");
+          forgetMirrorBackup();
           setMirrorBackup(null);
         } else {
           toast.error("还原失败", { description: r.error ?? "备份可能已不存在" });
@@ -494,28 +509,49 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           }`,
         );
       }
-      // 镜像切换：成功提示里一次性「还原」按钮 + 明文备份绝对路径（不建常驻列表）。
-      // 备份成功但落盘失败必须保留为可还原项，绝不按「成功清理」回收。
+      // 镜像切换：一次切号只报一条主结果，三种语义分开——
+      // ① needsRecovery：有未完成写入，下次切号会先恢复；
+      // ② errors 非空：部分步骤没做成（写入前就失败的居多，不产生待恢复记录）；
+      // ③ 其余：整份完成。
+      // 无论哪种，备份路径都先记下来：没有入口的"可还原"等于没有还原。
       const mirrorReport = res.mirror;
       if (mirrorReport) {
-        const removed = `整份镜像完成：软删 ${mirrorReport.deletedSessions} 个会话、复制 ${mirrorReport.copiedSessions} 个会话`;
-        parts.push(removed);
-        if (mirrorReport.needsRecovery) {
-          toast.error("镜像切换未全部完成，备份已保留", {
-            description: `${mirrorReport.backup ? `备份：${mirrorReport.backup}；` : ""}已登记为可还原项，下次切号会先恢复，绝不按成功清理回收。`,
-          });
-        } else if (mirrorReport.backup) {
-          const backup = mirrorReport.backup;
+        const backup = mirrorReport.backup;
+        const failed = mirrorReport.errors.length > 0;
+        const unfinished = mirrorReport.needsRecovery;
+        const title = unfinished
+          ? `镜像未完成、需要恢复：已软删 ${mirrorReport.deletedSessions} 个、复制 ${mirrorReport.copiedSessions} 个`
+          : failed
+            ? `镜像部分完成：已软删 ${mirrorReport.deletedSessions} 个、复制 ${mirrorReport.copiedSessions} 个`
+            : `整份镜像完成：软删 ${mirrorReport.deletedSessions} 个会话、复制 ${mirrorReport.copiedSessions} 个会话`;
+        parts.push(title);
+        if (backup) {
+          rememberMirrorBackup(backup);
           setMirrorBackup(backup);
-          toast.success(removed, {
+        }
+        const restoreAction = backup
+          ? { label: "还原", onClick: () => restoreMirrorBackup(backup) }
+          : undefined;
+        if (unfinished) {
+          toast.error("镜像切换未全部完成，下次切号会先恢复", {
+            description: `${backup ? `备份：${backup}；` : ""}已登记为可还原项，绝不按成功清理回收。`,
+            action: restoreAction,
+          });
+        } else if (failed) {
+          toast.warning("镜像部分未完成，备份已保留", {
+            description: `${backup ? `备份：${backup}；` : ""}可以在「镜像切换」tab 里一键还原。`,
+            action: restoreAction,
+          });
+        } else if (backup) {
+          toast.success(title, {
             description: `覆盖前已先备份，明文路径：${backup}。如需撤销可点「还原」。`,
-            action: { label: "还原", onClick: () => restoreMirrorBackup(backup) },
+            action: restoreAction,
           });
         }
         for (const warning of mirrorReport.warnings) {
           toast.warning("镜像切换已落盘但持久化证明缺失", { description: warning });
         }
-        if (mirrorReport.errors.length > 0) {
+        if (failed) {
           toast.error("部分镜像切换未完成", {
             description: mirrorReport.errors.map((item) => `${item.sessionId}：${item.error}`).join("；"),
           });
@@ -821,6 +857,17 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   /** 第三个 tab：跨账号同步（记忆 / 人设 / 专家团）。原来挤在底部，收纳到这里。 */
   const syncTabContent = (
     <div className="space-y-2.5">
+      {/* 镜像启用时这里是全灰的，原因必须写在当前 tab 内，不能只在镜像 tab 里。 */}
+      {mirrorBlocks.memory && (
+        <Alert variant="default" className="min-w-0">
+          <CircleAlert />
+          <AlertTitle>镜像切换已启用</AlertTitle>
+          <AlertDescription className="min-w-0 break-words">
+            附加同步（工作记忆 / 人设 / 专家团）与一键全选已暂时关闭，避免和整份镜像双重写入。
+            要逐项同步，请先到「镜像切换」tab 取消启用。
+          </AlertDescription>
+        </Alert>
+      )}
       <p className="text-xs text-muted-foreground">
         这些都是本地文件操作，与会话无关；选定后会在写入登录态之前完成，覆盖前都会先备份。
       </p>
@@ -978,6 +1025,12 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         </div>
       </label>
 
+    </div>
+  );
+
+  // 镜像切换独立为第 4 个 tab（排在「附加同步」右侧，用户明确要求）。
+  const mirrorTabContent = (
+    <div className="space-y-2">
       {/* 镜像切换：显式独立通道。默认全关，绝不并入一键全选 / 工作记忆 / 人设 / 归档。 */}
       <div className="space-y-2 rounded-md border border-destructive/40 px-3 py-2.5">
         <div className="flex items-center justify-between gap-2">
@@ -1037,6 +1090,15 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           {mirrorPreviewBusy ? <Loader2 className="animate-spin" /> : <CircleAlert />}
           {mirrorPreviewBusy ? "正在核对整份镜像…" : "预览镜像将改变的会话"}
         </Button>
+        {/* 预览按钮为什么不能点：逐条说清，不留"灰着不解释"的状态。 */}
+        {!mirrorPreviewBusy && !mirror.enabled && (
+          <p className="text-xs text-muted-foreground">先勾选上面的「启用镜像切换」，才能预览。</p>
+        )}
+        {!mirrorPreviewBusy && mirror.enabled && !mirror.motherUid && (
+          <p className="text-xs text-muted-foreground">
+            没认到当前登录账号，请先登录母本账号，再重新打开切号窗口。
+          </p>
+        )}
 
         {mirrorError && (
           <Alert variant="destructive" className="min-w-0">
@@ -1047,22 +1109,30 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         {mirrorPreview && (
           <div className="space-y-2 rounded-md border bg-muted/30 px-2.5 py-2">
             <div className="text-xs font-medium">
-              {`母本「${mirrorMotherLabel}」为准，将软删 ${mirrorPreview.sessionCount} 个会话、复制 ${mirrorPreview.copiedCount} 个会话`}
+              {mirrorPreview.sessionCount > 0
+                ? `母本「${mirrorMotherLabel}」为准，将软删 ${mirrorPreview.sessionCount} 个会话、复制 ${mirrorPreview.copiedCount} 个会话`
+                : `母本「${mirrorMotherLabel}」已包含目标账号现有的全部会话；本次将复制 ${mirrorPreview.copiedCount} 个会话，并按需覆盖 MEMORY.md`}
             </div>
             {/* 逐条待软删清单：不折叠，含私有会话；母本会话不进此清单。 */}
-            <ul className="max-h-40 space-y-1 overflow-y-auto text-xs">
-              {mirrorPreview.targets.map((target) => (
-                <li
-                  key={`mirror:${target.sessionId}`}
-                  className="flex items-start justify-between gap-2"
-                >
-                  <span className="min-w-0 break-all">{target.title || target.sessionId}</span>
-                  <span className="shrink-0 text-muted-foreground tabular-nums">
-                    {target.groupId ? "关联会话 · 软删" : "私有会话 · 软删"}
-                  </span>
-                </li>
-              ))}
-            </ul>
+            {mirrorPreview.targets.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                没有要软删的会话——目标账号的会话母本都有，不会删除任何东西。
+              </p>
+            ) : (
+              <ul className="max-h-40 space-y-1 overflow-y-auto text-xs">
+                {mirrorPreview.targets.map((target) => (
+                  <li
+                    key={`mirror:${target.sessionId}`}
+                    className="flex items-start justify-between gap-2"
+                  >
+                    <span className="min-w-0 break-all">{target.title || target.sessionId}</span>
+                    <span className="shrink-0 text-muted-foreground tabular-nums">
+                      {target.groupId ? "关联会话 · 软删" : "私有会话 · 软删"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
             <label className="flex cursor-pointer items-start gap-2">
               <Checkbox
                 checked={mirror.acknowledged}
@@ -1081,10 +1151,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
             <Button
               variant="destructive"
               size="sm"
-              disabled={
-                busy ||
-                !canSubmitMirror({ ...mirror, confirmed: true }, mirrorPreview)
-              }
+              disabled={busy || mirrorSubmitBlocker !== null}
               onClick={() => setMirrorConfirmOpen(true)}
             >
               二次确认镜像切换
@@ -1095,6 +1162,11 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
               </p>
             )}
           </div>
+        )}
+
+        {/* 启用后始终说明还缺什么（未预览时也要说），不留"灰着不解释"的状态。 */}
+        {mirror.enabled && mirrorSubmitBlocker !== null && (
+          <p className="text-xs text-muted-foreground">{mirrorSubmitBlocker}</p>
         )}
 
         {/* 常驻还原入口：明文备份绝对路径，不建列表、不伪装成成功。 */}
@@ -1120,7 +1192,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           <AlertDialogHeader>
             <AlertDialogTitle>确认镜像切换？</AlertDialogTitle>
             <AlertDialogDescription>
-              {`母本「${mirrorMotherLabel}」为准，将软删 ${mirrorPreview?.sessionCount ?? 0} 个会话、复制 ${mirrorPreview?.copiedCount ?? 0} 个会话。执行前每项仍会重新校验预览凭据与现场摘要，内容已变化会跳过而不是软删；覆盖前先备份，成功后可一键还原。`}
+              {`母本「${mirrorMotherLabel}」为准：软删 ${mirrorPreview?.sessionCount ?? 0} 个会话、复制 ${mirrorPreview?.copiedCount ?? 0} 个会话，并把目标账号的 MEMORY.md 整份覆盖为母本的（覆盖前自动备份）。执行前每项仍会重新校验预览凭据与现场摘要，内容已变化会跳过而不是软删；成功后可一键还原。不影响人设、专家团与归档状态。`}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1151,6 +1223,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       </AlertDialog>
     </div>
   );
+
 
   // 「复制会话」tab 内容：勾选即意图，提交结果由底部摘要兜底确认。
   const copyTabContent = (
@@ -1288,10 +1361,10 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
 
           <Tabs
             value={tab}
-            onValueChange={(value) => setTab(value as "links" | "copy" | "sync")}
+            onValueChange={(value) => setTab(value as "links" | "copy" | "sync" | "mirror")}
             className="flex min-h-0 flex-col gap-3 overflow-hidden"
           >
-            <TabsList className="h-auto w-full shrink-0 justify-start gap-5 rounded-none border-b border-border bg-transparent p-0">
+            <TabsList className="h-auto w-full shrink-0 justify-start gap-3 overflow-x-auto rounded-none border-b border-border bg-transparent p-0 sm:gap-5">
               {linksAvailable && (
                 <TabsTrigger value="links" className={TAB_TRIGGER_CLASS}>
                   关联会话
@@ -1305,6 +1378,11 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
               <TabsTrigger value="sync" className={TAB_TRIGGER_CLASS}>
                 附加同步
                 {tabCount(syncAssetCount)}
+              </TabsTrigger>
+              {/* 镜像切换独立成 tab，位置固定在「附加同步」右侧（用户明确要求）。 */}
+              <TabsTrigger value="mirror" className={TAB_TRIGGER_CLASS}>
+                镜像切换
+                <span className="text-[10px] text-muted-foreground">bata</span>
               </TabsTrigger>
             </TabsList>
             {/* forceMount：切换 tab 不得卸载另一侧，否则关联勾选会被预览重拉重置。 */}
@@ -1339,6 +1417,13 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
               className="min-h-0 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
             >
               {syncTabContent}
+            </TabsContent>
+            <TabsContent
+              value="mirror"
+              forceMount
+              className="min-h-0 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
+            >
+              {mirrorTabContent}
             </TabsContent>
           </Tabs>
         </div>

@@ -48,6 +48,11 @@ pub fn load_github_config() -> Value {
     // 显式代理默认关闭：地址可以留着，但只有用户自己打开开关才生效。
     // 老配置没有这个键 → false，升级后不会继续把更新请求塞进一个可能已经失效的代理。
     let mut proxy_enabled = false;
+    // 发现新版本后是否自动后台下载：默认开（用户的诉求就是"后台自动下"）。
+    // 老配置没有这个键 → true，升级后立即可用；用户显式关掉才保留 false。
+    let mut auto_download = true;
+    // 用户明确跳过的版本号（如 "0.1.79"）；空 = 没有跳过任何版本。
+    let mut skipped_version = String::new();
     let f = github_config_file();
     let mut should_normalize = false;
     if f.exists() {
@@ -69,6 +74,12 @@ pub fn load_github_config() -> Value {
                 if let Some(value) = v.get("proxy_enabled").and_then(Value::as_bool) {
                     proxy_enabled = value;
                 }
+                if let Some(value) = v.get("auto_download").and_then(Value::as_bool) {
+                    auto_download = value;
+                }
+                if let Some(value) = v.get("skipped_version").and_then(|v| v.as_str()) {
+                    skipped_version = value.trim().to_string();
+                }
                 // 只在需要清理历史 token 时写盘；`proxy_enabled` 缺失按 false 处理即可，
                 // 不在「读配置」时顺手改文件。
                 should_normalize = v.get("token").is_some();
@@ -85,6 +96,8 @@ pub fn load_github_config() -> Value {
         "repo": repo,
         "proxy": proxy,
         "proxy_enabled": proxy_enabled,
+        "auto_download": auto_download,
+        "skipped_version": skipped_version,
     });
     if should_normalize {
         let _ = atomic_write(
@@ -101,6 +114,43 @@ pub fn load_github_config() -> Value {
 /// 已经失效的历史地址会把清单和镜像一起拖死。
 pub fn effective_proxy() -> Option<String> {
     effective_proxy_from(&load_github_config())
+}
+
+/// 发现新版本后是否自动后台下载。缺省 `true`：用户要的就是"后台自动下"。
+pub fn auto_download_enabled() -> bool {
+    load_github_config()
+        .get("auto_download")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// 用户明确跳过的版本号（已去空白并去掉前导 `v`）；`None` = 没有跳过任何版本。
+pub fn skipped_version() -> Option<String> {
+    load_github_config()
+        .get("skipped_version")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().trim_start_matches('v').to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// 记录或清除「已跳过版本」。PATCH 语义：只改这一个键，不碰其余配置。
+///
+/// 传 `None`（或空白）即清除跳过标记，下次发现同一版本会重新提示。
+pub fn set_skipped_version(version: Option<&str>) -> std::io::Result<()> {
+    let mut cfg = load_github_config();
+    let value = version
+        .map(|value| value.trim().trim_start_matches('v'))
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    cfg["skipped_version"] = json!(value);
+    save_github_config(&cfg)
+}
+
+/// 开关「自动后台下载」。PATCH 语义：只改这一个键。
+pub fn set_auto_download(enabled: bool) -> std::io::Result<()> {
+    let mut cfg = load_github_config();
+    cfg["auto_download"] = json!(enabled);
+    save_github_config(&cfg)
 }
 
 /// 同一份配置已经在手上时用它，别为了取代理再读一次磁盘。
@@ -141,18 +191,36 @@ pub fn save_github_config(cfg: &Value) -> std::io::Result<()> {
         .unwrap_or("");
     // 没带这个键（老客户端只发 owner/repo/proxy）时保留磁盘上的状态，
     // 不能按 PATCH 语义把用户已经打开的开关悄悄关掉。
+    let disk = load_github_config();
     let proxy_enabled = match cfg.get("proxy_enabled").and_then(Value::as_bool) {
         Some(value) => value,
-        None => load_github_config()
-            .get("proxy_enabled")
+        None => disk.get("proxy_enabled").and_then(Value::as_bool) == Some(true),
+    };
+    // 同理：新增的两个键也必须是 PATCH 语义——只改调用方显式带来的那个键，
+    // 否则「保存代理地址」会顺手把"自动下载"和"已跳过版本"重置掉。
+    let auto_download = match cfg.get("auto_download").and_then(Value::as_bool) {
+        Some(value) => value,
+        None => disk
+            .get("auto_download")
             .and_then(Value::as_bool)
-            == Some(true),
+            .unwrap_or(true),
+    };
+    let skipped_version = match cfg.get("skipped_version").and_then(|v| v.as_str()) {
+        Some(value) => value.trim().to_string(),
+        None => disk
+            .get("skipped_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
     };
     let clean = json!({
         "owner": owner,
         "repo": repo,
         "proxy": proxy,
         "proxy_enabled": proxy_enabled,
+        "auto_download": auto_download,
+        "skipped_version": skipped_version,
     });
     std::fs::create_dir_all(store_dir())?;
     atomic_write(

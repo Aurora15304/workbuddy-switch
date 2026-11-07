@@ -26,7 +26,7 @@ use wb_switch_core::modules::update;
 use wb_switch_core::modules::update_download;
 
 /// 后台首次检查延迟：启动 15 秒后（替代前端 30 分钟轮询的首屏延迟）。
-pub const FIRST_CHECK_DELAY: Duration = Duration::from_secs(15);
+pub const FIRST_CHECK_DELAY: Duration = Duration::from_secs(5);
 /// 后台检查间隔（30 分钟）。
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
@@ -424,14 +424,67 @@ pub async fn restart<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 ///
 /// 常驻循环随进程存活，轻量模式（WebView 销毁）与主窗口关闭时同样在跑；
 /// 未带 force 走 core 的 6 小时缓存，因此多数轮次不发网络请求。
+///
+/// 发现新版本且用户没跳过时**自动转后台下载**（用户诉求："不是说后台下载吗"）。
 pub fn spawn_periodic_check(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(FIRST_CHECK_DELAY).await;
         loop {
-            let _ = check(&app, None, false).await;
+            // 注意顺序：`check` 内部持 BusyGuard 并在返回时释放；自动下载必须在它
+            // 释放**之后**另起一次获取。BusyGuard 不可重入，在 check 内部调用
+            // start_download 会 100% 被 BUSY 拒绝。
+            let result = check(&app, None, false).await;
+            maybe_auto_download(&app, &result).await;
             tokio::time::sleep(CHECK_INTERVAL).await;
         }
     });
+}
+
+/// 检查结果说「有新版」且用户没跳过，就自动进后台下载。
+///
+/// 只做决策，不做下载：真正的下载仍走 [`start_download`]（含 BusyGuard、通知、托盘）。
+async fn maybe_auto_download<R: Runtime>(app: &AppHandle<R>, result: &Value) {
+    if crate::is_screenshot_demo() {
+        return;
+    }
+    if !update::auto_download_enabled() {
+        return;
+    }
+    let has_update = result
+        .get("hasUpdate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let Some(latest) = result
+        .get("latest")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    if !has_update {
+        return;
+    }
+    if update::skipped_version().as_deref() == Some(latest) {
+        eprintln!("[更新] v{latest} 已被用户跳过，不自动下载");
+        return;
+    }
+    // 阶段必须是 available：检查刚失败或是"已最新"时不该下载。
+    if snapshot().phase != "available" {
+        return;
+    }
+    match start_download(app) {
+        Ok(()) => {
+            eprintln!("[更新] v{latest} 自动后台下载已启动");
+            notify(
+                app,
+                "发现新版本",
+                &format!("v{latest} 正在后台下载，完成后会提示你重启安装"),
+            );
+        }
+        // 用户可能刚在弹窗里手点了下载：BUSY 属正常拒绝，不重复、不报错。
+        Err(error) => eprintln!("[更新] 自动下载未启动：{error}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -531,6 +584,9 @@ async fn download_verified(
     progress: &update_download::Progress,
 ) -> Result<Vec<u8>, String> {
     let candidates = update_download::download_candidates(update.download_url.as_str());
+    // 候选顺序不再写死：镜像与直连谁快完全取决于用户网络（实测过镜像 20 KB/s、
+    // 代理直连 3.5 MB/s 的机器，也见过相反的）。按小样本实测速度重排，慢的沉底兜底。
+    let candidates = update_download::rank_candidates(&candidates, proxy).await;
     let mut failures: Vec<String> = Vec::new();
     for candidate in candidates {
         let label = source_label(&candidate);

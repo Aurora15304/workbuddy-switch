@@ -35,7 +35,6 @@ export function UpdateInstallDialog({ open, onOpenChange }: UpdateInstallDialogP
   const phase = snapshot.phase;
   const targetVersion = snapshot.latest ?? "新版本";
   const percent = snapshot.percent;
-  const busy = phase === "checking" || phase === "downloading";
   const error = actionError ?? snapshot.message ?? "未知更新错误";
 
   useEffect(() => {
@@ -71,6 +70,18 @@ export function UpdateInstallDialog({ open, onOpenChange }: UpdateInstallDialogP
     }
   }
 
+  /** 跳过当前版本：只写配置，不动已经下好的包与更新源。 */
+  async function skipVersion() {
+    if (!snapshot.latest) return;
+    setActionError(null);
+    try {
+      await api.updateSkipVersion(snapshot.latest);
+      onOpenChange(false);
+    } catch (e) {
+      setActionError(`跳过版本失败：${api.asError(e)}`);
+    }
+  }
+
   async function restartApp() {
     setRestarting(true);
     setActionError(null);
@@ -94,11 +105,13 @@ export function UpdateInstallDialog({ open, onOpenChange }: UpdateInstallDialogP
     <Dialog
       open={open}
       onOpenChange={(next) => {
-        if (!next && (busy || restarting)) return;
+        // 只有「正在安装并重启」不可关；下载在后台跑，关窗不该拦——
+        // 否则文案说"可随时从托盘查看进度"，按钮却把人锁在弹窗里。
+        if (!next && restarting) return;
         onOpenChange(next);
       }}
     >
-      <DialogContent showCloseButton={!busy && !restarting}>
+      <DialogContent showCloseButton={!restarting}>
         <DialogHeader>
           <DialogTitle>
             {phase === "checking" && "正在检查更新"}
@@ -111,7 +124,7 @@ export function UpdateInstallDialog({ open, onOpenChange }: UpdateInstallDialogP
           <DialogDescription>
             {phase === "checking" && "正在检查 GitHub Release 中的签名更新包，请稍候。"}
             {phase === "downloading" &&
-              "请不要关闭应用，更新包下载完成后由你决定何时重启安装。"}
+              "下载在后台进行，关掉这个窗口不会中断；进度见托盘提示，完成后由你决定何时重启安装。"}
             {(phase === "idle" || phase === "upToDate") &&
               "没有发现高于当前版本的签名更新包。"}
             {phase === "available" &&
@@ -129,8 +142,11 @@ export function UpdateInstallDialog({ open, onOpenChange }: UpdateInstallDialogP
         )}
 
         {phase === "available" && (
-          <div className="rounded-md border p-3 text-sm">
-            v{targetVersion} 已确认可升级。点击下方按钮开始下载；下载在后台进行，可随时从托盘查看进度。
+          <div className="space-y-1 rounded-md border p-3 text-sm">
+            <p>v{targetVersion} 已确认可升级。</p>
+            <p className="text-xs text-muted-foreground">
+              开启「自动后台下载」时，发现新版本会自动开始下载；这里只是手动入口。下载在后台进行，关掉窗口不会中断。
+            </p>
           </div>
         )}
 
@@ -171,12 +187,21 @@ export function UpdateInstallDialog({ open, onOpenChange }: UpdateInstallDialogP
           {phase === "available" && (
             <>
               <Button variant="outline" onClick={() => onOpenChange(false)}>
-                关闭
+                稍后提醒
               </Button>
+              <DemoAction>
+                <Button
+                  variant="ghost"
+                  onClick={() => void skipVersion()}
+                  disabled={!snapshot.latest}
+                >
+                  跳过 v{targetVersion}
+                </Button>
+              </DemoAction>
               <DemoAction>
                 <Button onClick={() => void startDownload()}>
                   <Download />
-                  下载更新包
+                  立即下载
                 </Button>
               </DemoAction>
             </>

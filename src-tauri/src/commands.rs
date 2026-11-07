@@ -1477,6 +1477,29 @@ pub async fn update_restart(app: tauri::AppHandle) -> Result<(), String> {
     crate::update_service::restart(&app).await
 }
 
+/// 跳过指定版本：之后检查到这个版本不再提示、也不自动下载。
+///
+/// 纯配置写入（PATCH 语义，只改 `skipped_version`），不动更新源、代理或自动下载开关。
+#[tauri::command]
+pub fn update_skip_version(version: String) -> Result<Value, String> {
+    update::set_skipped_version(Some(&version)).map_err(|e| e.to_string())?;
+    Ok(update::load_github_config())
+}
+
+/// 清除「已跳过版本」：下次发现同一版本会重新提示。
+#[tauri::command]
+pub fn update_clear_skipped_version() -> Result<Value, String> {
+    update::set_skipped_version(None).map_err(|e| e.to_string())?;
+    Ok(update::load_github_config())
+}
+
+/// 开关「发现新版本后自动在后台下载」。PATCH 语义，只改这一个键。
+#[tauri::command]
+pub fn update_set_auto_download(enabled: bool) -> Result<Value, String> {
+    update::set_auto_download(enabled).map_err(|e| e.to_string())?;
+    Ok(update::load_github_config())
+}
+
 /// 启动当前应用的新进程并退出旧进程，用于更新安装完成后的立即重启。
 #[tauri::command]
 pub fn relaunch_app(_app: tauri::AppHandle) -> Result<(), String> {

@@ -1022,8 +1022,8 @@ pub fn mirror_apply_at(
     })?;
 
     // 复制母本独有会话：失败不阻断软删，错误进 errors；成功的新副本登记进清单供回滚。
-    let (copied_entries, copy_errors) = if missing.is_empty() {
-        (Vec::new(), Vec::new())
+    let (copied_entries, copy_errors, copy_needs_recovery) = if missing.is_empty() {
+        (Vec::new(), Vec::new(), false)
     } else {
         copy_missing_sessions(paths, variant, acc, target_uid, &missing)
     };
@@ -1049,12 +1049,19 @@ pub fn mirror_apply_at(
         ));
     }
 
+    // `needs_recovery` 只回填复制侧的真实值（`session.rs` 在「有未完成写入 / 恢复不干净」
+    // 时才置 true）——它的语义是「下次切号会先恢复」，不能拿来表达「这次没全成」。
+    // 复制在写入前就失败（如源正文不存在）、或多账号 MEMORY.md 覆盖失败，都不产生
+    // pending operation，标 true 等于承诺一件不会发生的事；那类情况由前端用
+    // `errors` 单独表达为「部分未完成，备份已保留」。
+    let needs_recovery = copy_needs_recovery;
+
     Ok(MirrorReport {
         deleted_sessions: deleted,
         copied_sessions: copied_entries.len(),
         restored_copies: 0,
         backup: Some(backup_dir.to_string_lossy().to_string()),
-        needs_recovery: false,
+        needs_recovery,
         warnings,
         skipped,
         errors,
@@ -1068,7 +1075,7 @@ fn copy_missing_sessions(
     acc: &Value,
     target_uid: &str,
     missing: &[String],
-) -> (Vec<MirrorCopiedEntry>, Vec<MirrorError>) {
+) -> (Vec<MirrorCopiedEntry>, Vec<MirrorError>, bool) {
     // App 已在 switch 主干 close_workbuddy 之后关闭，探针恒 false。
     let report = match session::copy_sessions_for_switch_at(paths, variant, acc, missing, |_| false) {
         Ok(report) => report,
@@ -1079,6 +1086,7 @@ fn copy_missing_sessions(
                     session_id: String::new(),
                     error,
                 }],
+                false,
             )
         }
     };
@@ -1127,7 +1135,13 @@ fn copy_missing_sessions(
                 .collect()
         })
         .unwrap_or_default();
-    (copied_entries, copy_errors)
+    // 复制侧自己的恢复标记：会话持久化不完整时它会是 true，必须原样上报，
+    // 不能被镜像层压成「整份镜像完成」。
+    let copy_needs_recovery = report
+        .get("needsRecovery")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    (copied_entries, copy_errors, copy_needs_recovery)
 }
 
 /// 整份覆盖目标账号 `MEMORY.md`：成功回填备份路径，失败折算成 `errors`（不阻断软删/复制）。

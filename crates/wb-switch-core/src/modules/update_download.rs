@@ -75,6 +75,96 @@ pub fn download_candidates(url: &str) -> Vec<String> {
     candidates
 }
 
+/// 测速样本大小：256 KiB。够判断通道量级，又不必为了排序先下掉半个包。
+const PROBE_SAMPLE_BYTES: u64 = 256 * 1024;
+
+/// 单个候选的测速预算：拿满样本会立即返回，只有慢/死的通道才吃满这 2.5 秒。
+const PROBE_BUDGET: Duration = Duration::from_millis(2_500);
+
+/// 测速阶段的建连超时：比正式下载短得多——不通就赶紧换下一条。
+const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+/// 按**实测速度**重排候选：快的在前，没测通的沉底但仍保留（兜底）。
+///
+/// 为什么不能写死顺序：镜像与直连谁更快完全取决于用户网络。实测过两种相反的环境——
+/// 有的机器镜像 6.7 MB/s、直连 0；有的机器镜像 20 KB/s、代理直连 3.5 MB/s。
+/// 写死任何一边都会让另一半用户慢几十倍，所以排序必须是运行时结果。
+///
+/// 并发探测、互不影响；单条失败只意味着它拿 0 分，不会中断整体。
+pub async fn rank_candidates(candidates: &[String], proxy: Option<&str>) -> Vec<String> {
+    if candidates.len() <= 1 {
+        return candidates.to_vec();
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for (index, url) in candidates.iter().enumerate() {
+        let url = url.clone();
+        let proxy = proxy.map(str::to_string);
+        set.spawn(async move {
+            let speed = probe_speed(&url, proxy.as_deref()).await;
+            (index, speed)
+        });
+    }
+    // 按索引回填而不是收集返回值：即使某条任务被取消，候选也不会从列表里消失。
+    let mut speeds = vec![0u64; candidates.len()];
+    while let Some(joined) = set.join_next().await {
+        if let Ok((index, speed)) = joined {
+            speeds[index] = speed;
+        }
+    }
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by(|&a, &b| speeds[b].cmp(&speeds[a]).then(a.cmp(&b)));
+    order.into_iter().map(|index| candidates[index].clone()).collect()
+}
+
+/// 小样本测速：返回字节/秒；任何失败都返回 0（等价于「这条最慢」）。
+async fn probe_speed(url: &str, proxy: Option<&str>) -> u64 {
+    let direct = is_mirror_url(url);
+    let mut builder = reqwest::Client::builder()
+        .user_agent(DEFAULT_HTTP_USER_AGENT)
+        .connect_timeout(PROBE_CONNECT_TIMEOUT);
+    if direct {
+        builder = builder.no_proxy();
+    } else if let Some(proxy) = proxy.map(str::trim).filter(|value| !value.is_empty()) {
+        match reqwest::Proxy::all(proxy) {
+            Ok(configured) => builder = builder.proxy(configured),
+            Err(_) => return 0,
+        }
+    }
+    let Ok(client) = builder.build() else {
+        return 0;
+    };
+    let started = std::time::Instant::now();
+    let Ok(response) = client
+        .get(url)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes=0-{}", PROBE_SAMPLE_BYTES - 1),
+        )
+        .timeout(PROBE_BUDGET)
+        .send()
+        .await
+    else {
+        return 0;
+    };
+    let status = response.status();
+    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return 0;
+    }
+    let mut response = response;
+    let mut received: u64 = 0;
+    loop {
+        if received >= PROBE_SAMPLE_BYTES || started.elapsed() >= PROBE_BUDGET {
+            break;
+        }
+        match tokio::time::timeout(PROBE_BUDGET, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => received += chunk.len() as u64,
+            _ => break,
+        }
+    }
+    let elapsed_ms = started.elapsed().as_millis().max(1) as u64;
+    received * 1000 / elapsed_ms
+}
+
 /// 把总字节切成 `connections` 段，返回闭区间 `(start, end)`。
 pub fn plan_segments(total: u64, connections: usize) -> Vec<(u64, u64)> {
     if total == 0 || connections == 0 {
@@ -740,5 +830,29 @@ mod tests {
             String::from_utf8_lossy(&body).contains("version"),
             "下载内容看起来不是更新清单"
         );
+    }
+
+    /// 空输入不该 panic、也不该造出候选；单元素直接原样返回（连测速都省掉）。
+    #[tokio::test]
+    async fn rank_candidates_handles_empty_and_single_input_without_network() {
+        assert!(rank_candidates(&[], None).await.is_empty());
+        let single = vec!["https://example.com/updates/a.exe".to_string()];
+        assert_eq!(rank_candidates(&single, None).await, single);
+    }
+
+    /// 两条都不会连通的候选：必须原样保留（慢/死只是排序靠后，不能把兜底删掉）。
+    #[tokio::test]
+    async fn rank_candidates_keeps_every_candidate_even_when_all_probes_fail() {
+        let candidates = vec![
+            "http://127.0.0.1:1/a.exe".to_string(),
+            "http://127.0.0.1:2/b.exe".to_string(),
+        ];
+        let ranked = rank_candidates(&candidates, None).await;
+        assert_eq!(ranked.len(), 2);
+        let mut sorted_input = candidates.clone();
+        let mut sorted_output = ranked.clone();
+        sorted_input.sort();
+        sorted_output.sort();
+        assert_eq!(sorted_input, sorted_output);
     }
 }

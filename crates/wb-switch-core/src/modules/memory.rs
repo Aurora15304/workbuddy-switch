@@ -131,8 +131,16 @@ pub(crate) fn memory_already_identical(root: &Path, source_uid: &str, target_uid
     if uid.is_empty() || target.is_empty() || uid == target {
         return true;
     }
-    let Ok(mother) = std::fs::read_to_string(personal_dir_at(root, uid).join(MEMORY_FILE)) else {
+    let mother_path = personal_dir_at(root, uid).join(MEMORY_FILE);
+    // 「母本没有这个文件」= 没有可覆盖的内容，视为无需处理。
+    // 但「文件存在却读不出来」绝不能当成已一致——那会让镜像静默跳过覆盖，
+    // 用户看到"镜像成功"而记忆其实没动。返回 false 让它进入覆盖流程，
+    // 真正的读取失败会在覆盖里折成可读 errors。
+    if !mother_path.exists() {
         return true;
+    }
+    let Ok(mother) = std::fs::read_to_string(&mother_path) else {
+        return false;
     };
     if mother.trim().is_empty() {
         return true;
@@ -1594,5 +1602,22 @@ mod tests {
             dir.read("target", MEMORY_FILE).as_deref(),
             Some("## 母本\n\n- 完整")
         );
+    }
+
+    /// 母本 MEMORY.md 存在但读不出来，绝不能被当成「已一致」跳过：
+    /// 那会让镜像显示成功、记忆其实没动。用同名目录冒充文件构造读失败。
+    #[test]
+    fn unreadable_mother_memory_counts_as_pending_not_identical() {
+        let dir = TempDir::new("memory-unreadable-mother");
+        let blocked = personal_dir_at(dir.path(), "mother").join(MEMORY_FILE);
+        std::fs::create_dir_all(&blocked).unwrap();
+        assert!(!memory_already_identical(dir.path(), "mother", "target"));
+    }
+
+    /// 母本根本没有 MEMORY.md = 没有可覆盖的内容，视为无需处理（不产生错误）。
+    #[test]
+    fn missing_mother_memory_is_treated_as_nothing_to_copy() {
+        let dir = TempDir::new("memory-missing-mother");
+        assert!(memory_already_identical(dir.path(), "mother", "target"));
     }
 }

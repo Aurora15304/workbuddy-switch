@@ -1020,6 +1020,10 @@ export interface GithubConfig {
   proxy?: string;
   /** 显式代理开关：默认关闭。地址可以留着，只有打开才生效。 */
   proxy_enabled?: boolean;
+  /** 发现新版本后是否自动后台下载。缺省 true（用户诉求就是"后台自动下"）。 */
+  auto_download?: boolean;
+  /** 用户明确跳过的版本号；空/缺省 = 没有跳过任何版本。 */
+  skipped_version?: string;
 }
 
 export interface UpdateInfo {

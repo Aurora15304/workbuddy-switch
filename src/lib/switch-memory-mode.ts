@@ -278,6 +278,33 @@ export function initialMirrorSelection(): MirrorSelection {
 }
 
 /**
+ * 「还不能提交」的**第一条**可读原因；`null` = 已具备提交条件（仍需二次确认）。
+ *
+ * 与 [`canSubmitMirror`] 共用同一套判据：界面按钮的 `disabled` 与按钮下方的文案
+ * 都由本函数派生，避免「按钮灰着但不说为什么」或「文案说能点、按钮却点不动」。
+ *
+ * 刻意**不**判断「软删与复制是否为 0」：
+ * - 软删 0 条是正常结果（目标会话全在含母本的关联组内），不是错误；
+ * - 预览契约里没有「MEMORY.md 是否已一致」这一项，前端无从得知后端是否会因记忆差异
+ *   而实际执行。凭 targets/copiedCount 断言「已一致」是假陈述。
+ * 是否无事可做由后端 `mirror_apply_at` 判定并返回 no-op 报告，前端不猜。
+ */
+export function mirrorSubmitBlockReason(
+  selection: MirrorSelection,
+  preview: MirrorPreview | null,
+): string | null {
+  if (!selection.enabled) return "请先勾选「启用镜像切换」";
+  if (!selection.motherUid) return "未识别到当前登录账号，请重新打开切号窗口";
+  if (!preview) return "请先点「预览镜像将改变的会话」，看清会改什么再确认";
+  if (!preview.previewToken.trim()) return "预览已失效，请重新预览";
+  if (preview.motherUid !== selection.motherUid) {
+    return "当前登录账号已变化，请重新打开切号窗口再试";
+  }
+  if (!selection.acknowledged) return "请先勾选「我已知会先备份」";
+  return null;
+}
+
+/**
  * 提交门禁：母本 uid 已绑定 + 已知会先备份 + 二次确认 + 预览凭证有效且绑定同一母本。
  * `defaultUid` 不在参数里——从源头杜绝「默认母本代入镜像切换」。
  */
@@ -285,11 +312,8 @@ export function canSubmitMirror(
   selection: MirrorSelection,
   preview: MirrorPreview | null,
 ): boolean {
-  if (!selection.enabled) return false;
-  if (!selection.motherUid || !selection.acknowledged || !selection.confirmed) return false;
-  if (!preview || !preview.previewToken.trim() || preview.targets.length === 0) return false;
-  if (preview.motherUid !== selection.motherUid) return false;
-  return true;
+  if (!selection.confirmed) return false;
+  return mirrorSubmitBlockReason(selection, preview) === null;
 }
 
 /**

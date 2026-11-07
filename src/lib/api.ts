@@ -1173,6 +1173,32 @@ export function saveGithubConfig(config: GithubConfig): Promise<GithubConfig> {
   });
 }
 
+/**
+ * 跳过指定版本：之后检查到它不再提示、也不自动下载。
+ *
+ * 纯配置写入（后端 PATCH 语义，只改 `skipped_version`）；webui 端没有对应路由，
+ * 与下载/重启一样按"仅桌面端支持"处理，不伪装成成功。
+ */
+export function updateSkipVersion(version: string): Promise<GithubConfig> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (isWebui()) return Promise.reject(new Error(UPDATE_UNSUPPORTED_MESSAGE));
+  return call<GithubConfig>("update_skip_version", { version });
+}
+
+/** 清除「已跳过版本」：下次发现同一版本会重新提示。 */
+export function updateClearSkippedVersion(): Promise<GithubConfig> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (isWebui()) return Promise.reject(new Error(UPDATE_UNSUPPORTED_MESSAGE));
+  return call<GithubConfig>("update_clear_skipped_version");
+}
+
+/** 开关「发现新版本后自动在后台下载」。 */
+export function updateSetAutoDownload(enabled: boolean): Promise<GithubConfig> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (isWebui()) return Promise.reject(new Error(UPDATE_UNSUPPORTED_MESSAGE));
+  return call<GithubConfig>("update_set_auto_download", { enabled });
+}
+
 export function checkUpdate(proxy?: string, force?: boolean): Promise<UpdateInfo> {
   return call("check_update", { proxy: proxy?.trim() || null, force: force ?? false });
 }

@@ -1333,6 +1333,9 @@ function UpdateCard() {
   // 显式代理默认关闭：只有用户自己打开才参与更新请求。
   const [proxyEnabled, setProxyEnabled] = useState(false);
   const [proxySaving, setProxySaving] = useState(false);
+  /** 发现新版本后自动后台下载；缺省开（老配置没有该键时也按开处理）。 */
+  const [autoDownload, setAutoDownload] = useState(true);
+  const [autoSaving, setAutoSaving] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -1343,6 +1346,7 @@ function UpdateCard() {
         setGithubConfig(config);
         setProxyUrl(config.proxy ?? "");
         setProxyEnabled(config.proxy_enabled ?? false);
+        setAutoDownload(config.auto_download ?? true);
       })
       .catch((e) => {
         if (!cancelled) toast.error("更新配置加载失败", { description: api.asError(e) });
@@ -1437,6 +1441,41 @@ function UpdateCard() {
     await persistProxy(value, value ? proxyEnabled : false, value ? "更新代理已保存" : "已清空代理地址");
   }
 
+  /** 开关「自动后台下载」：立即落盘，失败回滚开关位置。 */
+  async function toggleAutoDownload(next: boolean) {
+    if (autoSaving) return;
+    setAutoSaving(true);
+    try {
+      const saved = await api.updateSetAutoDownload(next);
+      setGithubConfig(saved);
+      setAutoDownload(saved.auto_download ?? true);
+      toast.success(next ? "已开启自动后台下载" : "已关闭自动后台下载");
+    } catch (e) {
+      toast.error("保存自动下载设置失败", { description: api.asError(e) });
+    } finally {
+      setAutoSaving(false);
+    }
+  }
+
+  /** 清除「已跳过版本」：下次发现同一版本会重新提示并自动下载。 */
+  async function clearSkipped() {
+    try {
+      const saved = await api.updateClearSkippedVersion();
+      setGithubConfig(saved);
+      toast.success("已取消跳过，下次发现该版本会重新提示");
+    } catch (e) {
+      toast.error("取消跳过失败", { description: api.asError(e) });
+    }
+  }
+
+  /**
+   * 本次检查到的版本正好是被跳过的那个：Alert 必须如实说明。
+   * 否则用户点了"跳过"之后，设置页照样显示「发现新版本 / 立即升级」，等于跳过没生效。
+   */
+  const latestSkipped = Boolean(
+    info?.latest && githubConfig.skipped_version === info.latest,
+  );
+
   return (
     <SettingsGroup
       id="settings-updates"
@@ -1461,6 +1500,27 @@ function UpdateCard() {
             <ExternalLink />
           </Button></DemoAction>
         </div>
+
+        <SettingsFieldRow
+          label="自动后台下载"
+          description={
+            autoDownload
+              ? "发现新版本后在后台自动下载，下完再问你要不要重启；下载中可关闭窗口。"
+              : "只在托盘与这里提示新版本，由你手动点下载。"
+          }
+          htmlFor="update-auto-download"
+          className="bg-muted/25"
+        >
+          <DemoAction>
+            <Switch
+              id="update-auto-download"
+              aria-label="自动后台下载"
+              checked={autoDownload}
+              onCheckedChange={(next) => void toggleAutoDownload(next)}
+              disabled={autoSaving}
+            />
+          </DemoAction>
+        </SettingsFieldRow>
 
         <SettingsFieldRow
           label="启用更新代理"
@@ -1504,6 +1564,23 @@ function UpdateCard() {
           </Button></DemoAction>
         </div>
 
+        {/* 已跳过版本：可见、可撤销，不让用户以为「跳过」石沉大海。 */}
+        {githubConfig.skipped_version ? (
+          <div className="flex items-center justify-between gap-3 border-b border-border/60 bg-muted/25 px-4 py-3 text-sm sm:px-5">
+            <div className="min-w-0">
+              <div className="font-medium">已跳过版本</div>
+              <div className="text-xs text-muted-foreground">
+                v{githubConfig.skipped_version} 不会再提示，也不会自动下载。
+              </div>
+            </div>
+            <DemoAction>
+              <Button size="sm" variant="outline" onClick={() => void clearSkipped()}>
+                取消跳过
+              </Button>
+            </DemoAction>
+          </div>
+        ) : null}
+
         <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
           <DemoAction><Button size="sm" variant="outline" onClick={check} disabled={checking}>
             {checking ? <Loader2 className="animate-spin" /> : <RefreshCw />}
@@ -1512,17 +1589,25 @@ function UpdateCard() {
         </div>
 
         {info?.ok && (
-          <Alert variant="default" className={cn("!w-auto mx-4 my-4 sm:mx-5", info.hasUpdate && "border-primary/35 bg-primary/[0.06]")}>
-            {info.hasUpdate && <ArrowUpCircle className="text-primary" />}
+          <Alert variant="default" className={cn("!w-auto mx-4 my-4 sm:mx-5", info.hasUpdate && !latestSkipped && "border-primary/35 bg-primary/[0.06]")}>
+            {info.hasUpdate && !latestSkipped && <ArrowUpCircle className="text-primary" />}
             <AlertDescription className="space-y-2">
-              <AlertTitle className={cn(info.hasUpdate && "text-primary")}>{info.hasUpdate ? "发现新版本" : "更新检查完成"}</AlertTitle>
+              <AlertTitle className={cn(info.hasUpdate && !latestSkipped && "text-primary")}>
+                {!info.hasUpdate
+                  ? "更新检查完成"
+                  : latestSkipped
+                    ? "已跳过这个版本"
+                    : "发现新版本"}
+              </AlertTitle>
               <div className="text-sm">
-                {info.hasUpdate
-                  ? `发现新版本 v${info.latest}（当前 v${info.current}）`
-                  : `已是最新版本 v${info.current}`}
+                {!info.hasUpdate
+                  ? `已是最新版本 v${info.current}`
+                  : latestSkipped
+                    ? `v${info.latest} 你已选择跳过，不会再提示或自动下载。`
+                    : `发现新版本 v${info.latest}（当前 v${info.current}）`}
                 {info.releaseName && <span className="text-muted-foreground"> · {info.releaseName}</span>}
               </div>
-              {info.hasUpdate && (
+              {info.hasUpdate && !latestSkipped && (
                 <DemoAction>
                   {snapshot.phase === "readyToRestart" ? (
                     <Button size="sm" onClick={() => void restartNow()} disabled={restarting}>
@@ -1535,6 +1620,13 @@ function UpdateCard() {
                       立即升级
                     </Button>
                   )}
+                </DemoAction>
+              )}
+              {info.hasUpdate && latestSkipped && (
+                <DemoAction>
+                  <Button size="sm" variant="outline" onClick={() => void clearSkipped()}>
+                    取消跳过
+                  </Button>
                 </DemoAction>
               )}
               {info.releaseUrl && (
