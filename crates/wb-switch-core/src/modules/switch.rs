@@ -161,6 +161,7 @@ fn mirror_report_json(result: Result<mirror::MirrorReport, String>) -> Value {
     let report = result.unwrap_or_else(|error| mirror::MirrorReport {
         deleted_sessions: 0,
         copied_sessions: 0,
+        restored_copies: 0,
         backup: None,
         needs_recovery: false,
         warnings: Vec::new(),
@@ -366,7 +367,7 @@ pub fn switch_account(
             let target_uid = acc.get("uid").and_then(Value::as_str).unwrap_or_default();
             let paths = SessionPaths::for_variant(variant);
             mirror_report = Some(mirror_report_json(mirror::mirror_apply_at(
-                &paths, variant, target_uid, plan,
+                &paths, variant, target_uid, &acc, plan,
             )));
         }
     } else {
@@ -725,6 +726,7 @@ mod tests {
         let ok = mirror_report_json(Ok(mirror::MirrorReport {
             deleted_sessions: 3,
             copied_sessions: 0,
+            restored_copies: 0,
             backup: Some("/x".to_string()),
             needs_recovery: false,
             warnings: Vec::new(),

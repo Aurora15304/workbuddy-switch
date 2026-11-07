@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::modules::auth_file;
 use crate::modules::config::now_ms;
 use crate::modules::session::{
-    current_user_uid_at, open_db, table_exists, SessionPaths, REASON_PREVIEW_STALE,
+    self, current_user_uid_at, open_db, table_exists, SessionPaths, REASON_PREVIEW_STALE,
 };
 use crate::modules::session_backup;
 use crate::modules::session_link::{
@@ -104,6 +104,9 @@ pub struct MirrorError {
 pub struct MirrorReport {
     pub deleted_sessions: usize,
     pub copied_sessions: usize,
+    /// 还原时：把本次「复制新增」的会话按软删撤销的条数（rollback 时填充）。
+    #[serde(default)]
+    pub restored_copies: usize,
     pub backup: Option<String>,
     pub needs_recovery: bool,
     pub warnings: Vec<String>,
@@ -342,23 +345,41 @@ pub fn group_id_for(groups: &[LinkGroup], uid: &str, session_id: &str) -> String
     ids.into_iter().next().unwrap_or_default()
 }
 
-/// 从只读行生成逐条清单：`user_id` 隔离（母本 uid 绝不进清单）+ 仅未软删行 + 字段齐备。
+/// 从只读行生成逐条待软删清单：`user_id` 隔离（母本 uid 不进）+ 仅未软删行 + 字段齐备。
+///
+/// **排除母本对端/副本**：目标行所属关联组若含母本 active 成员（例如上一次镜像复制过来的
+/// 会话），它不是「目标多余会话」，不得进入软删清单——否则下一次镜像会误删自身副本。
 pub fn mirror_targets_from_rows(
     rows: &[MirrorRow],
     target_uid: &str,
+    mother_uid: &str,
     groups: &[LinkGroup],
 ) -> Vec<MirrorTarget> {
     let mut targets: Vec<MirrorTarget> = rows
         .iter()
         .filter(|row| row.user_id == target_uid && row.deleted_at.is_none())
-        .map(|row| MirrorTarget {
-            session_id: row.session_id.clone(),
-            title: display_title(row.title.clone(), row.custom_title.clone()),
-            user_id: row.user_id.clone(),
-            group_id: group_id_for(groups, target_uid, &row.session_id),
-            updated_at: row.updated_at,
-            full_digest: session_row_digest(row),
-            kind: "session".to_string(),
+        .filter_map(|row| {
+            let group_id = group_id_for(groups, target_uid, &row.session_id);
+            if !group_id.is_empty()
+                && groups.iter().any(|group| {
+                    group.id == group_id
+                        && group
+                            .members
+                            .iter()
+                            .any(|m| m.uid == mother_uid && m.state == MemberState::Active)
+                })
+            {
+                return None;
+            }
+            Some(MirrorTarget {
+                session_id: row.session_id.clone(),
+                title: display_title(row.title.clone(), row.custom_title.clone()),
+                user_id: row.user_id.clone(),
+                group_id,
+                updated_at: row.updated_at,
+                full_digest: session_row_digest(row),
+                kind: "session".to_string(),
+            })
         })
         .collect();
     targets.sort_by(|a, b| a.session_id.cmp(&b.session_id));
@@ -382,6 +403,39 @@ pub fn count_mirror_copies(groups: &[LinkGroup], mother_uid: &str, target_uid: &
             has_mother && !has_target
         })
         .count()
+}
+
+/// 目标账号缺失的母本会话 id 清单（母本有、目标没有；已关联的不算缺失），去重排序。
+/// 身份用 `LinkMember.uid` 精确匹配，绝不按标题全局去重；供复制执行。
+pub fn missing_mirror_session_ids(
+    groups: &[LinkGroup],
+    mother_uid: &str,
+    target_uid: &str,
+) -> Vec<String> {
+    let mut ids: Vec<String> = groups
+        .iter()
+        .filter(|group| {
+            let has_target = group
+                .members
+                .iter()
+                .any(|m| m.uid == target_uid && m.state == MemberState::Active);
+            has_target == false
+                && group
+                    .members
+                    .iter()
+                    .any(|m| m.uid == mother_uid && m.state == MemberState::Active)
+        })
+        .flat_map(|group| {
+            group
+                .members
+                .iter()
+                .filter(|m| m.uid == mother_uid && m.state == MemberState::Active)
+                .map(|m| m.session_id.clone())
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 // ---------------------------------------------------------------------------
@@ -543,7 +597,7 @@ pub fn mirror_preview_at(
         .ok_or_else(|| "会话库不可读，无法预览镜像".to_string())?;
     let rows = read_target_rows(&conn, &target_uid)?;
     let groups = load_groups(paths);
-    let targets = mirror_targets_from_rows(&rows, &target_uid, &groups);
+    let targets = mirror_targets_from_rows(&rows, &target_uid, &mother_uid, &groups);
     let expected_digest = expected_digest_of(&targets);
     let copied_count = count_mirror_copies(&groups, &mother_uid, &target_uid);
 
@@ -615,12 +669,26 @@ struct MirrorBackupManifest {
     preview_token: String,
     expected_digest: String,
     created_at: i64,
-    /// `pending`（备份已落、软删未确认完成/崩溃窗口）或 `done`（软删已 commit 且读回校验通过）。
+    /// `pending`（备份已落、软删/复制未确认完成/崩溃窗口）或 `done`（软删+复制已 commit 且读回校验通过）。
     /// 供 `scan_mirror_backups` 发现「库已改但 UI/启动恢复无感知」的窄窗口。
     #[serde(default = "default_mirror_state")]
     state: String,
     rows: Vec<MirrorBackupRow>,
+    /// 本次「复制新增」的会话：回滚时按 ids 软删，禁止静默留下孤儿。
+    #[serde(default)]
+    copied: Vec<MirrorCopiedEntry>,
     restore_steps: Vec<String>,
+}
+
+/// 一条「复制新增」登记：源会话 id、目标新 id、归属与创建时刻。回滚据此精确软删新副本。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorCopiedEntry {
+    pub source_session_id: String,
+    pub new_session_id: String,
+    pub user_id: String,
+    pub group_id: String,
+    pub created_at: i64,
 }
 
 /// 旧清单缺 `state` 时按 pending 处理（保守：宁可提示可还原，也不当作已完成）。
@@ -741,6 +809,7 @@ fn write_mirror_manifest(
         created_at: now_ms(),
         state: MIRROR_STATE_PENDING.to_string(),
         rows,
+        copied: Vec::new(),
         restore_steps: vec![
             "按清单逐条把 sessions.deleted_at 置空：WHERE id=? AND user_id=? AND deleted_at=<本清单 deletedAtWritten>".to_string(),
             "只还原本次写入值；严禁按 user_id 批量置空（会误恢复用户此前自删的会话）".to_string(),
@@ -827,11 +896,13 @@ fn verify_soft_deleted(
     Ok(())
 }
 
-/// 执行镜像软删：现场双 verify → 摘要重算 → 先备份再置位 → 读回校验。任一不符即零写入。
+/// 执行整份镜像：现场双 verify → 摘要重算 → 先备份再置位 → 软删 → 读回校验 → 复制母本独有会话。
+/// 任一 verify 非空即零写入（连复制也不做）。
 pub fn mirror_apply_at(
     paths: &SessionPaths,
     variant: WbVariant,
     target_uid: &str,
+    acc: &Value,
     plan: &MirrorPlan,
 ) -> Result<MirrorReport, String> {
     let target_uid = target_uid.trim();
@@ -855,7 +926,7 @@ pub fn mirror_apply_at(
     }
     let rows = read_target_rows(&conn, target_uid)?;
     let groups = load_groups(paths);
-    let live_targets = mirror_targets_from_rows(&rows, target_uid, &groups);
+    let live_targets = mirror_targets_from_rows(&rows, target_uid, &mother_uid, &groups);
     let live_expected_digest = expected_digest_of(&live_targets);
 
     // 硬门禁 2：expectedDigest 逐条重算，与计划不符 → 零写入。
@@ -892,11 +963,15 @@ pub fn mirror_apply_at(
         ));
     }
 
-    // 空清单：无需软删，也不建备份目录（避免空还原项）。
-    if live_targets.is_empty() {
+    // 目标账号缺失的母本会话（已关联的不算缺失）：100% 镜像的另一半。
+    let missing = missing_mirror_session_ids(&groups, &mother_uid, target_uid);
+
+    // 既无待删、也无待复制：无操作、不建备份目录（避免空还原项）。
+    if live_targets.is_empty() && missing.is_empty() {
         return Ok(MirrorReport {
             deleted_sessions: 0,
             copied_sessions: 0,
+            restored_copies: 0,
             backup: None,
             needs_recovery: false,
             warnings: Vec::new(),
@@ -905,7 +980,7 @@ pub fn mirror_apply_at(
         });
     }
 
-    // 先落备份记录再置位。
+    // 先落备份记录再置位（清单同时锚定软删与复制的回滚依据）。
     let deleted_at_written = now_ms();
     let operation_id = uuid::Uuid::new_v4().to_string();
     let backup_dir = write_mirror_manifest(
@@ -920,9 +995,9 @@ pub fn mirror_apply_at(
         deleted_at_written,
     )?;
 
-    let (deleted, skipped) = soft_delete_targets(&mut conn, target_uid, &live_targets, deleted_at_written)?;
-
-    // 落盘后读回校验：不符归「已落盘但持久化证明缺失」，备份保留、禁止反向写回。
+    // 软删（可能 0 行）：单事务 commit，随后读回校验。
+    let (deleted, skipped) =
+        soft_delete_targets(&mut conn, target_uid, &live_targets, deleted_at_written)?;
     verify_soft_deleted(&conn, target_uid, &live_targets, deleted_at_written).map_err(|detail| {
         format!(
             "已落盘但持久化证明缺失：{detail}；备份保留在 {}，请勿反向写回",
@@ -930,10 +1005,16 @@ pub fn mirror_apply_at(
         )
     })?;
 
-    // 软删已 commit 且读回校验通过：把清单原子改写为 done。此步失败不否定业务成功，
-    // 只降级为 warning（清单仍为 pending，扫描能发现并提示可还原）。
+    // 复制母本独有会话：失败不阻断软删，错误进 errors；成功的新副本登记进清单供回滚。
+    let (copied_entries, copy_errors) = if missing.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        copy_missing_sessions(paths, variant, acc, target_uid, &missing)
+    };
+
+    // 软删+复制完成后把清单原子改写为 done 并登记 copied；失败仅降级为 warning。
     let mut warnings = Vec::new();
-    if let Err(error) = mark_mirror_manifest_done(&backup_dir) {
+    if let Err(error) = finalize_mirror_manifest(&backup_dir, &copied_entries) {
         warnings.push(format!(
             "镜像已完成但清单状态标记失败（{error}）；备份仍在 {}，扫描会显示为 pending",
             backup_dir.display()
@@ -942,22 +1023,96 @@ pub fn mirror_apply_at(
 
     Ok(MirrorReport {
         deleted_sessions: deleted,
-        copied_sessions: 0,
+        copied_sessions: copied_entries.len(),
+        restored_copies: 0,
         backup: Some(backup_dir.to_string_lossy().to_string()),
         needs_recovery: false,
         warnings,
         skipped,
-        errors: Vec::new(),
+        errors: copy_errors,
     })
 }
 
-/// 软删事务可靠完成后，把清单状态原子改写为 done（durable_write 保证不产出半写文件）。
-fn mark_mirror_manifest_done(backup_dir: &Path) -> Result<(), String> {
+/// 调 `copy_sessions_for_switch_at` 复制，解析 `copied`/`errors`（复制失败不阻断软删）。
+fn copy_missing_sessions(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    acc: &Value,
+    target_uid: &str,
+    missing: &[String],
+) -> (Vec<MirrorCopiedEntry>, Vec<MirrorError>) {
+    // App 已在 switch 主干 close_workbuddy 之后关闭，探针恒 false。
+    let report = match session::copy_sessions_for_switch_at(paths, variant, acc, missing, |_| false) {
+        Ok(report) => report,
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![MirrorError {
+                    session_id: String::new(),
+                    error,
+                }],
+            )
+        }
+    };
+    let copied_entries: Vec<MirrorCopiedEntry> = report
+        .get("copied")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let source = item.get("id").and_then(Value::as_str)?;
+                    let new_id = item.get("newId").and_then(Value::as_str)?;
+                    Some(MirrorCopiedEntry {
+                        source_session_id: source.to_string(),
+                        new_session_id: new_id.to_string(),
+                        user_id: target_uid.to_string(),
+                        group_id: item
+                            .get("groupId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        created_at: now_ms(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let copy_errors: Vec<MirrorError> = report
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| MirrorError {
+                    session_id: item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    error: item
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (copied_entries, copy_errors)
+}
+
+/// 软删+复制可靠完成后，把清单原子改写为 done 并登记 copied（durable_write 不产出半写文件）。
+fn finalize_mirror_manifest(
+    backup_dir: &Path,
+    copied: &[MirrorCopiedEntry],
+) -> Result<(), String> {
     let file = backup_dir.join(MIRROR_MANIFEST_FILE);
     let text =
         std::fs::read_to_string(&file).map_err(|error| format!("镜像清单读取失败：{error}"))?;
     let mut manifest: MirrorBackupManifest =
         serde_json::from_str(&text).map_err(|error| format!("镜像清单解析失败：{error}"))?;
+    manifest.copied = copied.to_vec();
     manifest.state = MIRROR_STATE_DONE.to_string();
     let content = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
     session_backup::durable_write_str(&file, &content)
@@ -1018,11 +1173,33 @@ pub fn mirror_restore_at(
             });
         }
     }
+    // 回滚本次「复制新增」的会话：同样按软删撤销（可再次还原），绝不静默留下孤儿。
+    // 已被改动/不存在（如用户继续对话后 deleted_at 已非 NULL）则列入未撤销清单。
+    let copy_deleted_at = now_ms();
+    let mut restored_copies = 0usize;
+    for entry in &manifest.copied {
+        let affected = tx
+            .execute(
+                "UPDATE sessions SET deleted_at = ?1 \
+                 WHERE id = ?2 AND user_id = ?3 AND deleted_at IS NULL",
+                params![copy_deleted_at, entry.new_session_id, entry.user_id],
+            )
+            .map_err(|error| format!("撤销复制会话失败（{}）：{error}", entry.new_session_id))?;
+        if affected == 1 {
+            restored_copies += 1;
+        } else {
+            skipped.push(MirrorSkipped {
+                session_id: entry.new_session_id.clone(),
+                reason: "复制新增未撤销：会话不存在或已被改动".to_string(),
+            });
+        }
+    }
     tx.commit()
         .map_err(|error| format!("会话数据提交失败：{error}"))?;
     Ok(MirrorReport {
         deleted_sessions: restored,
         copied_sessions: 0,
+        restored_copies,
         backup: Some(backup_path.to_string_lossy().to_string()),
         needs_recovery: false,
         warnings: Vec::new(),
@@ -1331,7 +1508,7 @@ mod tests {
                 deleted_at: Some(999),
             },
         ];
-        let targets = mirror_targets_from_rows(&rows, "u-target", &groups);
+        let targets = mirror_targets_from_rows(&rows, "u-target", "u-mother", &groups);
         assert_eq!(targets.len(), 1, "只列目标 uid 且未软删的行");
         let only = &targets[0];
         assert_eq!(only.session_id, "s-1");
@@ -1357,7 +1534,7 @@ mod tests {
             updated_at: 1,
             deleted_at: None,
         }];
-        let targets = mirror_targets_from_rows(&rows, "u-target", &[]);
+        let targets = mirror_targets_from_rows(&rows, "u-target", "u-mother", &[]);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].group_id, "", "未建组会话 groupId 为空");
         assert_eq!(targets[0].title, "(无标题)");
@@ -1654,7 +1831,7 @@ mod tests {
         let plan = preview_plan(&paths, "u-target");
         assert_eq!(plan.targets.len(), 2, "只列 u-target 未软删两行");
 
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &plan).unwrap();
         assert_eq!(report.deleted_sessions, 2);
         assert!(report.backup.is_some(), "软删必须留备份");
         assert!(deleted_at_of(&paths, "s-1").is_some());
@@ -1671,13 +1848,13 @@ mod tests {
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
         let plan = preview_plan(&paths, "u-target");
-        let first = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        let first = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &plan).unwrap();
         assert_eq!(first.deleted_sessions, 1);
         let written = deleted_at_of(&paths, "s-1").unwrap();
 
         // 同一份计划重放必须 fail-closed（集合已变），且不重复写入、不改写已置位行。
         assert!(
-            mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).is_err(),
+            mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &plan).is_err(),
             "同一计划重放应被拒绝而非再次软删"
         );
         assert_eq!(deleted_at_of(&paths, "s-1"), Some(written), "重放不动已置位行");
@@ -1685,7 +1862,7 @@ mod tests {
         // 重新预览：目标已空 → 第二次 deleted=0，且不建空备份。
         let empty_plan = preview_plan(&paths, "u-target");
         assert!(empty_plan.targets.is_empty());
-        let second = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &empty_plan).unwrap();
+        let second = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &empty_plan).unwrap();
         assert_eq!(second.deleted_sessions, 0);
         assert!(second.backup.is_none(), "空清单不建备份目录");
     }
@@ -1699,7 +1876,7 @@ mod tests {
         let mut plan = preview_plan(&paths, "u-target");
         plan.expected_digest = "tampered-digest".to_string();
 
-        let error = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap_err();
+        let error = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &plan).unwrap_err();
         assert!(error.contains("不一致"), "{error}");
         assert_eq!(deleted_at_of(&paths, "s-1"), None, "摘要不符零写入");
     }
@@ -1714,7 +1891,7 @@ mod tests {
         // 预览后登录态被切到别的母本：现场母本与凭据不符，双 verify 必报 STALE。
         seed_auth(&paths, "u-attacker");
 
-        let error = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap_err();
+        let error = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &plan).unwrap_err();
         assert!(error.contains("过期"), "{error}");
         assert_eq!(deleted_at_of(&paths, "s-1"), None, "母本变化零写入");
     }
@@ -1735,7 +1912,7 @@ mod tests {
         let plan = preview_plan(&paths, "u-target");
         assert_eq!(plan.targets.len(), 1, "只列未软删的 s-1");
 
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &plan).unwrap();
         assert_eq!(report.deleted_sessions, 1);
         let backup = PathBuf::from(report.backup.clone().unwrap());
         assert!(deleted_at_of(&paths, "s-1").is_some());
@@ -1763,7 +1940,7 @@ mod tests {
         let before = std::fs::read(&body).unwrap();
 
         let plan = preview_plan(&paths, "u-target");
-        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &plan).unwrap();
 
         let after = std::fs::read(&body).unwrap();
         assert_eq!(before, after, "镜像只软删数据库行，绝不改会话正文");
@@ -1776,7 +1953,7 @@ mod tests {
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
         let plan = preview_plan(&paths, "u-target");
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &plan).unwrap();
         let backup = PathBuf::from(report.backup.clone().unwrap());
 
         let restored = mirror_restore_within_root(&paths, WbVariant::Cn, &backup).unwrap();
@@ -1791,7 +1968,7 @@ mod tests {
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
         let plan = preview_plan(&paths, "u-target");
-        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap(); // 确保根目录存在
+        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &plan).unwrap(); // 确保根目录存在
 
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
@@ -1806,7 +1983,7 @@ mod tests {
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
         let plan = preview_plan(&paths, "u-target");
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &plan).unwrap();
 
         let entries = scan_mirror_backups(&paths);
         assert_eq!(entries.len(), 1);
@@ -1839,7 +2016,7 @@ mod tests {
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
         let plan = preview_plan(&paths, "u-target");
-        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &plan).unwrap();
         let file = PathBuf::from(report.backup.unwrap()).join(MIRROR_MANIFEST_FILE);
         let on_disk: MirrorBackupManifest =
             serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
@@ -1853,7 +2030,7 @@ mod tests {
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
         let plan = preview_plan(&paths, "u-target");
-        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &plan).unwrap();
 
         // 另造一个非镜像交易目录（只有不属于 mirror 的清单），扫描必须忽略。
         let other = session_backup::transactions_root(&paths, WbVariant::Cn).join("other-op");
@@ -1862,5 +2039,179 @@ mod tests {
 
         let entries = scan_mirror_backups(&paths);
         assert_eq!(entries.len(), 1, "只返回 mirror manifest，不含其它交易目录");
+    }
+
+    // --- 批次③a：复制母本独有会话 + 复制可回滚 -----------------------------
+
+    fn write_link_store(paths: &SessionPaths, groups: Vec<LinkGroup>) {
+        let store = session_link::LinkStore {
+            version: session_link::LINK_STORE_VERSION,
+            revision: 1,
+            groups,
+        };
+        let file = paths.session_links_file();
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(file, serde_json::to_string(&store).unwrap()).unwrap();
+    }
+
+    /// 可复制环境：源账号 u-mother 有带正文的 s-mother，目标 u-target 空；关联组 g-1 只有母本。
+    fn copy_ready_env(dir: &TempDir) -> SessionPaths {
+        let paths = paths_for(dir);
+        seed_auth(&paths, "u-mother");
+        std::fs::create_dir_all(&paths.data_root).unwrap();
+        let conn = Connection::open(paths.workbuddy_db()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, user_id TEXT, title TEXT, custom_title TEXT, \
+             updated_at INTEGER, deleted_at INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s-mother','u-mother','母本会话',NULL,2000,NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let econn = Connection::open(paths.edge_sync_db(WbVariant::Cn)).unwrap();
+        econn
+            .execute_batch(
+                "CREATE TABLE edge_sync_mapping (session_id TEXT, conversation_id TEXT, \
+                 msg_channel TEXT, created_at INTEGER);",
+            )
+            .unwrap();
+        drop(econn);
+        let proj = paths.projects_dir().join("ws-a");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("s-mother.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"type":"user","sessionId":"s-mother","text":"你好"}),
+                json!({"type":"assistant","sessionId":"s-mother","text":"hi"})
+            ),
+        )
+        .unwrap();
+        write_link_store(
+            &paths,
+            vec![group("g-1", vec![("u-mother", "s-mother", MemberState::Active)])],
+        );
+        paths
+    }
+
+    fn target_active_count(paths: &SessionPaths, uid: &str) -> i64 {
+        Connection::open(paths.workbuddy_db())
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE user_id=?1 AND deleted_at IS NULL",
+                [uid],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn missing_mirror_session_ids_excludes_linked() {
+        let groups = vec![
+            group("g-mother-only", vec![("u-mother", "s-m", MemberState::Active)]),
+            group(
+                "g-both",
+                vec![
+                    ("u-mother", "s-m2", MemberState::Active),
+                    ("u-target", "s-t2", MemberState::Active),
+                ],
+            ),
+        ];
+        assert_eq!(
+            missing_mirror_session_ids(&groups, "u-mother", "u-target"),
+            vec!["s-m".to_string()],
+            "只算母本独有组；已关联（g-both）不算缺失"
+        );
+    }
+
+    #[test]
+    fn mirror_copy_adds_mother_only_sessions() {
+        let dir = TempDir::new("copy-add");
+        let paths = copy_ready_env(&dir);
+        let target_acc = json!({"id":"acc-u-target","uid":"u-target","variant":"cn"});
+        let plan = preview_plan(&paths, "u-target");
+        assert_eq!(plan.targets.len(), 0, "目标无待删行");
+
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &plan).unwrap();
+        assert_eq!(report.copied_sessions, 1, "应复制 1 个母本独有会话");
+        assert_eq!(report.deleted_sessions, 0);
+        assert_eq!(target_active_count(&paths, "u-target"), 1, "目标库出现副本");
+
+        let backup = PathBuf::from(report.backup.clone().unwrap());
+        let manifest: MirrorBackupManifest =
+            serde_json::from_str(&std::fs::read_to_string(backup.join(MIRROR_MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(manifest.copied.len(), 1, "复制登记进清单");
+        assert_eq!(manifest.state, "done");
+    }
+
+    #[test]
+    fn mirror_copy_is_idempotent_after_repreview() {
+        let dir = TempDir::new("copy-idem");
+        let paths = copy_ready_env(&dir);
+        let target_acc = json!({"id":"acc-u-target","uid":"u-target","variant":"cn"});
+
+        let plan1 = preview_plan(&paths, "u-target");
+        let r1 = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &plan1).unwrap();
+        assert_eq!(r1.copied_sessions, 1);
+
+        // 重预览：副本在含母本的组里，不算多余、不再复制、不被误软删。
+        let plan2 = preview_plan(&paths, "u-target");
+        assert_eq!(plan2.targets.len(), 0, "母本对端副本不算待删");
+        let r2 = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &plan2).unwrap();
+        assert_eq!(r2.copied_sessions, 0, "已关联不重复复制");
+        assert_eq!(r2.deleted_sessions, 0, "副本不被误软删");
+        assert_eq!(target_active_count(&paths, "u-target"), 1, "副本仍在");
+    }
+
+    #[test]
+    fn mirror_copy_failure_does_not_block_soft_delete() {
+        let dir = TempDir::new("copy-fail");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        // 目标有一个多余行（待软删）；母本组里的 s-mother 无正文 → 复制必失败。
+        seed_session_db(&paths, &[("s-extra", "u-target", 1000, None)]);
+        {
+            let conn = Connection::open(paths.workbuddy_db()).unwrap();
+            conn.execute(
+                "INSERT INTO sessions VALUES ('s-mother','u-mother','母本',NULL,2000,NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        write_link_store(
+            &paths,
+            vec![group("g-1", vec![("u-mother", "s-mother", MemberState::Active)])],
+        );
+        let target_acc = json!({"id":"acc-u-target","uid":"u-target","variant":"cn"});
+        let plan = preview_plan(&paths, "u-target");
+        assert_eq!(plan.targets.len(), 1, "s-extra 待软删");
+
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &plan).unwrap();
+        assert_eq!(report.deleted_sessions, 1, "软删成功");
+        assert_eq!(report.copied_sessions, 0, "复制失败");
+        assert!(!report.errors.is_empty(), "复制错误进 errors");
+        assert!(deleted_at_of(&paths, "s-extra").is_some(), "软删未被复制失败阻断");
+    }
+
+    #[test]
+    fn mirror_restore_soft_deletes_copied_sessions() {
+        let dir = TempDir::new("copy-rollback");
+        let paths = copy_ready_env(&dir);
+        let target_acc = json!({"id":"acc-u-target","uid":"u-target","variant":"cn"});
+        let plan = preview_plan(&paths, "u-target");
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &target_acc, &plan).unwrap();
+        assert_eq!(report.copied_sessions, 1);
+        assert_eq!(target_active_count(&paths, "u-target"), 1, "副本存在");
+
+        let backup = PathBuf::from(report.backup.clone().unwrap());
+        let restored = mirror_restore_within_root(&paths, WbVariant::Cn, &backup).unwrap();
+        assert_eq!(restored.restored_copies, 1, "复制新增被撤销");
+        assert_eq!(target_active_count(&paths, "u-target"), 0, "副本已软删");
     }
 }

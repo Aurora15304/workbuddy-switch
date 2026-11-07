@@ -825,7 +825,7 @@ fn copy_sessions_cross_at(
 ///
 /// App 运行检查做两次：拿档位操作锁之前先快速拒绝；拿锁之后再复查——锁前到拿锁之间
 /// App 可能被启动，只有锁后复查才能保证会话写入发生在 App 停止写入之后（design §4.1）。
-fn copy_sessions_for_switch_at(
+pub(crate) fn copy_sessions_for_switch_at(
     paths: &SessionPaths,
     variant: WbVariant,
     target_acc: &Value,
