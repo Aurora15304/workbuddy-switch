@@ -178,7 +178,8 @@ pub fn restore_mirror_backup(backup: &Path) -> Result<mirror::MirrorReport, Stri
     let variant = mirror_backup_variant(backup);
     let _guard = crate::modules::auth_transaction::try_auth().map_err(|error| error.to_string())?;
     let paths = SessionPaths::for_variant(variant);
-    mirror::mirror_restore_at(&paths, variant, backup)
+    // 限根：只允许还原落在镜像备份根目录内的路径（硬要求在 mirror 侧围栏，不改回滚算法）。
+    mirror::mirror_restore_within_root(&paths, variant, backup)
 }
 
 /// 从备份目录推断档位：目录约定为 `…/session-transactions/{variant}/{uuid}`。

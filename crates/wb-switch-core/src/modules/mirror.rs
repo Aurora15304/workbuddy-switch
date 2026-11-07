@@ -580,6 +580,10 @@ pub fn mirror_preview_at(
 const MIRROR_BACKUP_VERSION: u32 = 1;
 /// 镜像备份清单文件名（固定放在操作专属目录内）。
 const MIRROR_MANIFEST_FILE: &str = "mirror-manifest.json";
+/// 清单状态：备份已落、软删事务尚未可靠完成（或崩溃窗口），库可能已改但未标记完成。
+const MIRROR_STATE_PENDING: &str = "pending";
+/// 清单状态：软删事务已 commit 且读回校验通过，可放心一键还原。
+const MIRROR_STATE_DONE: &str = "done";
 
 /// 单条待软删会话的备份登记：恢复只按 `(sessionId, userId, deletedAtWritten)` 三元组精确置空。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,8 +615,17 @@ struct MirrorBackupManifest {
     preview_token: String,
     expected_digest: String,
     created_at: i64,
+    /// `pending`（备份已落、软删未确认完成/崩溃窗口）或 `done`（软删已 commit 且读回校验通过）。
+    /// 供 `scan_mirror_backups` 发现「库已改但 UI/启动恢复无感知」的窄窗口。
+    #[serde(default = "default_mirror_state")]
+    state: String,
     rows: Vec<MirrorBackupRow>,
     restore_steps: Vec<String>,
+}
+
+/// 旧清单缺 `state` 时按 pending 处理（保守：宁可提示可还原，也不当作已完成）。
+fn default_mirror_state() -> String {
+    MIRROR_STATE_PENDING.to_string()
 }
 
 /// 构造「预览时冻结」的绑定：母本、指纹与待删清单都来自预览凭据与计划，绝不信任前端母本。
@@ -726,6 +739,7 @@ fn write_mirror_manifest(
         preview_token: plan.preview_token.clone(),
         expected_digest: plan.expected_digest.clone(),
         created_at: now_ms(),
+        state: MIRROR_STATE_PENDING.to_string(),
         rows,
         restore_steps: vec![
             "按清单逐条把 sessions.deleted_at 置空：WHERE id=? AND user_id=? AND deleted_at=<本清单 deletedAtWritten>".to_string(),
@@ -916,15 +930,39 @@ pub fn mirror_apply_at(
         )
     })?;
 
+    // 软删已 commit 且读回校验通过：把清单原子改写为 done。此步失败不否定业务成功，
+    // 只降级为 warning（清单仍为 pending，扫描能发现并提示可还原）。
+    let mut warnings = Vec::new();
+    if let Err(error) = mark_mirror_manifest_done(&backup_dir) {
+        warnings.push(format!(
+            "镜像已完成但清单状态标记失败（{error}）；备份仍在 {}，扫描会显示为 pending",
+            backup_dir.display()
+        ));
+    }
+
     Ok(MirrorReport {
         deleted_sessions: deleted,
         copied_sessions: 0,
         backup: Some(backup_dir.to_string_lossy().to_string()),
         needs_recovery: false,
-        warnings: Vec::new(),
+        warnings,
         skipped,
         errors: Vec::new(),
     })
+}
+
+/// 软删事务可靠完成后，把清单状态原子改写为 done（durable_write 保证不产出半写文件）。
+fn mark_mirror_manifest_done(backup_dir: &Path) -> Result<(), String> {
+    let file = backup_dir.join(MIRROR_MANIFEST_FILE);
+    let text =
+        std::fs::read_to_string(&file).map_err(|error| format!("镜像清单读取失败：{error}"))?;
+    let mut manifest: MirrorBackupManifest =
+        serde_json::from_str(&text).map_err(|error| format!("镜像清单解析失败：{error}"))?;
+    manifest.state = MIRROR_STATE_DONE.to_string();
+    let content = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
+    session_backup::durable_write_str(&file, &content)
+        .map_err(|error| format!("镜像清单状态更新失败：{error}"))?;
+    Ok(())
 }
 
 fn load_mirror_manifest(backup_path: &Path) -> Result<MirrorBackupManifest, String> {
@@ -991,6 +1029,78 @@ pub fn mirror_restore_at(
         skipped,
         errors: Vec::new(),
     })
+}
+
+/// 限根还原：canonicalize 后校验备份路径落在 `transactions_root` 之下，越界直接拒绝。
+///
+/// 只在 `mirror_restore_at` 之前加一道路径围栏，**不改其软删/回滚算法**。
+pub fn mirror_restore_within_root(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    backup_path: &Path,
+) -> Result<MirrorReport, String> {
+    let canonical_backup = std::fs::canonicalize(backup_path)
+        .map_err(|error| format!("镜像备份路径不存在或不可访问：{error}"))?;
+    let root = session_backup::transactions_root(paths, variant);
+    let canonical_root = std::fs::canonicalize(&root)
+        .map_err(|error| format!("镜像备份根目录不可访问：{error}"))?;
+    if !canonical_backup.starts_with(&canonical_root) {
+        return Err("备份路径不在允许的镜像备份目录内，已拒绝还原".to_string());
+    }
+    mirror_restore_at(paths, variant, &canonical_backup)
+}
+
+/// 一处镜像备份的可观测摘要（扫描用）：状态、绝对路径、目标账号与软删行数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorBackupEntry {
+    pub operation_id: String,
+    pub variant: WbVariant,
+    /// `pending`（崩溃窗口/未确认完成）或 `done`（软删已 commit 且读回校验通过）。
+    pub state: String,
+    /// 备份目录绝对路径（一键还原用）。
+    pub backup: String,
+    pub created_at: i64,
+    pub target_uid: String,
+    /// 清单登记的行数（本次软删量）。
+    pub deleted_sessions: usize,
+}
+
+/// 扫描所有镜像备份清单：暴露 `state`，让 UI 与启动恢复能发现「库已改但无感知」的窄窗口。
+/// 按创建时间倒序；损坏/非镜像清单跳过（不 panic、不误报）。
+pub fn scan_mirror_backups(paths: &SessionPaths) -> Vec<MirrorBackupEntry> {
+    let root = paths
+        .backup_root()
+        .join(session_backup::TRANSACTIONS_DIR_NAME);
+    let Ok(variant_dirs) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for variant_dir in variant_dirs.flatten() {
+        let Ok(op_dirs) = std::fs::read_dir(variant_dir.path()) else {
+            continue;
+        };
+        for op_dir in op_dirs.flatten() {
+            let dir = op_dir.path();
+            let Ok(text) = std::fs::read_to_string(dir.join(MIRROR_MANIFEST_FILE)) else {
+                continue;
+            };
+            let Ok(manifest) = serde_json::from_str::<MirrorBackupManifest>(&text) else {
+                continue;
+            };
+            entries.push(MirrorBackupEntry {
+                operation_id: manifest.operation_id,
+                variant: manifest.variant,
+                state: manifest.state,
+                backup: dir.to_string_lossy().to_string(),
+                created_at: manifest.created_at,
+                target_uid: manifest.target_uid,
+                deleted_sessions: manifest.rows.len(),
+            });
+        }
+    }
+    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    entries
 }
 
 // ---------------------------------------------------------------------------
@@ -1648,5 +1758,53 @@ mod tests {
 
         let after = std::fs::read(&body).unwrap();
         assert_eq!(before, after, "镜像只软删数据库行，绝不改会话正文");
+    }
+
+    #[test]
+    fn mirror_restore_within_root_accepts_in_root_backup() {
+        let dir = TempDir::new("restore-inroot");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        let plan = preview_plan(&paths, "u-target");
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        let backup = PathBuf::from(report.backup.clone().unwrap());
+
+        let restored = mirror_restore_within_root(&paths, WbVariant::Cn, &backup).unwrap();
+        assert_eq!(restored.deleted_sessions, 1, "根内路径可还原");
+        assert_eq!(deleted_at_of(&paths, "s-1"), None);
+    }
+
+    #[test]
+    fn mirror_restore_rejects_path_outside_root() {
+        let dir = TempDir::new("restore-outside");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        let plan = preview_plan(&paths, "u-target");
+        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap(); // 确保根目录存在
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let error = mirror_restore_within_root(&paths, WbVariant::Cn, &outside).unwrap_err();
+        assert!(error.contains("不在允许"), "{error}");
+    }
+
+    #[test]
+    fn mirror_scan_lists_backups_with_done_state() {
+        let dir = TempDir::new("scan");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        let plan = preview_plan(&paths, "u-target");
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+
+        let entries = scan_mirror_backups(&paths);
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.state, "done", "软删成功后清单应为 done");
+        assert_eq!(entry.deleted_sessions, 1);
+        assert_eq!(entry.target_uid, "u-target");
+        assert_eq!(Some(entry.backup.clone()), report.backup);
     }
 }
