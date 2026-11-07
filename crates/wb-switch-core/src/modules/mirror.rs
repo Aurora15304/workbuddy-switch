@@ -128,7 +128,7 @@ pub struct MirrorBinding {
     pub mother_uid: String,
     /// 目标 uid。
     pub target_uid: String,
-    /// 母本在所有关联组里的 active 成员集合指纹（group_id|uid|session_id|state 排序去重）。
+    /// 母本侧指纹（`mother_mirror_fingerprint`）：组内母本成员集合 + 母本会话存活状态。
     pub mother_active_fingerprint: String,
     /// 待删会话集合规范化摘要。
     pub expected_digest: String,
@@ -184,6 +184,70 @@ pub fn mother_active_fingerprint(groups: &[LinkGroup], mother_uid: &str) -> Stri
     full_digest_of(lines.join("\n").as_bytes())
 }
 
+/// 母本侧镜像指纹：既有维度「组内母本 `Active` 成员集合」与下面的「母本会话存活状态」
+/// 指纹合并，作为预览凭据的 `source.normalized_digest`。
+///
+/// 合并值恒不等于 0.1.81 的单一 digest → 升级前签发的凭据在升级后首次预览即**自然失配**
+/// （Spec §2 要求：不做兼容放行）。
+pub fn mother_mirror_fingerprint(
+    groups: &[LinkGroup],
+    mother_uid: &str,
+    mother_states: &HashMap<String, Option<i64>>,
+) -> String {
+    format!(
+        "{}|{}",
+        mother_active_fingerprint(groups, mother_uid),
+        mother_session_state_fingerprint(groups, mother_uid, mother_states)
+    )
+}
+
+/// 母本会话存活状态指纹（N2）：覆盖 `mother_active_fingerprint` 看不见的两类母本侧变化——
+/// 1. 母本**无组**存活会话的新增／删除／事后建组（I4，Bug B 的判据来源）；
+/// 2. 母本在组内成员由 `Alive` 转为 `Gone`（Bug A 的触发点：组还在、行已被软删）。
+///
+/// 只覆盖「存在性 + 存活状态 + 成员集合」，不含标题/`updated_at` 等内容字段：用户只是继续
+/// 对话不该让预览失效，而母本会话增删必须失效。
+pub fn mother_session_state_fingerprint(
+    groups: &[LinkGroup],
+    mother_uid: &str,
+    mother_states: &HashMap<String, Option<i64>>,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut mother_active: HashSet<&str> = HashSet::new();
+    for group in groups {
+        for member in group
+            .members
+            .iter()
+            .filter(|member| member.uid == mother_uid)
+        {
+            if member.state == MemberState::Active {
+                mother_active.insert(member.session_id.as_str());
+            }
+            let liveness = if is_alive(mother_states, &member.session_id) {
+                "alive"
+            } else {
+                "gone"
+            };
+            lines.push(format!(
+                "member|{}|{}|{}|{}",
+                group.id,
+                member.session_id,
+                member.state.as_str(),
+                liveness
+            ));
+        }
+    }
+    for (session_id, deleted_at) in mother_states {
+        if deleted_at.is_some() || mother_active.contains(session_id.as_str()) {
+            continue;
+        }
+        lines.push(format!("unpaired|{session_id}"));
+    }
+    lines.sort();
+    lines.dedup();
+    full_digest_of(lines.join("\n").as_bytes())
+}
+
 /// 待删会话集合规范化摘要：sessionId 有序 + 各自 fullDigest + updatedAt + deletedAt=NULL。
 /// 顺序无关——同一集合任意排列得到同一摘要。
 pub fn expected_digest_of(targets: &[MirrorTarget]) -> String {
@@ -207,6 +271,7 @@ pub fn build_mirror_binding(
     mother_uid: &str,
     target_uid: &str,
     groups: &[LinkGroup],
+    mother_states: &HashMap<String, Option<i64>>,
     targets: &[MirrorTarget],
     found_group_ids: Vec<String>,
     groups_with_mother: Vec<String>,
@@ -222,7 +287,7 @@ pub fn build_mirror_binding(
     MirrorBinding {
         mother_uid: mother_uid.to_string(),
         target_uid: target_uid.to_string(),
-        mother_active_fingerprint: mother_active_fingerprint(groups, mother_uid),
+        mother_active_fingerprint: mother_mirror_fingerprint(groups, mother_uid, mother_states),
         expected_digest: expected_digest_of(targets),
         targets: targets.to_vec(),
         group_ids,
@@ -347,30 +412,60 @@ pub fn group_id_for(groups: &[LinkGroup], uid: &str, session_id: &str) -> String
     ids.into_iter().next().unwrap_or_default()
 }
 
+/// 母本是否仍拥有该组的对话（`KEEP` 第三类判据，I1/I2）。
+///
+/// `M(g) = MoAct(g) ∪ MoSup(g)`：`Active` 与 `Superseded` 一视同仁，`Stale` 不计入
+/// （它描述「已判定失效」，不是母本仍持有的证据）。`M(g)` 为空说明母本在该组没有任何
+/// 成员 → 无从证明归属，保留（fail-closed）；`M(g)` 内存在任一 `Alive` 成员即视为仍拥有。
+fn mother_still_owns_group(
+    groups: &[LinkGroup],
+    group_id: &str,
+    mother_uid: &str,
+    mother_states: &HashMap<String, Option<i64>>,
+) -> bool {
+    let Some(group) = groups.iter().find(|group| group.id == group_id) else {
+        return true;
+    };
+    let mother_members: Vec<&session_link::LinkMember> = group
+        .members
+        .iter()
+        .filter(|member| member.uid == mother_uid && member.state != MemberState::Stale)
+        .collect();
+    if mother_members.is_empty() {
+        return true;
+    }
+    mother_members
+        .iter()
+        .any(|member| is_alive(mother_states, &member.session_id))
+}
+
 /// 从只读行生成逐条待软删清单：`user_id` 隔离（母本 uid 不进）+ 仅未软删行 + 字段齐备。
 ///
-/// **排除母本对端/副本**：目标行所属关联组若含母本 active 成员（例如上一次镜像复制过来的
-/// 会话），它不是「目标多余会话」，不得进入软删清单——否则下一次镜像会误删自身副本。
+/// 判据见 Spec §1.4（只跟着母本删）：
+/// - `KEEP`：目标行无组（I5）／组内无母本任何成员（目标独有）／组内存在 `Alive` 母本成员
+///   （I1/I2 正向：母本仍持有这段对话，不论该成员是 `Active` 还是 `Superseded`）。
+/// - `DELETE`：组内母本成员集 `M(g)` 非空且**全部** `Gone`（I1：全部 gone 才算 gone）。
+///
+/// 纯函数零 IO：母本状态由调用方读一次后传入，函数内绝不读盘/读库。
 pub fn mirror_targets_from_rows(
     rows: &[MirrorRow],
     target_uid: &str,
     mother_uid: &str,
     groups: &[LinkGroup],
+    mother_states: &HashMap<String, Option<i64>>,
 ) -> Vec<MirrorTarget> {
     let mut targets: Vec<MirrorTarget> = rows
         .iter()
         .filter(|row| row.user_id == target_uid && row.deleted_at.is_none())
+        .filter(|row| !row.session_id.is_empty())
         .filter_map(|row| {
             let group_id = group_id_for(groups, target_uid, &row.session_id);
-            if !group_id.is_empty()
-                && groups.iter().any(|group| {
-                    group.id == group_id
-                        && group
-                            .members
-                            .iter()
-                            .any(|m| m.uid == mother_uid && m.state == MemberState::Active)
-                })
-            {
+            // I5：目标行无组 → 无从证明其归属母本，一律保留。
+            if group_id.is_empty() {
+                return None;
+            }
+            // I1/I2：组内仍有存活母本成员（或组内根本没有母本成员）→ 保留。
+            if mother_still_owns_group(groups, &group_id, mother_uid, mother_states) {
                 return None;
             }
             Some(MirrorTarget {
@@ -388,53 +483,71 @@ pub fn mirror_targets_from_rows(
     targets
 }
 
-/// 母本有、目标没有的会话数：按 `LinkGroup.id + LinkMember(uid, session_id, state)` 判重，
-/// 身份以 `LinkMember.uid` 精确匹配，绝不按标题全局去重。同一组只计一次。
-pub fn count_mirror_copies(groups: &[LinkGroup], mother_uid: &str, target_uid: &str) -> usize {
-    groups
-        .iter()
-        .filter(|group| {
-            let has_mother = group
-                .members
-                .iter()
-                .any(|m| m.uid == mother_uid && m.state == MemberState::Active);
-            let has_target = group
-                .members
-                .iter()
-                .any(|m| m.uid == target_uid && m.state == MemberState::Active);
-            has_mother && !has_target
-        })
-        .count()
+/// 母本有、目标没有的会话数：`missing_mirror_session_ids` 的薄封装。
+///
+/// 预览的「将复制 N 条」与执行侧实际复制清单必须**同源同口径**——两处各算一遍必然漂移，
+/// 执行前的 `record_count` 复核会因此恒定 STALE（反例 E）。
+pub fn count_mirror_copies(
+    groups: &[LinkGroup],
+    mother_uid: &str,
+    target_uid: &str,
+    mother_states: &HashMap<String, Option<i64>>,
+    target_alive_ids: &HashSet<String>,
+) -> usize {
+    missing_mirror_session_ids(groups, mother_uid, target_uid, mother_states, target_alive_ids).len()
 }
 
-/// 目标账号缺失的母本会话 id 清单（母本有、目标没有；已关联的不算缺失），去重排序。
-/// 身份用 `LinkMember.uid` 精确匹配，绝不按标题全局去重；供复制执行。
+/// 目标账号缺失的母本会话 id 清单（Spec §1.4 `MISSING` 三段式），去重排序。
+///
+/// 1. 组内缺失：`MoAct(g) ≠ ∅` 且目标在该组无 `Active` 成员 → 取该组内仍 `Alive` 的母本成员；
+/// 2. 母本**无组**存活会话（I4，Bug B）：母本存活行里不出现在任何组 `MoAct` 的会话——
+///    只遍历组永远发现不了它们，用户正在用的那条就这样丢了；
+/// 3. 减去目标已存活存在的 id（P6：防重复复制）。
+///
+/// 身份一律以 `uid + session_id` 精确匹配，绝不按标题去重（反例 B）。纯函数零 IO。
 pub fn missing_mirror_session_ids(
     groups: &[LinkGroup],
     mother_uid: &str,
     target_uid: &str,
+    mother_states: &HashMap<String, Option<i64>>,
+    target_alive_ids: &HashSet<String>,
 ) -> Vec<String> {
-    let mut ids: Vec<String> = groups
-        .iter()
-        .filter(|group| {
-            let has_target = group
-                .members
+    let mut ids: Vec<String> = Vec::new();
+    let mut linked_by_mother: HashSet<&str> = HashSet::new();
+    for group in groups {
+        let mother_active: Vec<&session_link::LinkMember> = group
+            .members
+            .iter()
+            .filter(|member| member.uid == mother_uid && member.state == MemberState::Active)
+            .collect();
+        for member in &mother_active {
+            linked_by_mother.insert(member.session_id.as_str());
+        }
+        if mother_active.is_empty() {
+            continue;
+        }
+        let target_linked = group
+            .members
+            .iter()
+            .any(|member| member.uid == target_uid && member.state == MemberState::Active);
+        if target_linked {
+            continue;
+        }
+        ids.extend(
+            mother_active
                 .iter()
-                .any(|m| m.uid == target_uid && m.state == MemberState::Active);
-            has_target == false
-                && group
-                    .members
-                    .iter()
-                    .any(|m| m.uid == mother_uid && m.state == MemberState::Active)
-        })
-        .flat_map(|group| {
-            group
-                .members
-                .iter()
-                .filter(|m| m.uid == mother_uid && m.state == MemberState::Active)
-                .map(|m| m.session_id.clone())
-        })
-        .collect();
+                .filter(|member| is_alive(mother_states, &member.session_id))
+                .map(|member| member.session_id.clone()),
+        );
+    }
+    // I4：母本存活、且没有出现在任何组 `MoAct` 里的会话，只能按 id 直接复制。
+    for (session_id, deleted_at) in mother_states {
+        if deleted_at.is_some() || linked_by_mother.contains(session_id.as_str()) {
+            continue;
+        }
+        ids.push(session_id.clone());
+    }
+    ids.retain(|session_id| !session_id.is_empty() && !target_alive_ids.contains(session_id));
     ids.sort();
     ids.dedup();
     ids
@@ -517,6 +630,65 @@ fn read_target_rows(conn: &Connection, target_uid: &str) -> Result<Vec<MirrorRow
     Ok(rows)
 }
 
+/// 只读采样某账号**全部**会话行的存活状态，**不过滤** `deleted_at`。
+///
+/// 镜像判据要区分三种事实：行存在且未删（`Alive`）／行存在但已删（`Gone`）／行物理不存在
+/// （`Gone`）——按 Spec §1.2 后两者等价，因此快照只登记「存在」的行，查不到 id 即视为物理
+/// 不存在。`deleted_at` 列不存在（旧库）时全部映射为 `None`（按 `Alive` 处理，fail-closed：
+/// 宁可少删，Z4）。空 `session_id` 不进快照（Z2：不得产生空串复制或空串软删）。
+fn read_session_states(
+    conn: &Connection,
+    uid: &str,
+) -> Result<HashMap<String, Option<i64>>, String> {
+    if !table_exists(conn, "sessions") {
+        return Ok(HashMap::new());
+    }
+    let deleted_expr = if column_exists(conn, "sessions", "deleted_at") {
+        "deleted_at"
+    } else {
+        "NULL"
+    };
+    let sql = format!("SELECT id, {deleted_expr} FROM sessions WHERE user_id = ?1 ORDER BY id");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| format!("镜像预览：母本会话状态查询失败：{error}"))?;
+    let mapped = stmt
+        .query_map([uid], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get::<_, Option<i64>>(1)?,
+            ))
+        })
+        .map_err(|error| format!("镜像预览：母本会话状态读取失败：{error}"))?;
+    let mut states: HashMap<String, Option<i64>> = HashMap::new();
+    for row in mapped {
+        let (session_id, deleted_at) =
+            row.map_err(|error| format!("镜像预览：母本会话状态行读取失败：{error}"))?;
+        if session_id.is_empty() {
+            continue;
+        }
+        states.insert(session_id, deleted_at);
+    }
+    Ok(states)
+}
+
+/// `Alive(m)`（Spec §1.2）：母本 `sessions` 行存在且 `deleted_at IS NULL`。
+/// 不在快照里 = 物理不存在 = `Gone`。
+fn is_alive(mother_states: &HashMap<String, Option<i64>>, session_id: &str) -> bool {
+    mother_states
+        .get(session_id)
+        .map(Option::is_none)
+        .unwrap_or(false)
+}
+
+/// 存活行 id 集：`MISSING` 第三段「减去目标已存活存在」的去重依据。
+fn alive_ids_of(rows: &[MirrorRow]) -> HashSet<String> {
+    rows.iter()
+        .map(|row| row.session_id.clone())
+        .filter(|session_id| !session_id.is_empty())
+        .collect()
+}
+
 fn load_groups(paths: &SessionPaths) -> Vec<LinkGroup> {
     match session_link::load_store(paths) {
         session_link::StoreState::Ready(store) => store.groups,
@@ -526,12 +698,17 @@ fn load_groups(paths: &SessionPaths) -> Vec<LinkGroup> {
 
 /// 构造镜像预览凭据绑定：复用既有 `PreviewBinding`（`mother_uid` 绑定母本，
 /// `group_fingerprint` 绑定 expectedDigest），执行时 `load_preview_token` + `verify_preview` 复核。
+///
+/// `source.normalized_digest` 用 `mother_mirror_fingerprint`（含无组存活会话与 `Gone` 状态），
+/// `source.record_count` 用与执行侧同源的 `copied_count`——母本侧变化或缺失集合变化都会失配。
+#[allow(clippy::too_many_arguments)]
 fn build_mirror_token_binding(
     variant: WbVariant,
     mother_uid: &str,
     target_uid: &str,
     expected_digest: &str,
     groups: &[LinkGroup],
+    mother_states: &HashMap<String, Option<i64>>,
     targets_len: usize,
     copied_count: usize,
 ) -> PreviewBinding {
@@ -551,7 +728,7 @@ fn build_mirror_token_binding(
         source: member(
             mother_uid,
             "mother",
-            mother_active_fingerprint(groups, mother_uid),
+            mother_mirror_fingerprint(groups, mother_uid, mother_states),
             copied_count,
         ),
         target: member(
@@ -599,9 +776,18 @@ pub fn mirror_preview_at(
         .ok_or_else(|| "会话库不可读，无法预览镜像".to_string())?;
     let rows = read_target_rows(&conn, &target_uid)?;
     let groups = load_groups(paths);
-    let targets = mirror_targets_from_rows(&rows, &target_uid, &mother_uid, &groups);
+    // 一次请求内**只采样一次**母本状态：targets 与 copiedCount 共用同一份快照，禁止两处各读一次。
+    let mother_states = read_session_states(&conn, &mother_uid)?;
+    let target_alive_ids = alive_ids_of(&rows);
+    let targets = mirror_targets_from_rows(&rows, &target_uid, &mother_uid, &groups, &mother_states);
     let expected_digest = expected_digest_of(&targets);
-    let copied_count = count_mirror_copies(&groups, &mother_uid, &target_uid);
+    let copied_count = count_mirror_copies(
+        &groups,
+        &mother_uid,
+        &target_uid,
+        &mother_states,
+        &target_alive_ids,
+    );
 
     let binding = build_mirror_token_binding(
         variant,
@@ -609,6 +795,7 @@ pub fn mirror_preview_at(
         &target_uid,
         &expected_digest,
         &groups,
+        &mother_states,
         targets.len(),
         copied_count,
     );
@@ -737,6 +924,7 @@ fn live_mirror_binding(
     mother_uid: &str,
     target_uid: &str,
     groups: &[LinkGroup],
+    mother_states: &HashMap<String, Option<i64>>,
     live_targets: &[MirrorTarget],
     expected: &MirrorBinding,
 ) -> MirrorBinding {
@@ -767,6 +955,7 @@ fn live_mirror_binding(
         mother_uid,
         target_uid,
         groups,
+        mother_states,
         live_targets,
         found_group_ids,
         groups_with_mother,
@@ -939,7 +1128,11 @@ pub fn mirror_apply_at(
     }
     let rows = read_target_rows(&conn, target_uid)?;
     let groups = load_groups(paths);
-    let live_targets = mirror_targets_from_rows(&rows, target_uid, &mother_uid, &groups);
+    // 与 `mirror_preview_at` 同源：整条执行链路只采样一次母本状态，targets / copiedCount /
+    // missing 三处共用同一份快照，禁止任何一处再读一次库。
+    let mother_states = read_session_states(&conn, &mother_uid)?;
+    let target_alive_ids = alive_ids_of(&rows);
+    let live_targets = mirror_targets_from_rows(&rows, target_uid, &mother_uid, &groups, &mother_states);
     let live_expected_digest = expected_digest_of(&live_targets);
 
     // 硬门禁 2：expectedDigest 逐条重算，与计划不符 → 零写入。
@@ -949,13 +1142,20 @@ pub fn mirror_apply_at(
 
     // 硬门禁 3：造镜像专用 live PreviewBinding（哨兵 group_id + mother_uid=Some(重取登录态)、
     // 逐字段重算），同跑 verify_preview；绝不复用逐组同步的 live_preview_binding。
-    let live_copied_count = count_mirror_copies(&groups, &mother_uid, target_uid);
+    let live_copied_count = count_mirror_copies(
+        &groups,
+        &mother_uid,
+        target_uid,
+        &mother_states,
+        &target_alive_ids,
+    );
     let live_preview_binding = build_mirror_token_binding(
         variant,
         &mother_uid,
         target_uid,
         &live_expected_digest,
         &groups,
+        &mother_states,
         live_targets.len(),
         live_copied_count,
     );
@@ -964,7 +1164,14 @@ pub fn mirror_apply_at(
     // 硬门禁 5：母本唯一权威 = 登录态重取。expected 取凭据绑定母本、live 取当前登录态，
     // 两个 verify 的 live 侧都由同一 mother_uid 构造，口径同源不漂移。
     let expected_binding = expected_mirror_binding(&token, plan, target_uid);
-    let live_binding = live_mirror_binding(&mother_uid, target_uid, &groups, &live_targets, &expected_binding);
+    let live_binding = live_mirror_binding(
+        &mother_uid,
+        target_uid,
+        &groups,
+        &mother_states,
+        &live_targets,
+        &expected_binding,
+    );
     let mirror_stale = verify_mirror_binding(&expected_binding, &live_binding);
 
     if !preview_stale.is_empty() || !mirror_stale.is_empty() {
@@ -976,8 +1183,14 @@ pub fn mirror_apply_at(
         ));
     }
 
-    // 目标账号缺失的母本会话（已关联的不算缺失）：100% 镜像的另一半。
-    let missing = missing_mirror_session_ids(&groups, &mother_uid, target_uid);
+    // 目标账号缺失的母本会话（已关联的不算缺失）：100% 镜像的另一半，与预览 `copiedCount` 同源。
+    let missing = missing_mirror_session_ids(
+        &groups,
+        &mother_uid,
+        target_uid,
+        &mother_states,
+        &target_alive_ids,
+    );
 
     // 记忆是否已一致：必须并入「零操作」判定——否则「仅 MEMORY.md 不同」的切号会被整体跳过，
     // 镜像就不算 100%。
@@ -1713,6 +1926,7 @@ mod tests {
             "u-mother",
             "u-target",
             &groups,
+            &HashMap::new(),
             &targets,
             vec!["g-1".to_string()],
             vec!["g-1".to_string()],
@@ -1804,7 +2018,10 @@ mod tests {
     fn mirror_targets_isolates_user_id_and_lists_every_field() {
         let groups = vec![group(
             "g-1",
-            vec![("u-target", "s-1", MemberState::Active)],
+            vec![
+                ("u-mother", "s-m-gone", MemberState::Active),
+                ("u-target", "s-1", MemberState::Active),
+            ],
         )];
         let rows = vec![
             MirrorRow {
@@ -1840,7 +2057,7 @@ mod tests {
                 deleted_at: Some(999),
             },
         ];
-        let targets = mirror_targets_from_rows(&rows, "u-target", "u-mother", &groups);
+        let targets = mirror_targets_from_rows(&rows, "u-target", "u-mother", &groups, &HashMap::new());
         assert_eq!(targets.len(), 1, "只列目标 uid 且未软删的行");
         let only = &targets[0];
         assert_eq!(only.session_id, "s-1");
@@ -1857,7 +2074,9 @@ mod tests {
     }
 
     #[test]
-    fn private_sessions_get_empty_group_id() {
+    fn ungrouped_target_rows_are_kept_with_empty_group_id() {
+        // I5：目标行不在任何组里 → 无从证明其归属母本，一律保留（D1：不做「母本没有就删」）。
+        // `groupId` 仍按 `group_id_for` 口径为空串（该字段供备份清单与回显使用）。
         let rows = vec![MirrorRow {
             session_id: "s-private".to_string(),
             user_id: "u-target".to_string(),
@@ -1866,10 +2085,217 @@ mod tests {
             updated_at: 1,
             deleted_at: None,
         }];
-        let targets = mirror_targets_from_rows(&rows, "u-target", "u-mother", &[]);
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].group_id, "", "未建组会话 groupId 为空");
-        assert_eq!(targets[0].title, "(无标题)");
+        let targets = mirror_targets_from_rows(&rows, "u-target", "u-mother", &[], &HashMap::new());
+        assert!(targets.is_empty(), "无组目标行必须保留：{targets:?}");
+        assert_eq!(
+            group_id_for(&[], "u-target", "s-private"),
+            "",
+            "未建组会话 groupId 为空"
+        );
+        assert_eq!(display_title(None, None), "(无标题)");
+    }
+
+    // --- 红测 2b：只跟着母本删（I1/I2/I5 + Bug A 判据） --------------------
+
+    /// 母本会话状态快照：`alive` 为存活 id，`gone` 为已软删（`deleted_at` 时刻）的 id；
+    /// 两者都没列出的 id 即「物理不存在」，与已软删等价（Spec §1.2）。
+    fn mother_states(alive: &[&str], gone: &[(&str, i64)]) -> HashMap<String, Option<i64>> {
+        let mut states: HashMap<String, Option<i64>> =
+            alive.iter().map(|id| (id.to_string(), None)).collect();
+        for (id, deleted_at) in gone {
+            states.insert(id.to_string(), Some(*deleted_at));
+        }
+        states
+    }
+
+    fn target_row(session_id: &str) -> MirrorRow {
+        MirrorRow {
+            session_id: session_id.to_string(),
+            user_id: "u-target".to_string(),
+            title: Some(format!("标题-{session_id}")),
+            custom_title: None,
+            updated_at: 1000,
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn mirror_targets_deletes_when_every_mother_member_is_gone() {
+        // P1（母本行 deleted_at 非空）与 P2（母本行物理不存在）等价，都必须进待删清单。
+        for (case, states) in [
+            ("已软删", mother_states(&[], &[("s-m", 999)])),
+            ("物理不存在", mother_states(&[], &[])),
+        ] {
+            let groups = vec![group(
+                "g-1",
+                vec![
+                    ("u-mother", "s-m", MemberState::Active),
+                    ("u-target", "s-1", MemberState::Active),
+                ],
+            )];
+            let targets = mirror_targets_from_rows(
+                &[target_row("s-1")],
+                "u-target",
+                "u-mother",
+                &groups,
+                &states,
+            );
+            assert_eq!(targets.len(), 1, "{case}：母本成员全 Gone 时副本应进清单（Bug A）");
+            assert_eq!(targets[0].session_id, "s-1", "{case}");
+            assert_eq!(targets[0].group_id, "g-1", "{case}");
+        }
+    }
+
+    #[test]
+    fn mirror_targets_keeps_group_when_any_mother_member_still_alive() {
+        // P3：一条 gone、一条 alive → 全部 gone 才算 gone（I1）。
+        let groups = vec![group(
+            "g-1",
+            vec![
+                ("u-mother", "s-m-gone", MemberState::Active),
+                ("u-mother", "s-m-alive", MemberState::Superseded),
+                ("u-target", "s-1", MemberState::Active),
+            ],
+        )];
+        let states = mother_states(&["s-m-alive"], &[("s-m-gone", 111)]);
+        let targets = mirror_targets_from_rows(
+            &[target_row("s-1")],
+            "u-target",
+            "u-mother",
+            &groups,
+            &states,
+        );
+        assert!(targets.is_empty(), "存在任一 Alive 母本成员即保留：{targets:?}");
+    }
+
+    #[test]
+    fn mirror_targets_keeps_superseded_member_that_is_still_alive() {
+        // P4：Superseded 描述配对生命周期，不是保留理由；它仍 Alive 才是保留理由（I2）。
+        let groups = vec![group(
+            "g-1",
+            vec![
+                ("u-mother", "s-m", MemberState::Superseded),
+                ("u-target", "s-1", MemberState::Active),
+            ],
+        )];
+        let states = mother_states(&["s-m"], &[]);
+        let targets = mirror_targets_from_rows(
+            &[target_row("s-1")],
+            "u-target",
+            "u-mother",
+            &groups,
+            &states,
+        );
+        assert!(targets.is_empty(), "母本仍持有该对话，不得删目标副本：{targets:?}");
+    }
+
+    #[test]
+    fn mirror_targets_deletes_when_active_and_superseded_all_gone() {
+        // P4b：Active 与 Superseded 全部 Gone → 进清单（Superseded 本身不是保留理由）。
+        let groups = vec![group(
+            "g-1",
+            vec![
+                ("u-mother", "s-m-act", MemberState::Active),
+                ("u-mother", "s-m-sup", MemberState::Superseded),
+                ("u-target", "s-1", MemberState::Active),
+            ],
+        )];
+        let states = mother_states(&[], &[("s-m-act", 1), ("s-m-sup", 2)]);
+        let targets = mirror_targets_from_rows(
+            &[target_row("s-1")],
+            "u-target",
+            "u-mother",
+            &groups,
+            &states,
+        );
+        assert_eq!(targets.len(), 1, "全部 Gone 且非空 → 删：{targets:?}");
+        assert_eq!(targets[0].session_id, "s-1");
+    }
+
+    #[test]
+    fn mirror_targets_keeps_ungrouped_and_motherless_groups() {
+        // I5：目标无组 → 无从证明归属，保留；组内没有母本任何成员 → 目标独有，保留。
+        let grouped = vec![group(
+            "g-third",
+            vec![
+                ("u-third", "s-third", MemberState::Active),
+                ("u-target", "s-2", MemberState::Active),
+            ],
+        )];
+        let targets = mirror_targets_from_rows(
+            &[target_row("s-private"), target_row("s-2")],
+            "u-target",
+            "u-mother",
+            &grouped,
+            &mother_states(&[], &[("s-m", 9)]),
+        );
+        assert!(targets.is_empty(), "无组与 M(g)=∅ 一律保留：{targets:?}");
+    }
+
+    #[test]
+    fn mirror_preview_soft_deletes_copy_when_mother_member_gone() {
+        // Bug A 端到端：母本行已软删、组与目标副本都还在 → 预览必须给出待删条目。
+        let dir = TempDir::new("bug-a");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(
+            &paths,
+            &[
+                ("s-1", "u-target", 1000, None),
+                ("s-m", "u-mother", 2000, Some(999)),
+            ],
+        );
+        write_link_store(
+            &paths,
+            vec![group(
+                "g-1",
+                vec![
+                    ("u-mother", "s-m", MemberState::Active),
+                    ("u-target", "s-1", MemberState::Active),
+                ],
+            )],
+        );
+        let preview =
+            mirror_preview_at(&paths, WbVariant::Cn, &json!({ "uid": "u-target" })).unwrap();
+        assert_eq!(preview.session_count, 1, "母本已删 → 目标副本进待删清单");
+        assert_eq!(preview.targets[0].session_id, "s-1");
+        assert_eq!(preview.copied_count, 0, "母本没有存活会话要复制");
+    }
+
+    #[test]
+    fn mirror_preview_without_deleted_at_column_treats_all_rows_alive() {
+        // Z4：旧库缺 `deleted_at` 列 → 母本所有存在行按 Alive（fail-closed：宁可少删）。
+        let dir = TempDir::new("no-deleted-at");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        std::fs::create_dir_all(&paths.data_root).unwrap();
+        {
+            let conn = Connection::open(paths.workbuddy_db()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (id TEXT, user_id TEXT, title TEXT, custom_title TEXT, \
+                 updated_at INTEGER);\
+                 INSERT INTO sessions VALUES ('s-1','u-target','目标副本',NULL,1000);\
+                 INSERT INTO sessions VALUES ('s-m','u-mother','母本',NULL,2000);",
+            )
+            .unwrap();
+        }
+        write_link_store(
+            &paths,
+            vec![group(
+                "g-1",
+                vec![
+                    ("u-mother", "s-m", MemberState::Active),
+                    ("u-target", "s-1", MemberState::Active),
+                ],
+            )],
+        );
+        let preview =
+            mirror_preview_at(&paths, WbVariant::Cn, &json!({ "uid": "u-target" })).unwrap();
+        assert!(
+            preview.targets.is_empty(),
+            "缺列时母本行恒按 Alive → 不删：{:?}",
+            preview.targets
+        );
     }
 
     // --- 红测 3：跨账号关联键判重（uid 精确匹配，绝不按标题） --------------
@@ -1894,7 +2320,13 @@ mod tests {
             ),
         ];
         assert_eq!(
-            count_mirror_copies(&groups, "u-mother", "u-target"),
+            count_mirror_copies(
+                &groups,
+                "u-mother",
+                "u-target",
+                &HashMap::from([("same-title".to_string(), None)]),
+                &HashSet::new(),
+            ),
             1,
             "仅母本有、目标没有的组需复制；标题相同不合并；第三方 uid 不算母本"
         );
@@ -1968,6 +2400,7 @@ mod tests {
             "u-target",
             "digest-x",
             &groups,
+            &HashMap::new(),
             1,
             1,
         );
@@ -2036,6 +2469,8 @@ mod tests {
         let target_acc = json!({ "uid": "u-target" });
         // 前端伪造 motherUid 也不能改变母本：母本恒取登录态 u-mother。
         let forged_acc = json!({ "uid": "u-target", "motherUid": "u-attacker" });
+        // s-1 / s-2 的母本成员物理不存在（Gone）→ 两条都进待删清单（「只跟着母本删」）。
+        seed_gone_mother_groups(&paths, &["s-1", "s-2"]);
 
         let snapshot = |conn: &Connection| -> Vec<(String, Option<i64>)> {
             let mut stmt = conn
@@ -2160,6 +2595,7 @@ mod tests {
                 ("s-already", "u-target", 1000, Some(999)),
             ],
         );
+        seed_gone_mother_groups(&paths, &["s-1", "s-2"]);
         let plan = preview_plan(&paths, "u-target");
         assert_eq!(plan.targets.len(), 2, "只列 u-target 未软删两行");
 
@@ -2179,6 +2615,7 @@ mod tests {
         let paths = paths_for(&dir);
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        seed_gone_mother_groups(&paths, &["s-1"]);
         let plan = preview_plan(&paths, "u-target");
         let first = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
         assert_eq!(first.deleted_sessions, 1);
@@ -2241,6 +2678,7 @@ mod tests {
                 ("s-prior", "u-target", 1000, Some(999)),
             ],
         );
+        seed_gone_mother_groups(&paths, &["s-1"]);
         let plan = preview_plan(&paths, "u-target");
         assert_eq!(plan.targets.len(), 1, "只列未软删的 s-1");
 
@@ -2284,6 +2722,7 @@ mod tests {
         let paths = paths_for(&dir);
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        seed_gone_mother_groups(&paths, &["s-1"]);
         let plan = preview_plan(&paths, "u-target");
         let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
         let backup = PathBuf::from(report.backup.clone().unwrap());
@@ -2314,6 +2753,7 @@ mod tests {
         let paths = paths_for(&dir);
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        seed_gone_mother_groups(&paths, &["s-1"]);
         let plan = preview_plan(&paths, "u-target");
         let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
 
@@ -2347,6 +2787,7 @@ mod tests {
         let paths = paths_for(&dir);
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        seed_gone_mother_groups(&paths, &["s-1"]);
         let plan = preview_plan(&paths, "u-target");
         let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
         let file = PathBuf::from(report.backup.unwrap()).join(MIRROR_MANIFEST_FILE);
@@ -2361,6 +2802,7 @@ mod tests {
         let paths = paths_for(&dir);
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        seed_gone_mother_groups(&paths, &["s-1"]);
         let plan = preview_plan(&paths, "u-target");
         mirror_apply_at(&paths, WbVariant::Cn, "u-target", &json!({"uid": "u-target"}), &paths.data_root, &plan).unwrap();
 
@@ -2386,6 +2828,31 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(file, serde_json::to_string(&store).unwrap()).unwrap();
+    }
+
+    /// 给每个目标行配一个「母本侧已删」的关联组（`m-<id>` 在 `sessions` 里物理不存在 = `Gone`）。
+    ///
+    /// 0.1.82 的镜像判据是「只跟着母本删」（Spec D1）：目标行若不在任何组、或所属组里仍有存活
+    /// 母本成员，一律保留。因此凡是要断言「会被软删」的用例，都必须先造出母本侧已删的证据。
+    fn seed_gone_mother_groups(paths: &SessionPaths, target_session_ids: &[&str]) {
+        let mother_ids: Vec<String> = target_session_ids
+            .iter()
+            .map(|session_id| format!("m-{session_id}"))
+            .collect();
+        let groups: Vec<LinkGroup> = target_session_ids
+            .iter()
+            .zip(mother_ids.iter())
+            .map(|(target_id, mother_id)| {
+                group(
+                    &format!("g-{target_id}"),
+                    vec![
+                        ("u-mother", mother_id.as_str(), MemberState::Active),
+                        ("u-target", target_id, MemberState::Active),
+                    ],
+                )
+            })
+            .collect();
+        write_link_store(paths, groups);
     }
 
     /// 可复制环境：源账号 u-mother 有带正文的 s-mother，目标 u-target 空；关联组 g-1 只有母本。
@@ -2455,9 +2922,256 @@ mod tests {
             ),
         ];
         assert_eq!(
-            missing_mirror_session_ids(&groups, "u-mother", "u-target"),
+            missing_mirror_session_ids(
+                &groups,
+                "u-mother",
+                "u-target",
+                &HashMap::from([("s-m".to_string(), None), ("s-m2".to_string(), None)]),
+                &HashSet::new(),
+            ),
             vec!["s-m".to_string()],
             "只算母本独有组；已关联（g-both）不算缺失"
+        );
+    }
+
+    // --- 批次③b：无关联组母本存活会话按 id 复制（I4 / Bug B） --------------
+
+    /// 无组可复制环境：源账号 u-mother 有 3 条**没有任何关联组**的存活会话（Bug B 现场形态），
+    /// 每条都带正文；目标 u-target 空；关联组列表为空（Z1）。
+    fn copy_ready_ungrouped_env(dir: &TempDir) -> SessionPaths {
+        let paths = paths_for(dir);
+        seed_auth(&paths, "u-mother");
+        std::fs::create_dir_all(&paths.data_root).unwrap();
+        let ids = ["s-loose-a", "s-loose-b", "s-loose-c"];
+        let conn = Connection::open(paths.workbuddy_db()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, user_id TEXT, title TEXT, custom_title TEXT, \
+             updated_at INTEGER, deleted_at INTEGER);",
+        )
+        .unwrap();
+        for id in ids {
+            conn.execute(
+                "INSERT INTO sessions VALUES (?1,'u-mother',?2,NULL,2000,NULL)",
+                rusqlite::params![id, format!("标题-{id}")],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let econn = Connection::open(paths.edge_sync_db(WbVariant::Cn)).unwrap();
+        econn
+            .execute_batch(
+                "CREATE TABLE edge_sync_mapping (session_id TEXT, conversation_id TEXT, \
+                 msg_channel TEXT, created_at INTEGER);",
+            )
+            .unwrap();
+        drop(econn);
+        let proj = paths.projects_dir().join("ws-a");
+        std::fs::create_dir_all(&proj).unwrap();
+        for id in ids {
+            std::fs::write(
+                proj.join(format!("{id}.jsonl")),
+                format!(
+                    "{}\n{}\n",
+                    json!({"type":"user","sessionId":id,"text":"你好"}),
+                    json!({"type":"assistant","sessionId":id,"text":"hi"})
+                ),
+            )
+            .unwrap();
+        }
+        write_link_store(&paths, Vec::new());
+        paths
+    }
+
+    fn mother_rows(paths: &SessionPaths) -> Vec<(String, Option<i64>, i64)> {
+        let conn = Connection::open(paths.workbuddy_db()).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, deleted_at, updated_at FROM sessions \
+                 WHERE user_id = 'u-mother' ORDER BY id",
+            )
+            .unwrap();
+        let rows: Vec<(String, Option<i64>, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        rows
+    }
+
+    #[test]
+    fn missing_mirror_session_ids_includes_ungrouped_mother_sessions() {
+        // P5/I4：母本 3 条无组存活会话必须全部进复制清单；已软删的无组会话不复制。
+        let states = mother_states(
+            &["loose-a", "loose-b", "loose-c"],
+            &[("loose-dead", 999)],
+        );
+        assert_eq!(
+            missing_mirror_session_ids(&[], "u-mother", "u-target", &states, &HashSet::new()),
+            vec![
+                "loose-a".to_string(),
+                "loose-b".to_string(),
+                "loose-c".to_string()
+            ],
+            "只遍历组的旧写法会漏掉这 3 条"
+        );
+        assert_eq!(
+            count_mirror_copies(&[], "u-mother", "u-target", &states, &HashSet::new()),
+            3,
+            "copiedCount 与 missing 同源"
+        );
+    }
+
+    #[test]
+    fn missing_mirror_session_ids_skips_ids_target_already_has() {
+        // P6：目标已存活存在的 id 不重复复制。
+        let states = mother_states(&["loose-a", "loose-b"], &[]);
+        let target_alive: HashSet<String> = HashSet::from(["loose-a".to_string()]);
+        assert_eq!(
+            missing_mirror_session_ids(&[], "u-mother", "u-target", &states, &target_alive),
+            vec!["loose-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn mother_mirror_fingerprint_tracks_ungrouped_and_gone_states() {
+        let groups = vec![group(
+            "g-1",
+            vec![
+                ("u-mother", "s-m", MemberState::Active),
+                ("u-target", "s-1", MemberState::Active),
+            ],
+        )];
+        let base = mother_states(&["s-m", "loose"], &[]);
+        let fingerprint =
+            |states: &HashMap<String, Option<i64>>| mother_mirror_fingerprint(&groups, "u-mother", states);
+
+        assert_eq!(fingerprint(&base.clone()), fingerprint(&base), "同现场恒等");
+        assert_ne!(
+            fingerprint(&mother_states(&["s-m", "loose", "loose-2"], &[])),
+            fingerprint(&base),
+            "母本无组存活会话新增必须改变指纹（I4）"
+        );
+        assert_ne!(
+            fingerprint(&mother_states(&["loose"], &[("s-m", 999)])),
+            fingerprint(&base),
+            "母本成员转 Gone 必须改变指纹（Bug A 触发点）"
+        );
+        assert_ne!(
+            fingerprint(&base),
+            mother_active_fingerprint(&groups, "u-mother"),
+            "合并指纹恒不等于旧指纹 → 升级后旧 token 自然失配"
+        );
+    }
+
+    #[test]
+    fn mirror_preview_and_apply_copy_ungrouped_mother_sessions() {
+        // Z1 + P5 端到端：`groups == []` 时目标行全部保留，母本全部存活会话都要复制。
+        let dir = TempDir::new("copy-loose");
+        let paths = copy_ready_ungrouped_env(&dir);
+        let target_acc = json!({"id":"acc-u-target","uid":"u-target","variant":"cn"});
+
+        let preview =
+            mirror_preview_at(&paths, WbVariant::Cn, &json!({"uid": "u-target"})).unwrap();
+        assert!(preview.targets.is_empty(), "没有母本已删证据 → 一条都不删");
+        assert_eq!(preview.copied_count, 3, "3 条无组存活会话全部计入（Bug B）");
+
+        let plan = preview_plan(&paths, "u-target");
+        let report = mirror_apply_at(
+            &paths,
+            WbVariant::Cn,
+            "u-target",
+            &target_acc,
+            &paths.data_root,
+            &plan,
+        )
+        .unwrap();
+        assert_eq!(report.copied_sessions, 3, "预览「将复制」与实际复制必须一致");
+        assert_eq!(target_active_count(&paths, "u-target"), 3, "目标出现 3 条副本");
+
+        let again = mirror_preview_at(&paths, WbVariant::Cn, &json!({"uid": "u-target"})).unwrap();
+        assert_eq!(again.copied_count, 0, "复制后建组 → 不再算缺失，不重复复制");
+    }
+
+    #[test]
+    fn mirror_copy_leaves_mother_side_untouched() {
+        // I8/P9：复制只读源——母本 sessions 行、正文 jsonl、MEMORY.md 全部零写入。
+        let dir = TempDir::new("copy-readonly-src");
+        let paths = copy_ready_ungrouped_env(&dir);
+        let memory_root = dir.path().join("memory-root");
+        let mother_dir = memory::personal_dir_at(&memory_root, "u-mother");
+        std::fs::create_dir_all(&mother_dir).unwrap();
+        std::fs::write(mother_dir.join("MEMORY.md"), "## 母本记忆\n").unwrap();
+
+        let body = paths
+            .projects_dir()
+            .join("ws-a")
+            .join("s-loose-a.jsonl");
+        let body_before = std::fs::read(&body).unwrap();
+        let rows_before = mother_rows(&paths);
+
+        let target_acc = json!({"id":"acc-u-target","uid":"u-target","variant":"cn"});
+        let plan = preview_plan(&paths, "u-target");
+        mirror_apply_at(
+            &paths,
+            WbVariant::Cn,
+            "u-target",
+            &target_acc,
+            &memory_root,
+            &plan,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&body).unwrap(), body_before, "母本正文零写入");
+        assert_eq!(mother_rows(&paths), rows_before, "母本 sessions 行零写入");
+        assert_eq!(
+            std::fs::read_to_string(mother_dir.join("MEMORY.md")).unwrap(),
+            "## 母本记忆\n",
+            "母本 MEMORY.md 零写入"
+        );
+    }
+
+    #[test]
+    fn mirror_apply_rejects_when_mother_loose_sessions_changed() {
+        // N2：预览后母本无组会话集合变化（**数量不变**，故只能由新指纹维度抓到）→ 零写入。
+        let dir = TempDir::new("loose-changed");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(
+            &paths,
+            &[
+                ("loose-a", "u-mother", 1000, None),
+                ("loose-b", "u-mother", 1000, None),
+            ],
+        );
+        write_link_store(&paths, Vec::new());
+        let plan = preview_plan(&paths, "u-target");
+        assert!(plan.targets.is_empty());
+
+        {
+            let conn = Connection::open(paths.workbuddy_db()).unwrap();
+            conn.execute("UPDATE sessions SET deleted_at = 999 WHERE id = 'loose-a'", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO sessions VALUES ('loose-c','u-mother','新会话',NULL,3000,NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let error = mirror_apply_at(
+            &paths,
+            WbVariant::Cn,
+            "u-target",
+            &json!({"uid": "u-target"}),
+            &paths.data_root,
+            &plan,
+        )
+        .unwrap_err();
+        assert!(error.contains("过期"), "母本无组会话变化必须拒绝：{error}");
+        assert_eq!(
+            target_active_count(&paths, "u-target"),
+            0,
+            "零写入：一条副本都不该产生"
         );
     }
 
@@ -2518,7 +3232,17 @@ mod tests {
         }
         write_link_store(
             &paths,
-            vec![group("g-1", vec![("u-mother", "s-mother", MemberState::Active)])],
+            vec![
+                group("g-1", vec![("u-mother", "s-mother", MemberState::Active)]),
+                // s-extra 的母本成员物理不存在（Gone）→ 按 I1/I3 进待删清单。
+                group(
+                    "g-extra",
+                    vec![
+                        ("u-mother", "m-s-extra", MemberState::Active),
+                        ("u-target", "s-extra", MemberState::Active),
+                    ],
+                ),
+            ],
         );
         let target_acc = json!({"id":"acc-u-target","uid":"u-target","variant":"cn"});
         let plan = preview_plan(&paths, "u-target");
@@ -2553,6 +3277,7 @@ mod tests {
         let paths = paths_for(&dir);
         seed_auth(&paths, "u-mother");
         seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        seed_gone_mother_groups(&paths, &["s-1"]);
 
         // 母本有记忆；目标的人格目录位置被一个同名**文件**占住 → 创建目录必失败。
         let memory_root = dir.path().join("memory-root");
