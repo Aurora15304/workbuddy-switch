@@ -278,7 +278,12 @@ export function canSubmitMirror(
   return true;
 }
 
-/** 边界一次性归一化：只输出冻结的四字段 MirrorPlan，不夹带任何别的通道。 */
+/**
+ * 边界一次性归一化：只输出冻结的三字段 MirrorPlan，不夹带任何别的通道。
+ *
+ * 刻意不下发 `motherUid`：母本恒由后端取自登录态，前端传入只会营造「可伪造」的假象。
+ * `selection.motherUid` 仅在 `canSubmitMirror` 中与预览返回的母本交叉校验，不进入计划。
+ */
 export function toMirrorSwitchArgs(
   selection: MirrorSelection,
   preview: MirrorPreview | null,
@@ -286,7 +291,6 @@ export function toMirrorSwitchArgs(
   if (!canSubmitMirror(selection, preview) || !preview) return {};
   return {
     mirrorPlan: {
-      motherUid: preview.motherUid,
       targets: preview.targets,
       expectedDigest: preview.expectedDigest,
       previewToken: preview.previewToken,

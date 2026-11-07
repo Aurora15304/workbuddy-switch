@@ -342,9 +342,14 @@ export interface MirrorPreview {
   backupDir: string | null;
 }
 
-/** 冻结的执行计划：作为 switchAccount 的独立参数并入 switch_account 主干，继承 try_auth() 锁。 */
+/**
+ * 冻结的执行计划：作为 switchAccount 的独立参数并入 switch_account 主干，继承 try_auth() 锁。
+ *
+ * 刻意不含 `motherUid`：母本恒由后端取自登录态（镜像执行端点忽略前端母本），
+ * 前端不下发、也不暗示可伪造。预览返回的 `MirrorPreview.motherUid` 仅用于界面回显与
+ * 「登录态在预览期间变化」的只读校验。
+ */
 export interface MirrorPlan {
-  motherUid: string;
   targets: MirrorTarget[];
   expectedDigest: string;
   previewToken: string;

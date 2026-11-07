@@ -638,10 +638,12 @@ export function switchAccount(args: {
 
 /**
  * 只读预览整份镜像：以当前登录账号为母本，逐条列出目标账号将被软删的会话，不折叠。
- * 返回的 previewToken 绑定 motherUid，执行时由后端复核（伪造 / 失效 / uid 变化一律拒绝）。
+ *
+ * 不传母本：后端恒从登录态取母本，`motherUid` 只在返回里作界面回显与只读校验，
+ * 前端即便传也会被忽略——因此这里不提供该参数，杜绝伪造幻想。
+ * 返回的 previewToken 绑定登录态母本，执行时由后端复核（伪造 / 失效 / uid 变化一律拒绝）。
  */
 export function mirrorPreview(args: {
-  motherUid: string;
   targetAccountId: string;
   variant?: WbVariant;
 }): Promise<MirrorPreview> {

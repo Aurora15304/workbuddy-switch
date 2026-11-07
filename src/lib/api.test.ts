@@ -97,9 +97,11 @@ describe("webui httpCall URL 构造", () => {
   });
 });
 
-/** 镜像切换是独立通道：mirrorPlan 逐字透传，绝不夹带任何别的写入通道。 */
+/**
+ * 镜像切换是独立通道：mirrorPlan 逐字透传，绝不夹带任何别的写入通道。
+ * 刻意不含 motherUid：母本恒由后端取自登录态，前端不下发也不暗示可伪造。
+ */
 const MIRROR_PLAN: MirrorPlan = {
-  motherUid: "u2",
   targets: [
     { sessionId: "s-1", title: "会话一", userId: "u-target", groupId: "g-1", updatedAt: 1000, fullDigest: "d-1", kind: "session" },
   ],
@@ -136,14 +138,14 @@ describe("switchAccount — mirrorPlan 独立参数形状", () => {
   it("mirrorPreview / restoreMirrorBackup 走独立只读预览 / 还原路由", async () => {
     const fetchMock = stubFetch();
 
-    await mirrorPreview({ motherUid: "u2", targetAccountId: "a-1" });
+    await mirrorPreview({ targetAccountId: "a-1" });
     await restoreMirrorBackup({ backup: "/abs/backup/dir" });
 
     const [previewUrl, previewInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     expect(previewUrl).toBe("/api/mirror/preview");
     expect(previewInit.method).toBe("POST");
+    // 不传母本：后端恒取登录态，前端不下发 motherUid。
     expect(JSON.parse(previewInit.body as string)).toEqual({
-      motherUid: "u2",
       targetAccountId: "a-1",
     });
 

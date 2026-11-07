@@ -175,6 +175,12 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const accounts = useAccountsStore((s) => s.accounts);
   const statusCurrent = useAccountsStore((s) => s.status?.current ?? null);
 
+  /**
+   * 登录态母本 uid：镜像切换的母本恒取此刻登录账号，只读，绝不由用户手选。
+   * 与后端 `current_user_uid_at` 同源；`status.current.uid` 即账号页 isWorkbuddyCurrent 口径。
+   */
+  const loginUid = statusCurrent?.uid ?? null;
+
   const variant = accountVariant(account);
   const accountId = account?.id;
 
@@ -236,6 +242,17 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       clearInterval: (id) => window.clearInterval(id),
     });
   }, [open, busy]);
+
+  // 母本恒等于登录态 uid：弹窗打开或登录态变化时同步，用户不可手选。
+  // 跨母本必须作废旧预览与全部确认，凭证绝不跨母本续用（登录态在切号期间可能被外部刷新）。
+  useEffect(() => {
+    if (!open) return;
+    if (mirror.motherUid === loginUid) return;
+    setMirror({ motherUid: loginUid, acknowledged: false, confirmed: false });
+    setMirrorPreview(null);
+    setMirrorError("");
+    setMirrorConfirmOpen(false);
+  }, [open, loginUid, mirror.motherUid]);
 
   // 立即打开弹框；首次绘制前重置旧内容，两个 tab 各自加载数据。
   useLayoutEffect(() => {
@@ -320,26 +337,20 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     mirrorPreview?.motherLabel ??
     "母本账号";
 
-  /** 变更母本：作废旧预览与全部确认，凭证绝不跨母本续用。 */
-  function chooseMirrorMother(uid: string) {
-    setMirror({ motherUid: uid, acknowledged: false, confirmed: false });
-    setMirrorPreview(null);
-    setMirrorError("");
-    setMirrorConfirmOpen(false);
-  }
-
-  /** 独立只读预览：整份镜像清单绑定 motherUid，执行时由后端复核凭证。 */
+  /** 独立只读预览：母本由后端取自登录态，返回的 motherUid 只做只读校验与回显。 */
   async function loadMirrorPreview() {
-    const motherUid = mirror.motherUid;
-    if (!motherUid || !accountId) return;
+    if (!loginUid || !accountId) return;
     setMirrorPreviewBusy(true);
     setMirrorError("");
     setMirrorPreview(null);
     setMirror((prev) => ({ ...prev, confirmed: false }));
     try {
-      const res = await api.mirrorPreview({ motherUid, targetAccountId: accountId, variant });
-      // 预览与母本强绑定：换了母本才返回的迟到结果一律丢弃。
-      if (res.motherUid !== motherUid) return;
+      const res = await api.mirrorPreview({ targetAccountId: accountId, variant });
+      // 预览期间登录账号发生变化：不静默丢弃，明确提示重新打开切号窗口。
+      if (res.motherUid !== loginUid) {
+        setMirrorError("当前登录账号已变化，请重新打开切号窗口再试");
+        return;
+      }
       setMirrorPreview(res);
     } catch (e) {
       setMirrorError(api.asError(e));
@@ -913,26 +924,18 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           以当前登录账号为母本，把目标账号的会话集合整份对齐：目标多出的会话软删（可还原），母本多出的会话复制，MEMORY.md 整份覆盖。默认关闭，须先预览逐条清单、再二次确认；执行前逐条复核并先备份，成功后可一键还原。不影响人设、专家团与归档状态。
         </p>
 
-        {/* 母本 = 当前登录账号：value 只绑定 mirror.motherUid，绝不代入 defaultUid。 */}
+        {/* 母本恒为当前登录账号（后端同源 current_user_uid_at）：只读展示，用户不可手选。 */}
         <div className="space-y-1.5">
           <label className="text-xs font-medium" htmlFor="mirror-mother-uid">母本账号（当前登录账号）</label>
-          <Select
-            value={mirror.motherUid ?? ""}
-            onValueChange={chooseMirrorMother}
-            disabled={busy || memorySources.options.length === 0}
-          >
+          <Select value={mirror.motherUid ?? ""} disabled>
             <SelectTrigger
               id="mirror-mother-uid"
               size="sm"
               className="w-full min-w-0 bg-background text-xs"
-              aria-label="镜像切换母本账号"
+              aria-label="镜像切换母本账号（当前登录账号，只读）"
             >
               <SelectValue
-                placeholder={
-                  memorySources.options.length === 0
-                    ? "账号库里没有可用作母本的账号"
-                    : "确认母本账号（当前登录账号）"
-                }
+                placeholder={loginUid ? "当前登录账号" : "未识别到当前登录账号"}
               />
             </SelectTrigger>
             <SelectContent>

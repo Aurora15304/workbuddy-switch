@@ -396,18 +396,19 @@ describe("镜像切换 — 母本 uid 由登录态确定，defaultUid 禁止代�
     expect(canSubmitMirror(selection, empty)).toBe(false);
   });
 
-  it("toMirrorSwitchArgs 只输出冻结的四字段 plan，不夹带 syncSelections / memoryMode", () => {
+  it("toMirrorSwitchArgs 只输出冻结的三字段 plan（不含 motherUid），不夹带别的通道", () => {
     const preview = mirrorPreviewFixture("u2");
     const args = toMirrorSwitchArgs(
       { motherUid: "u2", acknowledged: true, confirmed: true },
       preview,
     );
+    // 母本由后端取自登录态：前端只输出 targets/expectedDigest/previewToken。
     expect(args.mirrorPlan).toEqual({
-      motherUid: "u2",
       targets: preview.targets,
       expectedDigest: "digest-1",
       previewToken: "tok-delete-1",
     });
+    expect(args.mirrorPlan).not.toHaveProperty("motherUid");
     expect(args).not.toHaveProperty("syncSelections");
     expect(args).not.toHaveProperty("memoryMode");
     expect(args).not.toHaveProperty("memorySourceUid");
