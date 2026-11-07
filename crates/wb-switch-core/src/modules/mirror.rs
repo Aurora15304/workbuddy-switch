@@ -1041,12 +1041,18 @@ pub fn mirror_restore_within_root(
 ) -> Result<MirrorReport, String> {
     let canonical_backup = std::fs::canonicalize(backup_path)
         .map_err(|error| format!("镜像备份路径不存在或不可访问：{error}"))?;
-    let root = session_backup::transactions_root(paths, variant);
-    let canonical_root = std::fs::canonicalize(&root)
-        .map_err(|error| format!("镜像备份根目录不可访问：{error}"))?;
-    if !canonical_backup.starts_with(&canonical_root) {
+    // 校验落在「任一合法档位根」之下：两个档位的 transactions_root 都 canonicalize 后比对；
+    // 某档位根不存在（尚无该档备份）则跳过该根。越界即拒绝，绝不触碰数据库。
+    let in_range = [WbVariant::Cn, WbVariant::Ai].iter().any(|candidate| {
+        let root = session_backup::transactions_root(paths, *candidate);
+        std::fs::canonicalize(&root)
+            .map(|canonical_root| canonical_backup.starts_with(&canonical_root))
+            .unwrap_or(false)
+    });
+    if !in_range {
         return Err("备份路径不在允许的镜像备份目录内，已拒绝还原".to_string());
     }
+    // manifest 内部会再校验 `manifest.variant == variant`，故落到此处的路径与档位一致。
     mirror_restore_at(paths, variant, &canonical_backup)
 }
 
@@ -1062,6 +1068,8 @@ pub struct MirrorBackupEntry {
     pub backup: String,
     pub created_at: i64,
     pub target_uid: String,
+    /// 本次写入的 `deleted_at`（各行一致；空清单为 None）。
+    pub deleted_at: Option<i64>,
     /// 清单登记的行数（本次软删量）。
     pub deleted_sessions: usize,
 }
@@ -1095,6 +1103,7 @@ pub fn scan_mirror_backups(paths: &SessionPaths) -> Vec<MirrorBackupEntry> {
                 backup: dir.to_string_lossy().to_string(),
                 created_at: manifest.created_at,
                 target_uid: manifest.target_uid,
+                deleted_at: manifest.rows.first().map(|row| row.deleted_at_written),
                 deleted_sessions: manifest.rows.len(),
             });
         }
@@ -1806,5 +1815,52 @@ mod tests {
         assert_eq!(entry.deleted_sessions, 1);
         assert_eq!(entry.target_uid, "u-target");
         assert_eq!(Some(entry.backup.clone()), report.backup);
+        assert_eq!(
+            entry.deleted_at,
+            deleted_at_of(&paths, "s-1"),
+            "扫描暴露本次写入的 deletedAt"
+        );
+    }
+
+    #[test]
+    fn mirror_manifest_state_pending_then_done() {
+        // 缺省（无 state 字段）的清单按 pending 处理（保守：提示可还原，不当作已完成）。
+        let legacy = json!({
+            "version": 1, "operationId": "op", "variant": "cn", "motherUid": "m",
+            "targetUid": "t", "previewToken": "p", "expectedDigest": "d",
+            "createdAt": 1, "rows": [], "restoreSteps": []
+        });
+        let manifest: MirrorBackupManifest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(manifest.state, "pending", "缺省清单按 pending");
+
+        // apply 成功后落盘清单必须为 done。
+        let dir = TempDir::new("state");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        let plan = preview_plan(&paths, "u-target");
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        let file = PathBuf::from(report.backup.unwrap()).join(MIRROR_MANIFEST_FILE);
+        let on_disk: MirrorBackupManifest =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(on_disk.state, "done", "软删成功后清单应改写为 done");
+    }
+
+    #[test]
+    fn scan_ignores_non_mirror_transactions() {
+        let dir = TempDir::new("scan-nonmirror");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        let plan = preview_plan(&paths, "u-target");
+        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+
+        // 另造一个非镜像交易目录（只有不属于 mirror 的清单），扫描必须忽略。
+        let other = session_backup::transactions_root(&paths, WbVariant::Cn).join("other-op");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("manifest.json"), "{}").unwrap();
+
+        let entries = scan_mirror_backups(&paths);
+        assert_eq!(entries.len(), 1, "只返回 mirror manifest，不含其它交易目录");
     }
 }
