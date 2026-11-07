@@ -749,6 +749,150 @@ mod tests {
         assert!(reject_mirror_without_restart(true, false).is_none());
     }
 
+    // --- 批次②d：互斥矩阵入口断言（N3 / N4，必须在任何写入之前失败） -------
+
+    /// 把 `WB_SWITCH_HOME` 指向临时目录并在 drop 时还原。
+    ///
+    /// `switch_account` 的第一件事是取认证锁（锁文件路径来自 HOME），单测绝不该碰真实
+    /// `~/.wb-switch`，也不该因为本机残留锁而误判。
+    struct HomeGuard(Option<std::ffi::OsString>);
+
+    impl HomeGuard {
+        fn new(root: &Path) -> Self {
+            let previous = std::env::var_os(crate::modules::config::HOME_ENV_VAR);
+            std::env::set_var(crate::modules::config::HOME_ENV_VAR, root);
+            Self(previous)
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var(crate::modules::config::HOME_ENV_VAR, value),
+                None => std::env::remove_var(crate::modules::config::HOME_ENV_VAR),
+            }
+        }
+    }
+
+    fn entry_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+
+    /// 互斥判定只读 `is_some()` / `is_empty()`，计划内容不作数，给个最小非空形状即可。
+    fn minimal_mirror_plan() -> mirror::MirrorPlan {
+        mirror::MirrorPlan {
+            mother_uid: String::new(),
+            targets: Vec::new(),
+            expected_digest: "digest".to_string(),
+            preview_token: "token".to_string(),
+        }
+    }
+
+    /// 环境变量是进程全局的：本文件里有三个用例会临时改写 `WB_SWITCH_HOME`（本组两条 +
+    /// `restore_mirror_backup_reports_lock_conflict_when_held`），用一把测试专用互斥把本组
+    /// 两条串行化，避免彼此把对方占用的锁读成「认证锁冲突」。
+    static HOME_ENV_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_home_env() -> std::sync::MutexGuard<'static, ()> {
+        HOME_ENV_SERIAL
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// 在临时 HOME 下跑一次 `switch_account`，返回 (错误文案, 会话备份根, 认证备份目录, 跑前条目数)。
+    ///
+    /// 三个路径全部由 `root` 直接拼出（= `HOME=root` 时 `~/.wb-switch` 的等价路径），
+    /// **不读环境变量**：并行用例可能把 HOME 瞬时改走甚至移除，一旦用 `config::backup_dir()`
+    /// 取值，断言目标会漂到真实用户目录上。
+    fn switch_under_temp_home(
+        root: &Path,
+        copy_session_ids: &[String],
+        mirror_plan: Option<mirror::MirrorPlan>,
+        deleted_sync_plan: Option<mirror::DeletedSyncPlan>,
+    ) -> (String, std::path::PathBuf, std::path::PathBuf, usize) {
+        let stores = SessionPaths {
+            store_root: root.join(".wb-switch"),
+            data_root: root.join("data"),
+            auth_file: root.join("auth.info"),
+            link_namespace: crate::modules::session::LinkNamespace::WorkBuddy,
+        };
+        let transactions = crate::modules::session_backup::transactions_root(&stores, WbVariant::Cn);
+        let auth_backup_dir = stores.backup_root();
+        let before = entry_count(&transactions);
+
+        // 调用方持有 `HOME_ENV_SERIAL`：`WB_SWITCH_HOME` 在本次调用期间不会被别的用例改写，
+        // 认证锁因此必定空闲（锁路径取自 HOME）。
+        let _home = HomeGuard::new(root);
+        // 互斥判定在账号解析之前，故意用不存在的 id：证明失败先于任何读账号/备份/写入。
+        let error = switch_account(
+            None,
+            "no-such-account",
+            true,
+            false,
+            copy_session_ids,
+            &[],
+            None,
+            None,
+            false,
+            false,
+            memory::PersonaMode::Safe,
+            mirror_plan,
+            deleted_sync_plan,
+        )
+        .unwrap_err();
+        (error, transactions, auth_backup_dir, before)
+    }
+
+    #[test]
+    fn switch_account_rejects_mirror_with_deleted_sync_plan() {
+        let _serial = lock_home_env();
+        let dir = TempDir::new("mutex-deleted-sync");
+        let (error, transactions, auth_backup_dir, before) = switch_under_temp_home(
+            &dir.0,
+            &[],
+            Some(minimal_mirror_plan()),
+            Some(mirror::DeletedSyncPlan {
+                targets: Vec::new(),
+                expected_digest: "digest".to_string(),
+            }),
+        );
+
+        assert!(
+            error.contains("互斥"),
+            "镜像与「同步已删除会话」必须互斥：{error}"
+        );
+        assert_eq!(
+            entry_count(&transactions),
+            before,
+            "互斥必须在会话备份目录生成之前失败"
+        );
+        assert!(!transactions.exists(), "会话备份根不得被创建");
+        assert!(!auth_backup_dir.exists(), "认证备份目录不得被创建");
+    }
+
+    #[test]
+    fn switch_account_rejects_mirror_with_copy_session_ids() {
+        let _serial = lock_home_env();
+        let dir = TempDir::new("mutex-copy");
+        let (error, transactions, auth_backup_dir, before) = switch_under_temp_home(
+            &dir.0,
+            &["s-1".to_string()],
+            Some(minimal_mirror_plan()),
+            None,
+        );
+
+        assert!(error.contains("互斥"), "镜像与复制会话必须互斥：{error}");
+        assert_eq!(
+            entry_count(&transactions),
+            before,
+            "互斥必须在会话备份目录生成之前失败"
+        );
+        assert!(!transactions.exists(), "会话备份根不得被创建");
+        assert!(!auth_backup_dir.exists(), "认证备份目录不得被创建");
+    }
+
     #[test]
     fn mirror_failure_is_reported_not_blocking() {
         // 失败：投影为 MirrorReport 且不进 Err（切号继续），错误落 errors。
@@ -774,6 +918,9 @@ mod tests {
     #[test]
     fn restore_mirror_backup_reports_lock_conflict_when_held() {
         // 写端点必须自己持 try_auth：锁被占用时返回冲突错误，不触碰任何数据。
+        // 本用例两次 `try_auth` 必须看到同一个 HOME，否则「持锁→冲突」的因果断链；
+        // 与同样改写 `WB_SWITCH_HOME` 的互斥用例串行化（只加锁，不改任何断言）。
+        let _serial = lock_home_env();
         let prev = std::env::var_os(crate::modules::config::HOME_ENV_VAR);
         let dir = std::env::temp_dir().join(format!(
             "wb-mirror-restore-lock-{}-{}",

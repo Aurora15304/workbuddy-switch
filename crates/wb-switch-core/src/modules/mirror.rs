@@ -2609,6 +2609,58 @@ mod tests {
         assert_eq!(deleted_at_of(&paths, "s-already"), Some(999), "已软删行不被改写");
     }
 
+    /// 造一条「计划自报属于 u-target」的待删条目：`user_id` 只来自计划，DB 侧另行校验。
+    fn planned_target(session_id: &str) -> MirrorTarget {
+        MirrorTarget {
+            session_id: session_id.to_string(),
+            title: format!("标题-{session_id}"),
+            user_id: "u-target".to_string(),
+            group_id: "g-probe".to_string(),
+            updated_at: 1000,
+            full_digest: "digest-probe".to_string(),
+            kind: "session".to_string(),
+        }
+    }
+
+    #[test]
+    fn soft_delete_skips_rows_that_belong_to_another_account() {
+        // N7 跨账号写入隔离（Spec §4.3）：`UPDATE` 恒带 `user_id` + `deleted_at IS NULL`
+        // 双前置，计划若指向别人的会话，实际影响 0 行 → 进 `skipped`，绝不跨账号写入。
+        //
+        // 该分支在 E2E 不可达：`read_target_rows` 已按目标 uid 过滤，实时重算只产出目标账号
+        // 自己的行（见 `mirror_apply_soft_deletes_only_target_active_rows` 里 `s-other` 永不被写）。
+        // 只有并发变化或计划被篡改才会命中，所以在这一层直接构造目标入参。
+        let dir = TempDir::new("n7-cross-account");
+        let paths = paths_for(&dir);
+        seed_session_db(
+            &paths,
+            &[
+                ("s-own", "u-target", 1000, None),
+                ("s-other", "u-other", 1000, None),
+            ],
+        );
+        let mut conn = Connection::open(paths.workbuddy_db()).unwrap();
+        let targets = vec![
+            // 正向对照：真属于目标账号的行必须被写，证明下面的「0 行」不是断言失效。
+            planned_target("s-own"),
+            // 计划谎称属于目标账号、实际属于 u-other：必须影响 0 行。
+            planned_target("s-other"),
+        ];
+
+        let (deleted, skipped) = soft_delete_targets(&mut conn, "u-target", &targets, 4242).unwrap();
+
+        assert_eq!(deleted, 1, "只有真属于目标账号的行被写入");
+        assert!(deleted_at_of(&paths, "s-own").is_some());
+        assert_eq!(skipped.len(), 1, "影响 0 行必须进 skipped，不得静默忽略");
+        assert_eq!(skipped[0].session_id, "s-other");
+        assert!(skipped[0].reason.contains("已跳过"), "{}", skipped[0].reason);
+        assert_eq!(
+            deleted_at_of(&paths, "s-other"),
+            None,
+            "跨账号写入隔离：别人账号的行原封不动"
+        );
+    }
+
     #[test]
     fn mirror_apply_is_idempotent_after_repreview() {
         let dir = TempDir::new("apply-idem");
