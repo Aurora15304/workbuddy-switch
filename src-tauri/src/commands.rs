@@ -650,6 +650,7 @@ pub async fn switch_account(
     merge_experts: Option<bool>,
     sync_persona: Option<bool>,
     persona_mode: Option<String>,
+    mirror_plan: Option<Value>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
@@ -665,6 +666,14 @@ pub async fn switch_account(
     // 入参形状由 core 校验（缺 groupId / previewToken / mode 一律拒绝）；这里只做透传，
     // 不在命令层做业务判定。
     let sync_selections = session::parse_sync_selections(sync_selections.as_ref())?;
+    // 镜像计划：与 core 参数逐字对称；未传为 None，解析失败明确报错（不静默降级）。
+    let mirror_plan = match mirror_plan {
+        Some(value) if !value.is_null() => Some(
+            serde_json::from_value::<mirror::MirrorPlan>(value)
+                .map_err(|error| format!("mirrorPlan 解析失败：{error}"))?,
+        ),
+        _ => None,
+    };
     let progress: switch::ProgressFn = Box::new(move |message| {
         let _ = app.emit("switch-progress", json!({ "message": message }));
     });
@@ -681,6 +690,7 @@ pub async fn switch_account(
             merge_experts,
             sync_persona,
             persona_mode,
+            mirror_plan,
         )
     })
     .await
@@ -830,6 +840,26 @@ pub async fn mirror_preview(
             .map(|raw| WbVariant::parse(Some(raw)))
             .unwrap_or_else(|| account::variant_of(&target));
         mirror::mirror_preview(variant, &target)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// POST /api/mirror/restore —— 还原镜像切换的备份（写端点，自己持 auth 锁）。
+///
+/// 与 web 端 `POST /api/mirror/restore` 逐字对称；前端 `restoreMirrorBackup` 指向该入口。
+/// 把「持锁 + 精确白名单回滚」下沉到 `switch::restore_mirror_backup`，两端宿主共用同一实现。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn restore_mirror_backup(backup: String) -> Result<Value, String> {
+    if backup.trim().is_empty() {
+        return Err("缺少 backup".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = std::path::PathBuf::from(&backup);
+        let report = switch::restore_mirror_backup(&path)?;
+        let restored = report.deleted_sessions;
+        let report_value = serde_json::to_value(&report).map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({ "ok": true, "restored": restored, "report": report_value }))
     })
     .await
     .map_err(|e| e.to_string())?

@@ -226,6 +226,7 @@ pub fn router() -> Router {
             post(api_session_links_preview),
         )
         .route("/api/mirror/preview", post(api_mirror_preview))
+        .route("/api/mirror/restore", post(api_mirror_restore))
         .route(
             "/api/session-links/progress",
             get(api_session_links_progress),
@@ -1129,6 +1130,21 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
         Ok(selections) => selections,
         Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
     };
+    // 镜像计划：与 core 参数逐字对称；未传为 None，解析失败明确 400（不静默降级）。
+    let mirror_plan = match body.get("mirrorPlan") {
+        Some(value) if !value.is_null() => {
+            match serde_json::from_value::<mirror::MirrorPlan>(value.clone()) {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    return json_err(
+                        format!("mirrorPlan 解析失败：{error}"),
+                        StatusCode::BAD_REQUEST,
+                    )
+                }
+            }
+        }
+        _ => None,
+    };
 
     let Some(_switch_guard) = SwitchStateGuard::acquire() else {
         return json_err("已有切换任务进行中".to_string(), StatusCode::CONFLICT);
@@ -1153,6 +1169,7 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
             merge_experts,
             sync_persona,
             persona_mode,
+            mirror_plan,
         )
     })
     .await;
@@ -1373,6 +1390,39 @@ async fn api_mirror_preview(Json(body): Json<Value>) -> Response {
             format!("读取镜像预览失败: {error}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
+    }
+}
+
+/// POST /api/mirror/restore —— 还原镜像切换的备份（写端点，自己持 auth 锁）。
+///
+/// 与桌面端 `restore_mirror_backup` 逐字对称；前端 `restoreMirrorBackup` 指向该路由。
+/// 「持锁 + 精确白名单回滚」下沉在 `switch::restore_mirror_backup`，锁冲突返回 409。
+async fn api_mirror_restore(Json(body): Json<Value>) -> Response {
+    let backup = body
+        .get("backup")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if backup.trim().is_empty() {
+        return json_err("缺少 backup".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let path = PathBuf::from(&backup);
+        let report = switch::restore_mirror_backup(&path)?;
+        let restored = report.deleted_sessions;
+        let report_value = serde_json::to_value(&report).map_err(|error| error.to_string())?;
+        Ok::<Value, String>(json!({ "ok": true, "restored": restored, "report": report_value }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error))
+            if error.starts_with(wb_switch_core::modules::auth_transaction::BUSY_PREFIX) =>
+        {
+            json_err(error, StatusCode::CONFLICT)
+        }
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 

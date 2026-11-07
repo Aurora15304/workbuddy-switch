@@ -84,6 +84,7 @@ fn worker() {
                 false,
                 false,
                 memory::PersonaMode::Safe,
+                None,
             );
             assert!(
                 matches!(result, Err(ref e) if e.starts_with(state_lock::BUSY_PREFIX)),
@@ -130,6 +131,7 @@ fn worker() {
                 false,
                 false,
                 memory::PersonaMode::Safe,
+                None,
             )
             .unwrap();
             assert_eq!(result["ok"], true);
@@ -159,6 +161,7 @@ fn worker() {
                 false,
                 false,
                 memory::PersonaMode::Safe,
+                None,
             )
             .unwrap();
             let exported = auth_file::read_auth_file(WbVariant::Cn).unwrap();
@@ -186,6 +189,7 @@ fn worker() {
                 false,
                 false,
                 memory::PersonaMode::Safe,
+                None,
             )
             .is_err());
             let guard = state_lock::try_auth().expect("Failed switch leaked auth lock");
@@ -253,6 +257,7 @@ fn worker() {
                 false,
                 false,
                 memory::PersonaMode::Safe,
+                None,
             );
             assert!(
                 matches!(result, Err(ref e) if e.starts_with(state_lock::BUSY_PREFIX)),

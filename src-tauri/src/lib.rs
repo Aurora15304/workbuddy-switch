@@ -252,6 +252,7 @@ pub fn run() {
             commands::session_links_preview,
             commands::session_links_preview_cross,
             commands::mirror_preview,
+            commands::restore_mirror_backup,
             commands::session_sync_cross,
             commands::list_session_groups,
             commands::get_session_group,

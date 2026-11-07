@@ -15,6 +15,7 @@
 //!      保留操作记录），不能带着不一致的会话内容写认证并启动 App。
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use serde_json::{json, Value};
 
@@ -22,6 +23,7 @@ use crate::modules::account;
 use crate::modules::auth_file;
 use crate::modules::experts;
 use crate::modules::memory;
+use crate::modules::mirror;
 use crate::modules::process::{close_workbuddy, launch_workbuddy};
 use crate::modules::session::{self, SessionPaths, SyncSelection};
 use crate::modules::session_link::{
@@ -145,6 +147,50 @@ fn reject_session_writes_without_restart(
     (copy, sync)
 }
 
+/// `restart=false` 携带镜像意图时的拒绝文案。
+pub const MIRROR_WITHOUT_RESTART_MESSAGE: &str =
+    "镜像切换必须在重启 WorkBuddy 的前提下执行；本次未重启（restart=false），已拒绝镜像请求";
+
+/// `restart=false` 且请求了镜像切换 → 返回可读错误（在备份/进程/写入之前失败）。
+fn reject_mirror_without_restart(restart: bool, has_mirror: bool) -> Option<String> {
+    (!restart && has_mirror).then(|| MIRROR_WITHOUT_RESTART_MESSAGE.to_string())
+}
+
+/// 镜像结果 → 报告 JSON：失败**不阻断切号**，统一投影为 MirrorReport 形状（错误进 errors）。
+fn mirror_report_json(result: Result<mirror::MirrorReport, String>) -> Value {
+    let report = result.unwrap_or_else(|error| mirror::MirrorReport {
+        deleted_sessions: 0,
+        copied_sessions: 0,
+        backup: None,
+        needs_recovery: false,
+        warnings: Vec::new(),
+        skipped: Vec::new(),
+        errors: vec![mirror::MirrorError {
+            session_id: String::new(),
+            error,
+        }],
+    });
+    serde_json::to_value(&report).unwrap_or(Value::Null)
+}
+
+/// 还原镜像备份（写端点）：自己持跨进程 auth 锁后再还原，两端宿主共用同一入口。
+pub fn restore_mirror_backup(backup: &Path) -> Result<mirror::MirrorReport, String> {
+    let variant = mirror_backup_variant(backup);
+    let _guard = crate::modules::auth_transaction::try_auth().map_err(|error| error.to_string())?;
+    let paths = SessionPaths::for_variant(variant);
+    mirror::mirror_restore_at(&paths, variant, backup)
+}
+
+/// 从备份目录推断档位：目录约定为 `…/session-transactions/{variant}/{uuid}`。
+fn mirror_backup_variant(backup: &Path) -> WbVariant {
+    backup
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .map(|raw| WbVariant::parse(Some(raw)))
+        .unwrap_or(WbVariant::Cn)
+}
+
 /// 账号库到 `[(uid, label)]` 的投影：记忆合并与专家团同步共用同一份形状。
 ///
 /// 缺 uid 的账号照样保留（uid 为空串），由各自的模块决定怎么报告——这里不做静默丢弃。
@@ -179,10 +225,16 @@ pub fn switch_account(
     merge_experts: bool,
     sync_persona: bool,
     persona_mode: memory::PersonaMode,
+    mirror_plan: Option<mirror::MirrorPlan>,
 ) -> Result<Value, String> {
     // 快照与导出必须和令牌刷新处在同一个事务里：在任何备份、进程管理之前取锁，
     // 这样一次失败的切换不会留下副作用。
     let auth_guard = crate::modules::auth_transaction::try_auth().map_err(|e| e.to_string())?;
+    // 镜像切换是破坏性 DB 写入，必须在重启（关闭 App）前提下执行；未重启即拒绝，
+    // 且在备份/进程/写入之前失败，绝不静默丢弃用户已确认的镜像意图。
+    if let Some(error) = reject_mirror_without_restart(restart, mirror_plan.is_some()) {
+        return Err(error);
+    }
     let progress = |message: &str| {
         eprintln!("[switch] progress: {message}");
         if let Some(p) = progress_fn {
@@ -210,6 +262,7 @@ pub fn switch_account(
     let mut memory_report: Option<Value> = None;
     let mut experts_report: Option<Value> = None;
     let mut persona_report: Option<Value> = None;
+    let mut mirror_report: Option<Value> = None;
     if restart {
         progress("正在关闭 WorkBuddy…");
         close_workbuddy(variant, 20)?;
@@ -306,6 +359,15 @@ pub fn switch_account(
                 ));
             }
         }
+        if let Some(plan) = mirror_plan.as_ref() {
+            // 镜像软删：失败不阻断切号（与 copy/sync 同形记进报告，字段名 mirror）。
+            progress("正在执行整份镜像…");
+            let target_uid = acc.get("uid").and_then(Value::as_str).unwrap_or_default();
+            let paths = SessionPaths::for_variant(variant);
+            mirror_report = Some(mirror_report_json(mirror::mirror_apply_at(
+                &paths, variant, target_uid, plan,
+            )));
+        }
     } else {
         // restart=false 表示本次不做任何会话写入；携带写入意图时显式拒绝该会话操作，
         // 不能静默丢弃（design §4.1）。
@@ -384,6 +446,9 @@ pub fn switch_account(
     }
     if let Some(p) = persona_report {
         result["personaSync"] = p;
+    }
+    if let Some(m) = mirror_report {
+        result["mirror"] = m;
     }
     Ok(result)
 }
@@ -634,5 +699,71 @@ mod tests {
         // 都没有写入意图：不产生任何报告（保持原有语义）。
         let (copy, sync) = reject_session_writes_without_restart(false, false);
         assert!(copy.is_none() && sync.is_none());
+    }
+
+    // --- 批次②c：镜像接线（restart 拒绝 / 报告不阻断 / 还原持锁） ---------
+
+    #[test]
+    fn mirror_requires_restart() {
+        assert_eq!(
+            reject_mirror_without_restart(false, true).as_deref(),
+            Some(MIRROR_WITHOUT_RESTART_MESSAGE)
+        );
+        assert!(reject_mirror_without_restart(true, true).is_none(), "重启时可执行");
+        assert!(reject_mirror_without_restart(false, false).is_none(), "无镜像不拦");
+        assert!(reject_mirror_without_restart(true, false).is_none());
+    }
+
+    #[test]
+    fn mirror_failure_is_reported_not_blocking() {
+        // 失败：投影为 MirrorReport 且不进 Err（切号继续），错误落 errors。
+        let failed = mirror_report_json(Err("boom".to_string()));
+        assert_eq!(failed["deletedSessions"], 0);
+        assert_eq!(failed["errors"][0]["error"], "boom");
+        // 成功：字段原样透传。
+        let ok = mirror_report_json(Ok(mirror::MirrorReport {
+            deleted_sessions: 3,
+            copied_sessions: 0,
+            backup: Some("/x".to_string()),
+            needs_recovery: false,
+            warnings: Vec::new(),
+            skipped: Vec::new(),
+            errors: Vec::new(),
+        }));
+        assert_eq!(ok["deletedSessions"], 3);
+        assert_eq!(ok["backup"], "/x");
+        assert!(ok["errors"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_mirror_backup_reports_lock_conflict_when_held() {
+        // 写端点必须自己持 try_auth：锁被占用时返回冲突错误，不触碰任何数据。
+        let prev = std::env::var_os(crate::modules::config::HOME_ENV_VAR);
+        let dir = std::env::temp_dir().join(format!(
+            "wb-mirror-restore-lock-{}-{}",
+            std::process::id(),
+            crate::modules::config::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var(crate::modules::config::HOME_ENV_VAR, &dir);
+
+        let guard = crate::modules::auth_transaction::try_auth().unwrap();
+        let backup = dir
+            .join("session-transactions")
+            .join("cn")
+            .join("no-such-uuid");
+        let result = restore_mirror_backup(&backup);
+        drop(guard);
+
+        match prev {
+            Some(value) => std::env::set_var(crate::modules::config::HOME_ENV_VAR, value),
+            None => std::env::remove_var(crate::modules::config::HOME_ENV_VAR),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(result, Err(ref error) if error.starts_with(crate::modules::auth_transaction::BUSY_PREFIX)),
+            "持锁时应返回锁冲突：{result:?}"
+        );
     }
 }
