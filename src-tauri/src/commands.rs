@@ -651,6 +651,7 @@ pub async fn switch_account(
     sync_persona: Option<bool>,
     persona_mode: Option<String>,
     mirror_plan: Option<Value>,
+    deleted_sync_plan: Option<Value>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
@@ -674,6 +675,14 @@ pub async fn switch_account(
         ),
         _ => None,
     };
+    // 删除同步计划：同样逐字对称、解析失败明确报错。
+    let deleted_sync_plan = match deleted_sync_plan {
+        Some(value) if !value.is_null() => Some(
+            serde_json::from_value::<mirror::DeletedSyncPlan>(value)
+                .map_err(|error| format!("deletedSyncPlan 解析失败：{error}"))?,
+        ),
+        _ => None,
+    };
     let progress: switch::ProgressFn = Box::new(move |message| {
         let _ = app.emit("switch-progress", json!({ "message": message }));
     });
@@ -691,6 +700,7 @@ pub async fn switch_account(
             sync_persona,
             persona_mode,
             mirror_plan,
+            deleted_sync_plan,
         )
     })
     .await
@@ -1431,6 +1441,14 @@ pub async fn refresh_account_token(account_id: String) -> Result<Value, String> 
 #[tauri::command]
 pub fn get_github_config() -> Value {
     update::load_github_config()
+}
+
+/// GET /api/sessions/deleted-sync —— 扫描「别处已删、这里还在」的会话（只读）。
+#[tauri::command]
+pub fn deleted_sync_preview() -> Result<Value, String> {
+    let paths = session::SessionPaths::for_variant(WbVariant::Cn);
+    let preview = mirror::deleted_sync_preview_at(&paths)?;
+    serde_json::to_value(preview).map_err(|error| error.to_string())
 }
 
 /// POST /api/update/config —— 保存更新源配置。

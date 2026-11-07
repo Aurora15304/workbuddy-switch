@@ -572,6 +572,26 @@ export interface SwitchResult {
   personaSync?: PersonaSyncReport;
   /** 本次的镜像切换报告（未提交镜像计划时不返回）。 */
   mirror?: MirrorReport;
+  /** 本次的「同步已删除会话」报告（未提交删除同步计划时不返回）。 */
+  deletedSync?: MirrorReport;
+}
+
+/**
+ * 「同步已删除会话」的只读预览：某个账号已删、其他账号仍保留副本的会话。
+ *
+ * 只对已建立关联组的会话生效——没有关联就没有「同一段对话」的可靠证据。
+ */
+export interface DeletedSyncPreview {
+  targets: MirrorTarget[];
+  sessionCount: number;
+  accountCount: number;
+  expectedDigest: string;
+}
+
+/** 冻结的执行计划；服务端会整份重算，篡改无效。 */
+export interface DeletedSyncPlan {
+  targets: MirrorTarget[];
+  expectedDigest: string;
 }
 
 /**

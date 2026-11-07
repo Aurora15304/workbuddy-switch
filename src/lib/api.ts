@@ -7,6 +7,8 @@ import type {
   ArchiveImportResult,
   ArchiveInspect,
   AppNotification,
+  DeletedSyncPlan,
+  DeletedSyncPreview,
   AppStatus,
   AutoRotateConfig,
   CodeBuddyCliInstallResult,
@@ -632,6 +634,11 @@ export function switchAccount(args: {
    * 执行并入 `switch_account` 主干以继承 try_auth() 跨进程锁，绝不另开写端点。
    */
   mirrorPlan?: MirrorPlan;
+  /**
+   * 独立显式删除同步计划：把「别的账号已删、这里还留着」的会话也软删。
+   * 与 `mirrorPlan` 互斥（都写 sessions 表），执行同样并入 `switch_account` 主干。
+   */
+  deletedSyncPlan?: DeletedSyncPlan;
 }): Promise<SwitchResult> {
   return call("switch_account", args as unknown as Record<string, unknown>);
 }
@@ -648,6 +655,11 @@ export function mirrorPreview(args: {
   variant?: WbVariant;
 }): Promise<MirrorPreview> {
   return call("mirror_preview", args as unknown as Record<string, unknown>);
+}
+
+/** 只读扫描「别处已删、这里还在」的会话；不写任何数据。 */
+export function deletedSyncPreview(): Promise<DeletedSyncPreview> {
+  return call("deleted_sync_preview");
 }
 
 /** 一键还原镜像切换备份：成功提示里的一次性入口，绝不建常驻列表。 */

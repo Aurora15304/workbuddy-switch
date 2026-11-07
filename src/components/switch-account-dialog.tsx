@@ -74,6 +74,7 @@ import {
 } from "@/lib/mirror-backup";
 import type {
   AccountMeta,
+  DeletedSyncPreview,
   MirrorPreview,
   Session,
   SessionLinkPreviewGroup,
@@ -183,6 +184,11 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [mirrorRiskOpen, setMirrorRiskOpen] = useState(false);
   /** 成功后的一次性还原入口：明文备份绝对路径。 */
   const [mirrorBackup, setMirrorBackup] = useState<string | null>(null);
+  /** 删除同步：只读扫描结果 + 用户是否已确认（确认后随本次切号执行）。 */
+  const [deletedSync, setDeletedSync] = useState<DeletedSyncPreview | null>(null);
+  const [deletedSyncBusy, setDeletedSyncBusy] = useState(false);
+  const [deletedSyncError, setDeletedSyncError] = useState("");
+  const [deletedSyncConfirmed, setDeletedSyncConfirmed] = useState(false);
 
   /** 镜像启用后必须关闭的通道：附加同步三项与一键全选（语义互斥，防双重写入）。 */
   const mirrorBlocks = assetSyncSuppressedByMirror(mirror);
@@ -432,6 +438,21 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setMirrorConfirmOpen(false);
   }
 
+  /** 扫描「别的账号已删、这里还留着」的会话（只读，不写任何数据）。 */
+  async function scanDeletedSync() {
+    setDeletedSyncBusy(true);
+    setDeletedSyncError("");
+    setDeletedSync(null);
+    setDeletedSyncConfirmed(false);
+    try {
+      setDeletedSync(await api.deletedSyncPreview());
+    } catch (e) {
+      setDeletedSyncError(api.asError(e));
+    } finally {
+      setDeletedSyncBusy(false);
+    }
+  }
+
   /** 还原入口：toast 一次性 action 与 tab 内常驻入口共用同一实现。 */
   function restoreMirrorBackup(backup: string) {
     void api
@@ -488,6 +509,15 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         personaMode: syncPersona ? personaMode : undefined,
         // 独立通道：只有显式母本 + 已知会先备份 + 二次确认 + 预览凭证绑定同一母本才产出。
         ...toMirrorSwitchArgs(mirror, mirrorPreview),
+        // 删除同步：只有用户看过清单并确认过才带上；服务端会整份重算，篡改无效。
+        ...(deletedSyncConfirmed && deletedSync
+          ? {
+              deletedSyncPlan: {
+                targets: deletedSync.targets,
+                expectedDigest: deletedSync.expectedDigest,
+              },
+            }
+          : {}),
       });
       const nickname = displayName(account);
       const parts: string[] = [];
@@ -567,6 +597,31 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         if (mirrorReport.skipped.length > 0) {
           toast.warning("部分镜像切换已跳过", {
             description: mirrorReport.skipped.map((item) => `${item.sessionId}：${item.reason}`).join("；"),
+          });
+        }
+      }
+      // 删除同步：与镜像同形，先记备份路径再按结果分级提示。
+      const deletedReport = res.deletedSync;
+      if (deletedReport) {
+        const backup = deletedReport.backup;
+        if (backup) {
+          rememberMirrorBackup(backup);
+          setMirrorBackup(backup);
+        }
+        const restoreAction = backup
+          ? { label: "还原", onClick: () => restoreMirrorBackup(backup) }
+          : undefined;
+        if (deletedReport.errors.length > 0 || deletedReport.needsRecovery) {
+          toast.warning("同步删除部分未完成，备份已保留", {
+            description: `${backup ? `备份：${backup}；` : ""}可在「关联会话」tab 一键还原。`,
+            action: restoreAction,
+          });
+        } else {
+          toast.success(`已同步删除 ${deletedReport.deletedSessions} 个会话`, {
+            description: backup
+              ? `覆盖前已先备份：${backup}。如需撤销可点「还原」。`
+              : "没有需要删除的会话。",
+            action: restoreAction,
           });
         }
       }
@@ -1400,6 +1455,69 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
                 forceMount
                 className="min-h-0 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
               >
+                <div className="mb-2 space-y-2 rounded-md border border-amber-500/40 px-3 py-2.5">
+                  <div className="text-sm font-medium">同步其他账号已删除的会话</div>
+                  <p className="text-xs text-muted-foreground">
+                    某个账号删掉的会话，其他账号仍留着的副本也一起软删。只对已建立关联的会话生效；
+                    先预览、先备份，执行后可一键还原。启用镜像切换时不可用（两者互斥）。
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={busy || deletedSyncBusy || mirrorBlocks.sessionSelectAll}
+                    onClick={() => void scanDeletedSync()}
+                  >
+                    {deletedSyncBusy ? <Loader2 className="animate-spin" /> : <CircleAlert />}
+                    {deletedSyncBusy ? "正在扫描…" : "扫描并预览"}
+                  </Button>
+                  {deletedSyncError && (
+                    <p className="break-all text-xs text-destructive">{deletedSyncError}</p>
+                  )}
+                  {deletedSync && deletedSync.sessionCount === 0 && (
+                    <p className="text-xs text-muted-foreground">
+                      没有需要同步删除的会话：已关联的会话里不存在「一边删了、一边还留着」的情况。
+                    </p>
+                  )}
+                  {deletedSync && deletedSync.sessionCount > 0 && (
+                    <div className="space-y-2 rounded-md border bg-muted/30 px-2.5 py-2">
+                      <div className="text-xs font-medium">
+                        {`将在 ${deletedSync.accountCount} 个账号上软删 ${deletedSync.sessionCount} 个会话`}
+                      </div>
+                      <ul className="max-h-40 space-y-1 overflow-y-auto text-xs">
+                        {deletedSync.targets.map((target) => (
+                          <li
+                            key={`deleted:${target.userId}:${target.sessionId}`}
+                            className="flex items-start justify-between gap-2"
+                          >
+                            <span className="min-w-0 break-all">
+                              {target.title || target.sessionId}
+                            </span>
+                            <span className="shrink-0 text-muted-foreground">
+                              {memorySources.options.find((o) => o.uid === target.userId)?.label ??
+                                target.userId.slice(0, 8)}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                      <label className="flex cursor-pointer items-start gap-2">
+                        <Checkbox
+                          checked={deletedSyncConfirmed}
+                          disabled={busy}
+                          onCheckedChange={(value) => setDeletedSyncConfirmed(value === true)}
+                          className="mt-0.5"
+                        />
+                        <span className="text-xs">
+                          我确认把这 {deletedSync.sessionCount} 个会话也删掉（执行前自动备份）
+                        </span>
+                      </label>
+                      {deletedSyncConfirmed && (
+                        <p className="text-xs font-medium text-amber-700 dark:text-amber-400">
+                          已确认：将随本次切号一起软删，成功后可在本 tab 一键还原。
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
                 <SessionSyncSection
                   open={open}
                   account={account}

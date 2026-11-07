@@ -1145,6 +1145,21 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
         }
         _ => None,
     };
+    // 删除同步计划：同样与 core 逐字对称，解析失败 400。
+    let deleted_sync_plan = match body.get("deletedSyncPlan") {
+        Some(value) if !value.is_null() => {
+            match serde_json::from_value::<mirror::DeletedSyncPlan>(value.clone()) {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    return json_err(
+                        format!("deletedSyncPlan 解析失败：{error}"),
+                        StatusCode::BAD_REQUEST,
+                    )
+                }
+            }
+        }
+        _ => None,
+    };
 
     let Some(_switch_guard) = SwitchStateGuard::acquire() else {
         return json_err("已有切换任务进行中".to_string(), StatusCode::CONFLICT);
@@ -1170,6 +1185,7 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
             sync_persona,
             persona_mode,
             mirror_plan,
+            deleted_sync_plan,
         )
     })
     .await;

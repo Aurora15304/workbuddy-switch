@@ -85,6 +85,7 @@ fn worker() {
                 false,
                 memory::PersonaMode::Safe,
                 None,
+            None,
             );
             assert!(
                 matches!(result, Err(ref e) if e.starts_with(state_lock::BUSY_PREFIX)),
@@ -132,6 +133,7 @@ fn worker() {
                 false,
                 memory::PersonaMode::Safe,
                 None,
+            None,
             )
             .unwrap();
             assert_eq!(result["ok"], true);
@@ -162,6 +164,7 @@ fn worker() {
                 false,
                 memory::PersonaMode::Safe,
                 None,
+            None,
             )
             .unwrap();
             let exported = auth_file::read_auth_file(WbVariant::Cn).unwrap();
@@ -189,6 +192,7 @@ fn worker() {
                 false,
                 false,
                 memory::PersonaMode::Safe,
+                None,
                 None,
             )
             .is_err());
@@ -258,6 +262,7 @@ fn worker() {
                 false,
                 memory::PersonaMode::Safe,
                 None,
+            None,
             );
             assert!(
                 matches!(result, Err(ref e) if e.starts_with(state_lock::BUSY_PREFIX)),

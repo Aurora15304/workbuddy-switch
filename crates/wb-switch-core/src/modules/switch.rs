@@ -228,14 +228,22 @@ pub fn switch_account(
     sync_persona: bool,
     persona_mode: memory::PersonaMode,
     mirror_plan: Option<mirror::MirrorPlan>,
+    deleted_sync_plan: Option<mirror::DeletedSyncPlan>,
 ) -> Result<Value, String> {
     // 快照与导出必须和令牌刷新处在同一个事务里：在任何备份、进程管理之前取锁，
     // 这样一次失败的切换不会留下副作用。
     let auth_guard = crate::modules::auth_transaction::try_auth().map_err(|e| e.to_string())?;
     // 镜像切换是破坏性 DB 写入，必须在重启（关闭 App）前提下执行；未重启即拒绝，
     // 且在备份/进程/写入之前失败，绝不静默丢弃用户已确认的镜像意图。
-    if let Some(error) = reject_mirror_without_restart(restart, mirror_plan.is_some()) {
+    if let Some(error) = reject_mirror_without_restart(
+        restart,
+        mirror_plan.is_some() || deleted_sync_plan.is_some(),
+    ) {
         return Err(error);
+    }
+    // 两者都写 sessions 表、targets 可能重叠：同时跑会让后者的现场摘要必然失配。
+    if mirror_plan.is_some() && deleted_sync_plan.is_some() {
+        return Err("镜像切换与「同步已删除会话」互斥：一次切号只能选其中一种".to_string());
     }
     // 镜像与「复制 / 同步会话」语义互斥：镜像会把目标账号的会话整份对齐，而逐项同步会
     // 先改目标库，现场摘要随即与预览不符 → 镜像必然失败，用户却只看到「切号成功」。
@@ -271,6 +279,7 @@ pub fn switch_account(
     let mut experts_report: Option<Value> = None;
     let mut persona_report: Option<Value> = None;
     let mut mirror_report: Option<Value> = None;
+    let mut deleted_sync_report: Option<Value> = None;
     if restart {
         progress("正在关闭 WorkBuddy…");
         close_workbuddy(variant, 20)?;
@@ -382,6 +391,15 @@ pub fn switch_account(
                 plan,
             )));
         }
+        if let Some(plan) = deleted_sync_plan.as_ref() {
+            // 删除同步：把「别的账号已删、这里还留着」的会话也软删。
+            // 失败不阻断切号，与镜像同形记进报告（字段名 deletedSync）。
+            progress("正在同步其他账号已删除的会话…");
+            let paths = SessionPaths::for_variant(variant);
+            deleted_sync_report = Some(mirror_report_json(mirror::deleted_sync_apply_at(
+                &paths, variant, plan,
+            )));
+        }
     } else {
         // restart=false 表示本次不做任何会话写入；携带写入意图时显式拒绝该会话操作，
         // 不能静默丢弃（design §4.1）。
@@ -460,6 +478,9 @@ pub fn switch_account(
     }
     if let Some(p) = persona_report {
         result["personaSync"] = p;
+    }
+    if let Some(m) = deleted_sync_report {
+        result["deletedSync"] = m;
     }
     if let Some(m) = mirror_report {
         result["mirror"] = m;

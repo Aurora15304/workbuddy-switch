@@ -10,6 +10,7 @@
 //! - 目标清单只从 `user_id = 目标 uid` 且 `deleted_at IS NULL` 的行生成（含未建组的私有
 //!   会话，逐条不折叠）；身份按 `LinkMember.uid` 精确匹配，绝不按标题全局去重（11-06 误删教训）。
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -1373,6 +1374,257 @@ pub fn scan_mirror_backups(paths: &SessionPaths) -> Vec<MirrorBackupEntry> {
 // 红测（批次①：零 IO 副作用、契约字段、STALE 六条、隔离与判重）
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// 删除同步：某账号删掉的会话，在其他仍保留副本的账号上也软删
+// ---------------------------------------------------------------------------
+
+/// 删除同步的只读预览：列出「别处已删、这里还在」的会话。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedSyncPreview {
+    /// 逐条待软删清单，界面不得折叠。
+    pub targets: Vec<MirrorTarget>,
+    /// 待软删会话数（与 `targets.len()` 一致）。
+    pub session_count: usize,
+    /// 涉及多少个账号。
+    pub account_count: usize,
+    /// 待删集合的规范化摘要；执行前现场重算，不符零写入。
+    pub expected_digest: String,
+}
+
+/// 执行计划（前端回传）。服务端会整份重算，篡改无效。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedSyncPlan {
+    pub targets: Vec<MirrorTarget>,
+    pub expected_digest: String,
+}
+
+/// 读**全部账号**的会话行，**包含已软删的**。
+///
+/// 与 `read_target_rows` 的关键差别：不能过滤 `deleted_at IS NULL`。
+/// 「别的账号删了」这个事实只能从已软删的行（或行已不存在）里读出来。
+fn read_all_rows(conn: &Connection) -> Result<Vec<MirrorRow>, String> {
+    if !table_exists(conn, "sessions") {
+        return Ok(Vec::new());
+    }
+    let custom_expr = if column_exists(conn, "sessions", "custom_title") {
+        "custom_title"
+    } else {
+        "NULL"
+    };
+    let deleted_expr = if column_exists(conn, "sessions", "deleted_at") {
+        "deleted_at"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT id, user_id, title, {custom_expr}, updated_at, {deleted_expr} \
+         FROM sessions ORDER BY id"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| format!("删除同步：会话清单查询失败：{error}"))?;
+    let mapped = stmt
+        .query_map([], |row| {
+            Ok(MirrorRow {
+                session_id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                user_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                title: row.get::<_, Option<String>>(2)?,
+                custom_title: row.get::<_, Option<String>>(3)?,
+                updated_at: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                deleted_at: row.get::<_, Option<i64>>(5)?,
+            })
+        })
+        .map_err(|error| format!("删除同步：会话清单读取失败：{error}"))?;
+    let mut rows = Vec::new();
+    for row in mapped {
+        rows.push(row.map_err(|error| format!("删除同步：会话行读取失败：{error}"))?);
+    }
+    Ok(rows)
+}
+
+/// 计算待软删集合：某个关联组里**既有已删/已不存在的成员，也有仍活跃的成员**时，
+/// 把该组剩下的活跃成员全部纳入。
+///
+/// 只对已建立关联组的会话生效——没有关联就没有「同一段对话」的可靠证据，
+/// 按标题猜会误删。`members < 2` 的组直接跳过（单条无从对比）。
+pub fn deleted_sync_targets(rows: &[MirrorRow], groups: &[LinkGroup]) -> Vec<MirrorTarget> {
+    let mut alive: HashSet<(&str, &str)> = HashSet::new();
+    let mut by_key: HashMap<(&str, &str), &MirrorRow> = HashMap::new();
+    for row in rows {
+        by_key.insert((row.user_id.as_str(), row.session_id.as_str()), row);
+        if row.deleted_at.is_none() {
+            alive.insert((row.user_id.as_str(), row.session_id.as_str()));
+        }
+    }
+
+    let mut targets: Vec<MirrorTarget> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for group in groups {
+        let members: Vec<_> = group
+            .members
+            .iter()
+            .filter(|member| member.state == MemberState::Active)
+            .collect();
+        if members.len() < 2 {
+            continue;
+        }
+        let mut any_alive = false;
+        let mut any_gone = false;
+        for member in &members {
+            if alive.contains(&(member.uid.as_str(), member.session_id.as_str())) {
+                any_alive = true;
+            } else {
+                any_gone = true;
+            }
+        }
+        if !(any_alive && any_gone) {
+            continue;
+        }
+        for member in members {
+            let key = (member.uid.clone(), member.session_id.clone());
+            if !alive.contains(&(key.0.as_str(), key.1.as_str())) {
+                continue;
+            }
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let Some(row) = by_key.get(&(key.0.as_str(), key.1.as_str())) else {
+                continue;
+            };
+            targets.push(MirrorTarget {
+                session_id: row.session_id.clone(),
+                title: display_title(row.title.clone(), row.custom_title.clone()),
+                user_id: row.user_id.clone(),
+                group_id: group.id.clone(),
+                updated_at: row.updated_at,
+                full_digest: session_row_digest(row),
+                kind: "session".to_string(),
+            });
+        }
+    }
+    targets.sort_by(|a, b| a.user_id.cmp(&b.user_id).then(a.session_id.cmp(&b.session_id)));
+    targets
+}
+
+/// 只读扫描：全库 + 关联组，列出「别处已删、这里还在」的会话。
+pub fn deleted_sync_preview_at(paths: &SessionPaths) -> Result<DeletedSyncPreview, String> {
+    let conn = open_db(&paths.workbuddy_db(), true)
+        .ok_or_else(|| "会话库不可读，无法扫描删除同步".to_string())?;
+    let rows = read_all_rows(&conn)?;
+    let groups = load_groups(paths);
+    let targets = deleted_sync_targets(&rows, &groups);
+    let account_count = targets
+        .iter()
+        .map(|target| target.user_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    Ok(DeletedSyncPreview {
+        expected_digest: expected_digest_of(&targets),
+        session_count: targets.len(),
+        account_count,
+        targets,
+    })
+}
+
+/// 执行删除同步：现场重算 → 摘要比对 → 先备份 → 逐账号软删 → 读回校验。
+///
+/// 备份复用镜像的清单格式（`mother_uid` 留空、不复制、不动记忆），
+/// 因此现有的「还原」入口可以直接撤销本次删除。
+pub fn deleted_sync_apply_at(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    plan: &DeletedSyncPlan,
+) -> Result<MirrorReport, String> {
+    let mut conn = open_db(&paths.workbuddy_db(), false)
+        .ok_or_else(|| "会话库不可读，无法执行删除同步".to_string())?;
+    let rows = read_all_rows(&conn)?;
+    let groups = load_groups(paths);
+    let live_targets = deleted_sync_targets(&rows, &groups);
+    if expected_digest_of(&live_targets) != plan.expected_digest {
+        return Err(
+            "待删集合与预览不一致（期间有会话被删或改动），已停止且零写入；请重新扫描".to_string(),
+        );
+    }
+    if live_targets.is_empty() {
+        return Ok(MirrorReport {
+            deleted_sessions: 0,
+            copied_sessions: 0,
+            restored_copies: 0,
+            backup: None,
+            needs_recovery: false,
+            warnings: Vec::new(),
+            skipped: Vec::new(),
+            errors: Vec::new(),
+        });
+    }
+
+    let deleted_at_written = now_ms();
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let backup_plan = MirrorPlan {
+        mother_uid: String::new(),
+        targets: plan.targets.clone(),
+        expected_digest: plan.expected_digest.clone(),
+        preview_token: String::new(),
+    };
+    let backup_dir = write_mirror_manifest(
+        paths,
+        variant,
+        &operation_id,
+        "",
+        "",
+        &backup_plan,
+        &groups,
+        &live_targets,
+        deleted_at_written,
+    )?;
+
+    let mut by_uid: BTreeMap<String, Vec<MirrorTarget>> = BTreeMap::new();
+    for target in &live_targets {
+        by_uid
+            .entry(target.user_id.clone())
+            .or_default()
+            .push(target.clone());
+    }
+
+    let mut deleted = 0usize;
+    let mut skipped = Vec::new();
+    for (uid, items) in &by_uid {
+        let (count, mut skip) = soft_delete_targets(&mut conn, uid, items, deleted_at_written)?;
+        deleted += count;
+        skipped.append(&mut skip);
+    }
+    for (uid, items) in &by_uid {
+        verify_soft_deleted(&conn, uid, items, deleted_at_written).map_err(|detail| {
+            format!(
+                "已落盘但持久化证明缺失：{detail}；备份保留在 {}，请勿反向写回",
+                backup_dir.display()
+            )
+        })?;
+    }
+
+    let mut warnings = Vec::new();
+    if let Err(error) = finalize_mirror_manifest(&backup_dir, &[], None) {
+        warnings.push(format!(
+            "删除同步已完成但清单状态标记失败（{error}）；备份仍在 {}，扫描会显示为 pending",
+            backup_dir.display()
+        ));
+    }
+
+    Ok(MirrorReport {
+        deleted_sessions: deleted,
+        copied_sessions: 0,
+        restored_copies: 0,
+        backup: Some(backup_dir.to_string_lossy().to_string()),
+        needs_recovery: false,
+        warnings,
+        skipped,
+        errors: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2377,5 +2629,90 @@ mod tests {
             manifest.memory_backup.is_some(),
             "记忆备份路径必须登记进同一清单"
         );
+    }
+
+    /// 删除同步只动「混合组」：既有人已删、又有人还活着的关联组。
+    /// 全活、全删、单成员、无组一律不动——任何一条判错都会误删或漏删。
+    #[test]
+    fn deleted_sync_flags_only_mixed_groups() {
+        let row = |uid: &str, sid: &str, deleted: Option<i64>| MirrorRow {
+            session_id: sid.to_string(),
+            user_id: uid.to_string(),
+            title: Some(format!("{sid}-title")),
+            custom_title: None,
+            updated_at: 100,
+            deleted_at: deleted,
+        };
+        let rows = vec![
+            row("u1", "s1", None),      // 混合组：仍活跃 → 应删
+            row("u2", "s2", Some(1)),   // 混合组：已软删
+            row("u1", "s3", None),      // 全活组：都不动
+            row("u2", "s4", None),      // 全活组
+            row("u1", "s5", Some(2)),   // 全删组：都不动
+            row("u2", "s6", Some(3)),   // 全删组
+            row("u1", "s7", None),      // 未建立关联：不动
+            row("u3", "s8", None),      // 混合组但对方行已不存在 → 仍算 gone → 应删
+        ];
+        let groups = vec![
+            group(
+                "g-mixed",
+                vec![
+                    ("u1", "s1", MemberState::Active),
+                    ("u2", "s2", MemberState::Active),
+                ],
+            ),
+            group(
+                "g-alive",
+                vec![
+                    ("u1", "s3", MemberState::Active),
+                    ("u2", "s4", MemberState::Active),
+                ],
+            ),
+            group(
+                "g-dead",
+                vec![
+                    ("u1", "s5", MemberState::Active),
+                    ("u2", "s6", MemberState::Active),
+                ],
+            ),
+            group(
+                "g-missing",
+                vec![
+                    ("u3", "s8", MemberState::Active),
+                    ("u4", "s9", MemberState::Active), // s9 行不存在
+                ],
+            ),
+        ];
+        let targets = deleted_sync_targets(&rows, &groups);
+        let mut ids: Vec<&str> = targets.iter().map(|t| t.session_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["s1", "s8"]);
+        assert!(targets.iter().all(|t| t.kind == "session"));
+        assert!(targets.iter().all(|t| t.user_id == "u1" || t.user_id == "u3"));
+    }
+
+    /// 单成员组与「成员全部 inactive」的组一律跳过：没有对比就没有"别处已删"。
+    #[test]
+    fn deleted_sync_skips_single_and_inactive_groups() {
+        let row = |uid: &str, sid: &str| MirrorRow {
+            session_id: sid.to_string(),
+            user_id: uid.to_string(),
+            title: None,
+            custom_title: None,
+            updated_at: 1,
+            deleted_at: None,
+        };
+        let rows = vec![row("u1", "s1"), row("u1", "s2")];
+        let groups = vec![
+            group("g-single", vec![("u1", "s1", MemberState::Active)]),
+            group(
+                "g-inactive",
+                vec![
+                    ("u1", "s2", MemberState::Active),
+                    ("u2", "s3", MemberState::Stale),
+                ],
+            ),
+        ];
+        assert!(deleted_sync_targets(&rows, &groups).is_empty());
     }
 }
