@@ -10,16 +10,21 @@
 //! - 目标清单只从 `user_id = 目标 uid` 且 `deleted_at IS NULL` 的行生成（含未建组的私有
 //!   会话，逐条不折叠）；身份按 `LinkMember.uid` 精确匹配，绝不按标题全局去重（11-06 误删教训）。
 
-use rusqlite::Connection;
+use std::path::{Path, PathBuf};
+
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::modules::auth_file;
+use crate::modules::config::now_ms;
 use crate::modules::session::{
     current_user_uid_at, open_db, table_exists, SessionPaths, REASON_PREVIEW_STALE,
 };
+use crate::modules::session_backup;
 use crate::modules::session_link::{
-    self, full_digest_of, LinkGroup, MemberState, PreviewBinding, PreviewMemberBinding, SyncVerdict,
+    self, full_digest_of, LinkGroup, MemberState, PreviewBinding, PreviewMemberBinding, PreviewToken,
+    SyncVerdict,
 };
 use crate::modules::variant::WbVariant;
 
@@ -70,6 +75,9 @@ pub struct MirrorPreview {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MirrorPlan {
+    /// 前端已不再下发母本（批次②a）；`#[serde(default)]` 让字段缺省合法，仅兼容旧载荷。
+    /// 执行时**恒以登录态重取母本**（`current_user_uid_at`），本字段被忽略，绝不作作用域来源。
+    #[serde(default)]
     pub mother_uid: String,
     pub targets: Vec<MirrorTarget>,
     pub expected_digest: String,
@@ -565,6 +573,427 @@ pub fn mirror_preview_at(
 }
 
 // ---------------------------------------------------------------------------
+// 执行链路（批次②）：软删 + 精确白名单回滚（本批不接线到 switch.rs）
+// ---------------------------------------------------------------------------
+
+/// 镜像备份清单版本；与操作目录约定一一对应，读到其它版本一律拒绝。
+const MIRROR_BACKUP_VERSION: u32 = 1;
+/// 镜像备份清单文件名（固定放在操作专属目录内）。
+const MIRROR_MANIFEST_FILE: &str = "mirror-manifest.json";
+
+/// 单条待软删会话的备份登记：恢复只按 `(sessionId, userId, deletedAtWritten)` 三元组精确置空。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MirrorBackupRow {
+    session_id: String,
+    user_id: String,
+    group_id: String,
+    group_fingerprint: String,
+    title: String,
+    updated_at_before: i64,
+    /// 只登记未软删行，恒为空；保留字段以便未来扩展。
+    deleted_at_before: Option<i64>,
+    /// 预览时的规范化摘要，供人工核对。
+    full_digest: String,
+    /// 本次写入的 `deleted_at` 值，恢复时严格按其匹配。
+    deleted_at_written: i64,
+}
+
+/// 镜像切换备份清单：先落备份再置位；清单读不回来就不算备份成功。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MirrorBackupManifest {
+    version: u32,
+    operation_id: String,
+    variant: WbVariant,
+    mother_uid: String,
+    target_uid: String,
+    preview_token: String,
+    expected_digest: String,
+    created_at: i64,
+    rows: Vec<MirrorBackupRow>,
+    restore_steps: Vec<String>,
+}
+
+/// 构造「预览时冻结」的绑定：母本、指纹与待删清单都来自预览凭据与计划，绝不信任前端母本。
+fn expected_mirror_binding(
+    token: &PreviewToken,
+    plan: &MirrorPlan,
+    target_uid: &str,
+) -> MirrorBinding {
+    let mother_uid = token.binding.mother_uid.clone().unwrap_or_default();
+    let mut group_ids: Vec<String> = plan
+        .targets
+        .iter()
+        .map(|target| target.group_id.clone())
+        .filter(|id| !id.is_empty())
+        .collect();
+    group_ids.sort();
+    group_ids.dedup();
+    MirrorBinding {
+        mother_uid,
+        target_uid: target_uid.to_string(),
+        mother_active_fingerprint: token.binding.source.normalized_digest.clone(),
+        expected_digest: plan.expected_digest.clone(),
+        targets: plan.targets.clone(),
+        group_ids: group_ids.clone(),
+        found_group_ids: group_ids.clone(),
+        groups_with_mother: group_ids,
+        all_targets_active: true,
+    }
+}
+
+/// 构造「现场重算」的绑定：所有字段都从当前库与关联表重取，供 `verify_mirror_binding` 逐条比对。
+fn live_mirror_binding(
+    mother_uid: &str,
+    target_uid: &str,
+    groups: &[LinkGroup],
+    live_targets: &[MirrorTarget],
+    expected: &MirrorBinding,
+) -> MirrorBinding {
+    let found_group_ids: Vec<String> = expected
+        .group_ids
+        .iter()
+        .filter(|id| groups.iter().any(|group| &group.id == *id))
+        .cloned()
+        .collect();
+    let groups_with_mother: Vec<String> = expected
+        .group_ids
+        .iter()
+        .filter(|id| {
+            groups.iter().any(|group| {
+                &group.id == *id
+                    && group.members.iter().any(|member| {
+                        member.uid == mother_uid && member.state == MemberState::Active
+                    })
+            })
+        })
+        .cloned()
+        .collect();
+    let all_targets_active = expected
+        .targets
+        .iter()
+        .all(|target| live_targets.iter().any(|live| live.session_id == target.session_id));
+    build_mirror_binding(
+        mother_uid,
+        target_uid,
+        groups,
+        live_targets,
+        found_group_ids,
+        groups_with_mother,
+        all_targets_active,
+    )
+}
+
+/// 先落备份清单再置位：在没有备份正文的前提下，复用操作专属目录约定 + 持久化写。
+fn write_mirror_manifest(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    operation_id: &str,
+    mother_uid: &str,
+    target_uid: &str,
+    plan: &MirrorPlan,
+    groups: &[LinkGroup],
+    live_targets: &[MirrorTarget],
+    deleted_at_written: i64,
+) -> Result<PathBuf, String> {
+    let dir = session_backup::transaction_dir(paths, variant, operation_id)?;
+    std::fs::create_dir_all(&dir).map_err(|error| format!("镜像备份目录创建失败：{error}"))?;
+    let rows: Vec<MirrorBackupRow> = live_targets
+        .iter()
+        .map(|target| MirrorBackupRow {
+            session_id: target.session_id.clone(),
+            user_id: target.user_id.clone(),
+            group_id: target.group_id.clone(),
+            group_fingerprint: groups
+                .iter()
+                .find(|group| group.id == target.group_id)
+                .map(session_link::group_fingerprint)
+                .unwrap_or_default(),
+            title: target.title.clone(),
+            updated_at_before: target.updated_at,
+            deleted_at_before: None,
+            full_digest: target.full_digest.clone(),
+            deleted_at_written,
+        })
+        .collect();
+    let manifest = MirrorBackupManifest {
+        version: MIRROR_BACKUP_VERSION,
+        operation_id: operation_id.to_string(),
+        variant,
+        mother_uid: mother_uid.to_string(),
+        target_uid: target_uid.to_string(),
+        preview_token: plan.preview_token.clone(),
+        expected_digest: plan.expected_digest.clone(),
+        created_at: now_ms(),
+        rows,
+        restore_steps: vec![
+            "按清单逐条把 sessions.deleted_at 置空：WHERE id=? AND user_id=? AND deleted_at=<本清单 deletedAtWritten>".to_string(),
+            "只还原本次写入值；严禁按 user_id 批量置空（会误恢复用户此前自删的会话）".to_string(),
+            "本备份不涉及会话正文：镜像只软删，不写 jsonl，恢复亦不碰正文".to_string(),
+        ],
+    };
+    let content = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
+    let file = dir.join(MIRROR_MANIFEST_FILE);
+    session_backup::durable_write_str(&file, &content)
+        .map_err(|error| format!("镜像备份清单保存失败：{error}"))?;
+    let read_back = std::fs::read_to_string(&file)
+        .map_err(|error| format!("镜像备份清单回读失败：{error}"))?;
+    let parsed: MirrorBackupManifest = serde_json::from_str(&read_back)
+        .map_err(|error| format!("镜像备份清单回读解析失败：{error}"))?;
+    if parsed != manifest {
+        return Err("镜像备份清单保存后核验不一致，未按备份成功处理".to_string());
+    }
+    session_backup::sync_tree(&dir).map_err(|error| format!("镜像备份目录持久化失败：{error}"))?;
+    Ok(dir)
+}
+
+/// 短事务软删：条件 UPDATE 幂等且防跨账号（`user_id` + `deleted_at IS NULL` 双重前置）。
+fn soft_delete_targets(
+    conn: &mut Connection,
+    target_uid: &str,
+    targets: &[MirrorTarget],
+    deleted_at: i64,
+) -> Result<(usize, Vec<MirrorSkipped>), String> {
+    session_backup::ensure_full_synchronous(conn)?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("会话数据事务开启失败：{error}"))?;
+    let mut deleted = 0usize;
+    let mut skipped = Vec::new();
+    for target in targets {
+        let affected = tx
+            .execute(
+                "UPDATE sessions SET deleted_at = ?1 \
+                 WHERE id = ?2 AND user_id = ?3 AND deleted_at IS NULL",
+                params![deleted_at, target.session_id, target_uid],
+            )
+            .map_err(|error| format!("软删会话失败（{}）：{error}", target.session_id))?;
+        if affected == 1 {
+            deleted += 1;
+        } else {
+            skipped.push(MirrorSkipped {
+                session_id: target.session_id.clone(),
+                reason: "会话不存在、不属于目标账号或已被软删，已跳过".to_string(),
+            });
+        }
+    }
+    tx.commit()
+        .map_err(|error| format!("会话数据提交失败：{error}"))?;
+    Ok((deleted, skipped))
+}
+
+/// 落盘后读回校验：`deleted_at` 必须等于本次写入值，否则报「持久化证明缺失」（禁止反向写回）。
+fn verify_soft_deleted(
+    conn: &Connection,
+    target_uid: &str,
+    targets: &[MirrorTarget],
+    expected_deleted_at: i64,
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT deleted_at FROM sessions WHERE id = ?1 AND user_id = ?2")
+        .map_err(|error| format!("软删读回校验失败：{error}"))?;
+    for target in targets {
+        let value = stmt
+            .query_row(params![target.session_id, target_uid], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .optional()
+            .map_err(|error| format!("软删读回校验失败（{}）：{error}", target.session_id))?;
+        match value {
+            Some(Some(v)) if v == expected_deleted_at => {}
+            other => {
+                return Err(format!(
+                    "会话 {} 的 deleted_at 读回为 {other:?}，与本次写入值不一致",
+                    target.session_id
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 执行镜像软删：现场双 verify → 摘要重算 → 先备份再置位 → 读回校验。任一不符即零写入。
+pub fn mirror_apply_at(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    target_uid: &str,
+    plan: &MirrorPlan,
+) -> Result<MirrorReport, String> {
+    let target_uid = target_uid.trim();
+    if target_uid.is_empty() {
+        return Err("目标账号缺少 uid，无法执行镜像".to_string());
+    }
+    // 母本恒取登录态，忽略 plan.mother_uid（前端已不下发；后端同源 current_user_uid_at）。
+    let mother_uid = current_user_uid_at(&paths.auth_file)
+        .ok_or_else(|| "未读取到本机登录态，无法执行镜像".to_string())?;
+    if mother_uid == target_uid {
+        return Err("当前账号与目标账号相同，无需镜像".to_string());
+    }
+    // 预览凭据是执行授权的唯一依据：缺失即零写入。
+    let token = session_link::load_preview_token(paths, &plan.preview_token)
+        .ok_or_else(|| "镜像预览凭据已失效，请重新预览".to_string())?;
+
+    let mut conn = open_db(&paths.workbuddy_db(), false)
+        .ok_or_else(|| "会话库不可读，无法执行镜像".to_string())?;
+    if !table_exists(&conn, "sessions") {
+        return Err("会话库缺少 sessions 表，无法执行镜像".to_string());
+    }
+    let rows = read_target_rows(&conn, target_uid)?;
+    let groups = load_groups(paths);
+    let live_targets = mirror_targets_from_rows(&rows, target_uid, &groups);
+    let live_expected_digest = expected_digest_of(&live_targets);
+
+    // 硬门禁 2：expectedDigest 逐条重算，与计划不符 → 零写入。
+    if live_expected_digest != plan.expected_digest {
+        return Err("待删会话集合与预览不一致（内容已变化），已停止镜像；请重新预览".to_string());
+    }
+
+    // 硬门禁 3：造镜像专用 live PreviewBinding（哨兵 group_id + mother_uid=Some(重取登录态)、
+    // 逐字段重算），同跑 verify_preview；绝不复用逐组同步的 live_preview_binding。
+    let live_copied_count = count_mirror_copies(&groups, &mother_uid, target_uid);
+    let live_preview_binding = build_mirror_token_binding(
+        variant,
+        &mother_uid,
+        target_uid,
+        &live_expected_digest,
+        &groups,
+        live_targets.len(),
+        live_copied_count,
+    );
+    let preview_stale = session_link::verify_preview(&token, &live_preview_binding);
+
+    // 硬门禁 5：母本唯一权威 = 登录态重取。expected 取凭据绑定母本、live 取当前登录态，
+    // 两个 verify 的 live 侧都由同一 mother_uid 构造，口径同源不漂移。
+    let expected_binding = expected_mirror_binding(&token, plan, target_uid);
+    let live_binding = live_mirror_binding(&mother_uid, target_uid, &groups, &live_targets, &expected_binding);
+    let mirror_stale = verify_mirror_binding(&expected_binding, &live_binding);
+
+    if !preview_stale.is_empty() || !mirror_stale.is_empty() {
+        let mut details = preview_stale;
+        details.extend(mirror_stale.into_iter().map(|item| item.detail));
+        return Err(format!(
+            "镜像预览已过期，已停止且零写入：{}",
+            details.join("；")
+        ));
+    }
+
+    // 空清单：无需软删，也不建备份目录（避免空还原项）。
+    if live_targets.is_empty() {
+        return Ok(MirrorReport {
+            deleted_sessions: 0,
+            copied_sessions: 0,
+            backup: None,
+            needs_recovery: false,
+            warnings: Vec::new(),
+            skipped: Vec::new(),
+            errors: Vec::new(),
+        });
+    }
+
+    // 先落备份记录再置位。
+    let deleted_at_written = now_ms();
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let backup_dir = write_mirror_manifest(
+        paths,
+        variant,
+        &operation_id,
+        &mother_uid,
+        target_uid,
+        plan,
+        &groups,
+        &live_targets,
+        deleted_at_written,
+    )?;
+
+    let (deleted, skipped) = soft_delete_targets(&mut conn, target_uid, &live_targets, deleted_at_written)?;
+
+    // 落盘后读回校验：不符归「已落盘但持久化证明缺失」，备份保留、禁止反向写回。
+    verify_soft_deleted(&conn, target_uid, &live_targets, deleted_at_written).map_err(|detail| {
+        format!(
+            "已落盘但持久化证明缺失：{detail}；备份保留在 {}，请勿反向写回",
+            backup_dir.display()
+        )
+    })?;
+
+    Ok(MirrorReport {
+        deleted_sessions: deleted,
+        copied_sessions: 0,
+        backup: Some(backup_dir.to_string_lossy().to_string()),
+        needs_recovery: false,
+        warnings: Vec::new(),
+        skipped,
+        errors: Vec::new(),
+    })
+}
+
+fn load_mirror_manifest(backup_path: &Path) -> Result<MirrorBackupManifest, String> {
+    let file = backup_path.join(MIRROR_MANIFEST_FILE);
+    let text = std::fs::read_to_string(&file)
+        .map_err(|error| format!("镜像备份清单不可读：{error}"))?;
+    let manifest: MirrorBackupManifest =
+        serde_json::from_str(&text).map_err(|error| format!("镜像备份清单已损坏：{error}"))?;
+    if manifest.version != MIRROR_BACKUP_VERSION {
+        return Err(format!("镜像备份清单版本不受支持（{}）", manifest.version));
+    }
+    Ok(manifest)
+}
+
+/// 精确白名单回滚：只按清单登记的 `(sessionId, userId, deletedAtWritten)` 三元组置空。
+///
+/// **严禁** `WHERE user_id=?` 批量置空（会误恢复用户此前自己删的会话）；**不碰正文文件**。
+/// 返回的 `deleted_sessions` 表示本次还原行数，`skipped` 为未命中清单。
+pub fn mirror_restore_at(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    backup_path: &Path,
+) -> Result<MirrorReport, String> {
+    let manifest = load_mirror_manifest(backup_path)?;
+    if manifest.variant != variant {
+        return Err("镜像备份所属应用与当前不一致，拒绝还原".to_string());
+    }
+    let mut conn = open_db(&paths.workbuddy_db(), false)
+        .ok_or_else(|| "会话库不可写，无法还原镜像".to_string())?;
+    if !table_exists(&conn, "sessions") {
+        return Err("会话库缺少 sessions 表，无法还原镜像".to_string());
+    }
+    session_backup::ensure_full_synchronous(&conn)?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("会话数据事务开启失败：{error}"))?;
+    let mut restored = 0usize;
+    let mut skipped = Vec::new();
+    for row in &manifest.rows {
+        let affected = tx
+            .execute(
+                "UPDATE sessions SET deleted_at = NULL \
+                 WHERE id = ?1 AND user_id = ?2 AND deleted_at = ?3",
+                params![row.session_id, row.user_id, row.deleted_at_written],
+            )
+            .map_err(|error| format!("还原会话失败（{}）：{error}", row.session_id))?;
+        if affected == 1 {
+            restored += 1;
+        } else {
+            skipped.push(MirrorSkipped {
+                session_id: row.session_id.clone(),
+                reason: "会话不存在、归属不符或 deleted_at 已被改动，未还原".to_string(),
+            });
+        }
+    }
+    tx.commit()
+        .map_err(|error| format!("会话数据提交失败：{error}"))?;
+    Ok(MirrorReport {
+        deleted_sessions: restored,
+        copied_sessions: 0,
+        backup: Some(backup_path.to_string_lossy().to_string()),
+        needs_recovery: false,
+        warnings: Vec::new(),
+        skipped,
+        errors: Vec::new(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // 红测（批次①：零 IO 副作用、契约字段、STALE 六条、隔离与判重）
 // ---------------------------------------------------------------------------
 
@@ -1035,5 +1464,189 @@ mod tests {
         let error = mirror_preview_at(&paths, WbVariant::Cn, &json!({ "uid": "u-same" }))
             .unwrap_err();
         assert!(error.contains("相同"), "{error}");
+    }
+
+    // --- 批次②：软删执行 + 精确白名单回滚 ---------------------------------
+
+    fn seed_auth(paths: &SessionPaths, uid: &str) {
+        std::fs::write(
+            &paths.auth_file,
+            format!(r#"{{"account":{{"uid":"{uid}","label":"母本账号"}}}}"#),
+        )
+        .unwrap();
+    }
+
+    /// 建 `sessions` 表并按 `(id, user_id, updated_at, deleted_at)` 播种；只读列齐备。
+    fn seed_session_db(paths: &SessionPaths, rows: &[(&str, &str, i64, Option<i64>)]) {
+        std::fs::create_dir_all(&paths.data_root).unwrap();
+        let conn = Connection::open(paths.workbuddy_db()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (\
+             id TEXT, user_id TEXT, title TEXT, custom_title TEXT, \
+             updated_at INTEGER, deleted_at INTEGER);",
+        )
+        .unwrap();
+        for (id, uid, updated, deleted) in rows {
+            conn.execute(
+                "INSERT INTO sessions (id, user_id, title, custom_title, updated_at, deleted_at) \
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
+                rusqlite::params![id, uid, format!("标题-{id}"), updated, deleted],
+            )
+            .unwrap();
+        }
+    }
+
+    fn deleted_at_of(paths: &SessionPaths, session_id: &str) -> Option<i64> {
+        let conn = Connection::open(paths.workbuddy_db()).unwrap();
+        conn.query_row(
+            "SELECT deleted_at FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .unwrap()
+    }
+
+    /// 走真实只读预览产出计划与凭据，保证执行侧拿到的是「真凭据」而非手搓。
+    fn preview_plan(paths: &SessionPaths, target_uid: &str) -> MirrorPlan {
+        let preview = mirror_preview_at(paths, WbVariant::Cn, &json!({ "uid": target_uid })).unwrap();
+        MirrorPlan {
+            mother_uid: preview.mother_uid.clone(),
+            targets: preview.targets,
+            expected_digest: preview.expected_digest,
+            preview_token: preview.preview_token,
+        }
+    }
+
+    #[test]
+    fn mirror_apply_soft_deletes_only_target_active_rows() {
+        let dir = TempDir::new("apply-scope");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(
+            &paths,
+            &[
+                ("s-1", "u-target", 1000, None),
+                ("s-2", "u-target", 2000, None),
+                ("s-other", "u-other", 1000, None),
+                ("s-mother", "u-mother", 1000, None),
+                ("s-already", "u-target", 1000, Some(999)),
+            ],
+        );
+        let plan = preview_plan(&paths, "u-target");
+        assert_eq!(plan.targets.len(), 2, "只列 u-target 未软删两行");
+
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        assert_eq!(report.deleted_sessions, 2);
+        assert!(report.backup.is_some(), "软删必须留备份");
+        assert!(deleted_at_of(&paths, "s-1").is_some());
+        assert!(deleted_at_of(&paths, "s-2").is_some());
+        assert_eq!(deleted_at_of(&paths, "s-other"), None, "跨账号零影响");
+        assert_eq!(deleted_at_of(&paths, "s-mother"), None, "母本会话零影响");
+        assert_eq!(deleted_at_of(&paths, "s-already"), Some(999), "已软删行不被改写");
+    }
+
+    #[test]
+    fn mirror_apply_is_idempotent_after_repreview() {
+        let dir = TempDir::new("apply-idem");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        let plan = preview_plan(&paths, "u-target");
+        let first = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        assert_eq!(first.deleted_sessions, 1);
+        let written = deleted_at_of(&paths, "s-1").unwrap();
+
+        // 同一份计划重放必须 fail-closed（集合已变），且不重复写入、不改写已置位行。
+        assert!(
+            mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).is_err(),
+            "同一计划重放应被拒绝而非再次软删"
+        );
+        assert_eq!(deleted_at_of(&paths, "s-1"), Some(written), "重放不动已置位行");
+
+        // 重新预览：目标已空 → 第二次 deleted=0，且不建空备份。
+        let empty_plan = preview_plan(&paths, "u-target");
+        assert!(empty_plan.targets.is_empty());
+        let second = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &empty_plan).unwrap();
+        assert_eq!(second.deleted_sessions, 0);
+        assert!(second.backup.is_none(), "空清单不建备份目录");
+    }
+
+    #[test]
+    fn mirror_apply_rejects_digest_mismatch_with_zero_write() {
+        let dir = TempDir::new("apply-digest");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        let mut plan = preview_plan(&paths, "u-target");
+        plan.expected_digest = "tampered-digest".to_string();
+
+        let error = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap_err();
+        assert!(error.contains("不一致"), "{error}");
+        assert_eq!(deleted_at_of(&paths, "s-1"), None, "摘要不符零写入");
+    }
+
+    #[test]
+    fn mirror_apply_rejects_when_mother_changed_with_zero_write() {
+        let dir = TempDir::new("apply-mother");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        let plan = preview_plan(&paths, "u-target");
+        // 预览后登录态被切到别的母本：现场母本与凭据不符，双 verify 必报 STALE。
+        seed_auth(&paths, "u-attacker");
+
+        let error = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap_err();
+        assert!(error.contains("过期"), "{error}");
+        assert_eq!(deleted_at_of(&paths, "s-1"), None, "母本变化零写入");
+    }
+
+    #[test]
+    fn mirror_restore_only_reverts_this_write_not_prior_deletes() {
+        let dir = TempDir::new("restore-scope");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(
+            &paths,
+            &[
+                ("s-1", "u-target", 1000, None),
+                // 用户此前自己删的会话：deleted_at=999，绝不因本次镜像回滚被误恢复。
+                ("s-prior", "u-target", 1000, Some(999)),
+            ],
+        );
+        let plan = preview_plan(&paths, "u-target");
+        assert_eq!(plan.targets.len(), 1, "只列未软删的 s-1");
+
+        let report = mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+        assert_eq!(report.deleted_sessions, 1);
+        let backup = PathBuf::from(report.backup.clone().unwrap());
+        assert!(deleted_at_of(&paths, "s-1").is_some());
+
+        let restored = mirror_restore_at(&paths, WbVariant::Cn, &backup).unwrap();
+        assert_eq!(restored.deleted_sessions, 1, "只还原本次写入一行");
+        assert_eq!(deleted_at_of(&paths, "s-1"), None, "本次软删被还原");
+        assert_eq!(
+            deleted_at_of(&paths, "s-prior"),
+            Some(999),
+            "禁止批量置空：用户此前自删必须保留"
+        );
+    }
+
+    #[test]
+    fn mirror_apply_does_not_touch_session_body_files() {
+        let dir = TempDir::new("apply-body");
+        let paths = paths_for(&dir);
+        seed_auth(&paths, "u-mother");
+        seed_session_db(&paths, &[("s-1", "u-target", 1000, None)]);
+        let project = paths.projects_dir().join("proj-a");
+        std::fs::create_dir_all(&project).unwrap();
+        let body = project.join("sessions.jsonl");
+        std::fs::write(&body, b"{\"id\":\"s-1\",\"content\":\"keep me\"}\n").unwrap();
+        let before = std::fs::read(&body).unwrap();
+
+        let plan = preview_plan(&paths, "u-target");
+        mirror_apply_at(&paths, WbVariant::Cn, "u-target", &plan).unwrap();
+
+        let after = std::fs::read(&body).unwrap();
+        assert_eq!(before, after, "镜像只软删数据库行，绝不改会话正文");
     }
 }
