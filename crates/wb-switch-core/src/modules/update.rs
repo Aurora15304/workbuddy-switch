@@ -91,6 +91,9 @@ pub fn load_github_config() -> Value {
         repo = GITHUB_REPO.to_string();
         should_normalize = true;
     }
+    // 归一化：空白版本号等于"没有跳过"，与 `set_skipped_version` 的写入口径一致。
+    // 否则手改配置文件写 `"skipped_version": "  "` 会让跳过判断永远不命中。
+    let skipped_version = skipped_version.trim().trim_start_matches('v').to_string();
     let normalized = json!({
         "owner": owner,
         "repo": repo,

@@ -150,6 +150,15 @@ async fn probe_speed(url: &str, proxy: Option<&str>) -> u64 {
     if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
         return 0;
     }
+    // 被墙时镜像常返回一个 200 的 HTML 拦截页：按 0 字节处理，别让它蒙到高分。
+    if response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/html"))
+    {
+        return 0;
+    }
     let mut response = response;
     let mut received: u64 = 0;
     loop {

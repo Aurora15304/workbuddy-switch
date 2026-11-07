@@ -442,7 +442,14 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           forgetMirrorBackup();
           setMirrorBackup(null);
         } else {
-          toast.error("还原失败", { description: r.error ?? "备份可能已不存在" });
+          const message = r.error ?? "备份可能已不存在";
+          toast.error("还原失败", { description: message });
+          // 路径已失效（备份被清理 / 不在允许目录）时清掉这条点不动的入口；
+          // 但「已有任务在跑」这类临时冲突不能清，否则用户稍后想还原就找不到了。
+          if (!message.includes("进行中") && !message.includes("请稍候")) {
+            forgetMirrorBackup();
+            setMirrorBackup(null);
+          }
         }
       })
       .catch((e) => toast.error("还原失败", { description: api.asError(e) }));

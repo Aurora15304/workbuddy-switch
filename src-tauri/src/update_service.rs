@@ -429,15 +429,37 @@ pub async fn restart<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 pub fn spawn_periodic_check(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(FIRST_CHECK_DELAY).await;
+        // 连续失败计数：断网机器不该每 30 分钟重试一次 + 每轮发一条"发现新版本"。
+        let mut consecutive_failures: u32 = 0;
         loop {
             // 注意顺序：`check` 内部持 BusyGuard 并在返回时释放；自动下载必须在它
             // 释放**之后**另起一次获取。BusyGuard 不可重入，在 check 内部调用
             // start_download 会 100% 被 BUSY 拒绝。
             let result = check(&app, None, false).await;
-            maybe_auto_download(&app, &result).await;
-            tokio::time::sleep(CHECK_INTERVAL).await;
+            let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            if ok {
+                consecutive_failures = 0;
+                maybe_auto_download(&app, &result).await;
+            } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                eprintln!("[更新] 第 {consecutive_failures} 次连续失败，进入退避");
+            }
+            tokio::time::sleep(check_delay(consecutive_failures)).await;
         }
     });
+}
+
+/// 下一轮检查的等待时长：正常 30 分钟；连续失败按 30/60/120/240 分钟退避，上限 6 小时。
+///
+/// 没有退避时，一台断网的机器会每 30 分钟做一次注定失败的请求；一旦哪天出错路径
+/// 带上通知，就变成周期性骚扰。成功一次即归零（调用方负责重置计数）。
+fn check_delay(consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return CHECK_INTERVAL;
+    }
+    let doublings = consecutive_failures.min(4) - 1;
+    let minutes = 30u64.saturating_mul(1u64 << doublings).min(6 * 60);
+    Duration::from_secs(minutes * 60)
 }
 
 /// 检查结果说「有新版」且用户没跳过，就自动进后台下载。
@@ -469,8 +491,9 @@ async fn maybe_auto_download<R: Runtime>(app: &AppHandle<R>, result: &Value) {
         eprintln!("[更新] v{latest} 已被用户跳过，不自动下载");
         return;
     }
-    // 阶段必须是 available：检查刚失败或是"已最新"时不该下载。
-    if snapshot().phase != "available" {
+    // 阶段必须是 Available：检查刚失败或是"已最新"时不该下载。
+    // 注意 `UpdatePhase` 是枚举（序列化后才变字符串），必须用变体比较。
+    if snapshot().phase != UpdatePhase::Available {
         return;
     }
     match start_download(app) {
