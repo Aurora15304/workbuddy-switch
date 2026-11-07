@@ -375,11 +375,14 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     }
   }
 
-  /** 镜像启用时清空已勾的附加同步：语义互斥，避免与整份镜像双重写入。 */
+  /** 镜像启用时清空已勾的附加同步与逐项会话选择：语义互斥，避免与整份镜像双重写入。 */
   function disableAssetSync() {
     setMemoryMode("off");
     setSyncPersona(false);
     setMergeExperts(false);
+    setSelected(new Set());
+    setSyncSelections([]);
+    setSyncGroups([]);
   }
 
   /**
@@ -434,6 +437,17 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     if (!account) return;
     // 破坏性操作守卫：覆盖模式没选出母本时不发请求，也不静默降级成合并。
     if (!canSubmitMemory(memoryMode, effectiveSourceUid)) return;
+    // 镜像守卫：用户启用了镜像就必须走完预览与二次确认才允许切号。
+    // 否则请求里不会带 mirrorPlan——切号照常成功，用户却以为镜像已经跑过。
+    if (mirror.enabled && !canSubmitMirror(mirror, mirrorPreview)) {
+      setError("镜像切换还没走完：请先预览受影响清单并完成二次确认，或取消启用镜像切换");
+      return;
+    }
+    // 镜像与复制/同步会话互斥（后端同样会拒绝，这里先拦住，别让用户白等一次切号）。
+    if (mirror.enabled && (selected.size > 0 || syncSelections.length > 0)) {
+      setError("镜像切换与复制/同步会话互斥：一次切号只能选其中一种");
+      return;
+    }
     setBusy(true);
     setProgress("正在切换账号…");
     setError("");
