@@ -99,8 +99,184 @@ fn copy_and_overwrite_at(
     overwrite_at(root, source_uid, accounts, |from, to| std::fs::copy(from, to))
 }
 
+/// 把母本账号的 `MEMORY.md` 整份覆盖到**指定单个目标账号**（整份镜像专用）。
+///
+/// 与 [`copy_and_overwrite`] 的差异：
+/// 1. 只写一个目标，不动母本与其它账号；
+/// 2. **以落盘字节为唯一判据**：写完必须读回，逐字节等于母本才算成功。即使
+///    `atomic_write` 返回 `Err`（rename 已生效却仍报错的既有陷阱），只要读回一致
+///    就按成功处理；反之返回 `Ok` 但读回不一致一律按失败；
+/// 3. 读回不一致时保留备份并报错，**禁止反向写回**（反向写回会让被删内容复活）。
+pub fn copy_and_overwrite_to(source_uid: &str, target_uid: &str) -> Value {
+    copy_and_overwrite_to_at(&wb_data_root(), source_uid, target_uid)
+}
+
+/// 路径注入接缝：镜像执行方显式传 root（测试用临时目录，绝不碰用户真实人格目录）。
+pub(crate) fn copy_and_overwrite_to_at(
+    root: &Path,
+    source_uid: &str,
+    target_uid: &str,
+) -> Value {
+    copy_and_overwrite_to_with(root, source_uid, target_uid, |from, to| std::fs::copy(from, to), atomic_write)
+}
+
+/// 只读判定：母本记忆与目标记忆是否已逐字节一致（镜像执行前的「零写入」判据）。
+///
+/// 母本不可用（缺失/为空）、uid 非法或母本==目标时一律返回 `true`——没有可覆盖的内容，
+/// 本步骤不适用，绝不写入。与 [`copy_and_overwrite_to`] 的拒绝口径同源（同一 `MEMORY_FILE`、
+/// 同一「trim 后非空」判据），不另立标准。
+pub(crate) fn memory_already_identical(root: &Path, source_uid: &str, target_uid: &str) -> bool {
+    let uid = source_uid.trim();
+    let target = target_uid.trim();
+    if uid.is_empty() || target.is_empty() || uid == target {
+        return true;
+    }
+    let Ok(mother) = std::fs::read_to_string(personal_dir_at(root, uid).join(MEMORY_FILE)) else {
+        return true;
+    };
+    if mother.trim().is_empty() {
+        return true;
+    }
+    std::fs::read(personal_dir_at(root, target).join(MEMORY_FILE))
+        .ok()
+        .as_deref()
+        == Some(mother.as_bytes())
+}
+
+/// 备份与写入两个原语都可注入：写后读回判据必须能被「写成功但字节不符」确定性验证。
+fn copy_and_overwrite_to_with(
+    root: &Path,
+    source_uid: &str,
+    target_uid: &str,
+    backup: BackupFn,
+    write: WriteFn,
+) -> Value {
+    let uid = source_uid.trim();
+    let target = target_uid.trim();
+    let finish = |report: Value| with_mode(report, MemorySyncMode::Overwrite, Some(uid));
+    let reject = |error: String| {
+        finish(overwrite_report(
+            1,
+            vec![],
+            0,
+            vec![],
+            vec![],
+            vec![json!({ "label": target, "error": error })],
+        ))
+    };
+
+    if uid.is_empty() {
+        return reject("镜像覆盖必须指定母本账号 uid，已跳过且未写入任何文件".to_string());
+    }
+    if target.is_empty() {
+        return reject("镜像覆盖缺少目标账号 uid，已跳过且未写入任何文件".to_string());
+    }
+    if !crate::modules::vscode_session::is_safe_uid(uid)
+        || !crate::modules::vscode_session::is_safe_uid(target)
+    {
+        return reject(format!(
+            "账号 uid 非法（含路径分隔符或保留名）：{uid:?} / {target:?}"
+        ));
+    }
+    if uid == target {
+        return finish(overwrite_report(
+            1,
+            vec![],
+            0,
+            vec![],
+            vec![json!({ "label": target })],
+            vec![],
+        ));
+    }
+
+    let mother_path = personal_dir_at(root, uid).join(MEMORY_FILE);
+    let mother = match std::fs::read_to_string(&mother_path) {
+        Ok(text) if !text.trim().is_empty() => text,
+        Ok(_) => {
+            return reject(format!(
+                "母本账号 {uid} 的 {MEMORY_FILE} 为空，已跳过且未写入任何文件"
+            ))
+        }
+        Err(error) => {
+            return reject(format!(
+                "读取母本账号 {uid} 的 {MEMORY_FILE} 失败：{error}，已跳过且未写入任何文件"
+            ))
+        }
+    };
+    let mother_bytes = mother.as_bytes();
+    let merged_chars = mother.chars().count();
+    let sources = vec![json!({ "label": uid, "chars": merged_chars })];
+
+    let dir = personal_dir_at(root, target);
+    let path = dir.join(MEMORY_FILE);
+    if std::fs::read(&path).ok().as_deref() == Some(mother_bytes) {
+        return finish(overwrite_report(
+            1,
+            sources,
+            merged_chars,
+            vec![],
+            vec![json!({ "label": target })],
+            vec![],
+        ));
+    }
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        return reject(format!("创建人格目录失败：{error}"));
+    }
+    let had_content = path.is_file();
+    let backup_saved = if had_content {
+        let backup_dest = backup_path(&path);
+        match backup(&path, &backup_dest) {
+            Ok(_) => Some(backup_dest.to_string_lossy().to_string()),
+            Err(error) => {
+                return reject(format!("备份 {MEMORY_FILE} 失败，已跳过：{error}"));
+            }
+        }
+    } else {
+        None
+    };
+
+    // 以落盘字节为唯一判据：返回值只用于错误文案，不能作为提交依据。
+    let write_error = write(&path, &mother).err();
+    let read_back = std::fs::read(&path);
+    match read_back {
+        Ok(bytes) if bytes == mother_bytes => finish(overwrite_report(
+            1,
+            sources,
+            merged_chars,
+            vec![json!({
+                "label": target,
+                "backup": backup_saved,
+                "hadContent": had_content,
+                "readBackOk": true,
+            })],
+            vec![],
+            vec![],
+        )),
+        _ => finish(overwrite_report(
+            1,
+            sources,
+            merged_chars,
+            vec![],
+            vec![],
+            vec![json!({
+                "label": target,
+                "backup": backup_saved,
+                "error": match write_error {
+                    Some(error) => format!("写入 {MEMORY_FILE} 失败：{error}"),
+                    None => format!(
+                        "写入 {MEMORY_FILE} 后读回不一致，已保留备份，禁止反向写回"
+                    ),
+                },
+            })],
+        )),
+    }
+}
+
 /// 备份原语接缝：注入失败即可确定性验证「备份失败就不覆盖」，核心流程无需脆弱 Mock。
-type BackupFn = fn(&Path, &Path) -> std::io::Result<u64>;
+pub(crate) type BackupFn = fn(&Path, &Path) -> std::io::Result<u64>;
+
+/// 写入原语接缝：注入「写成功但内容不符」即可确定性验证写后读回判据。
+type WriteFn = fn(&Path, &str) -> std::io::Result<()>;
 
 /// 覆盖报告骨架：既有字段一个不删，`persona` 恒为空（本模式不碰人格文件）。
 fn overwrite_report(
@@ -212,15 +388,24 @@ fn overwrite_at(
         } else {
             None
         };
-        match atomic_write(&path, &mother) {
-            Ok(()) => written.push(json!({
+        // 以落盘字节为唯一判据：atomic_write 返回 Err 但 rename 已生效时，不能误报失败。
+        let write_error = atomic_write(&path, &mother).err();
+        match std::fs::read(&path) {
+            Ok(bytes) if bytes.as_slice() == mother_bytes => written.push(json!({
                 "label": label,
                 "backup": backup_saved,
                 "hadContent": had_content,
+                "readBackOk": true,
             })),
-            Err(error) => errors.push(json!({
+            _ => errors.push(json!({
                 "label": label,
-                "error": format!("写入 {MEMORY_FILE} 失败：{error}"),
+                "backup": backup_saved,
+                "error": match write_error {
+                    Some(error) => format!("写入 {MEMORY_FILE} 失败：{error}"),
+                    None => format!(
+                        "写入 {MEMORY_FILE} 后读回不一致，已保留备份，禁止反向写回"
+                    ),
+                },
             })),
         }
     }
@@ -553,15 +738,24 @@ fn distribute(
         } else {
             None
         };
-        match atomic_write(&path, merged) {
-            Ok(()) => written.push(json!({
+        // 以落盘字节为唯一判据：Err 但 rename 已生效时不能误报失败。
+        let write_error = atomic_write(&path, merged).err();
+        match std::fs::read(&path) {
+            Ok(bytes) if bytes.as_slice() == merged.as_bytes() => written.push(json!({
                 "label": label,
                 "backup": backup,
                 "hadContent": known.contains(&uid.as_str()),
+                "readBackOk": true,
             })),
-            Err(error) => errors.push(json!({
+            _ => errors.push(json!({
                 "label": label,
-                "error": format!("写入 {MEMORY_FILE} 失败：{error}"),
+                "backup": backup,
+                "error": match write_error {
+                    Some(error) => format!("写入 {MEMORY_FILE} 失败：{error}"),
+                    None => format!(
+                        "写入 {MEMORY_FILE} 后读回不一致，已保留备份，禁止反向写回"
+                    ),
+                },
             })),
         }
     }
@@ -1263,5 +1457,142 @@ mod tests {
         );
         assert_eq!(report["errors"].as_array().unwrap().len(), 1);
         assert_eq!(report["errors"][0]["label"], "无 uid 账号");
+    }
+
+    #[test]
+    fn copy_and_overwrite_to_writes_only_target_and_reads_back() {
+        let dir = TempDir::new("mirror-copy-ok");
+        dir.write("mother", MEMORY_FILE, "## 母本\n\n- 只有这份\n");
+        dir.write("other", MEMORY_FILE, "## 其他\n\n- 不许动\n");
+        dir.write("target", MEMORY_FILE, "## 旧的\n\n- 会被覆盖\n");
+
+        let report = copy_and_overwrite_to_with(
+            dir.path(),
+            "mother",
+            "target",
+            |from, to| std::fs::copy(from, to),
+            atomic_write,
+        );
+
+        assert_eq!(report["written"].as_array().unwrap().len(), 1);
+        assert_eq!(report["written"][0]["readBackOk"], true);
+        assert_eq!(
+            dir.read("target", MEMORY_FILE).as_deref(),
+            Some("## 母本\n\n- 只有这份\n")
+        );
+        assert_eq!(
+            dir.read("mother", MEMORY_FILE).as_deref(),
+            Some("## 母本\n\n- 只有这份\n")
+        );
+        assert_eq!(
+            dir.read("other", MEMORY_FILE).as_deref(),
+            Some("## 其他\n\n- 不许动\n")
+        );
+        assert_eq!(backup_paths(&dir, "target").len(), 1);
+    }
+
+    #[test]
+    fn copy_and_overwrite_to_rejects_blank_mother_with_zero_writes() {
+        let dir = TempDir::new("mirror-copy-blank");
+        dir.write("mother", MEMORY_FILE, "   \n");
+        dir.write("target", MEMORY_FILE, "## 原样\n\n- 不许动\n");
+
+        let report = copy_and_overwrite_to_with(
+            dir.path(),
+            "mother",
+            "target",
+            |from, to| std::fs::copy(from, to),
+            atomic_write,
+        );
+
+        assert_eq!(report["written"].as_array().unwrap().len(), 0);
+        assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            dir.read("target", MEMORY_FILE).as_deref(),
+            Some("## 原样\n\n- 不许动\n")
+        );
+        assert!(backup_paths(&dir, "target").is_empty());
+    }
+
+    #[test]
+    fn copy_and_overwrite_to_skips_identical_content() {
+        let dir = TempDir::new("mirror-copy-same");
+        dir.write("mother", MEMORY_FILE, "## 同\n\n- 一样\n");
+        dir.write("target", MEMORY_FILE, "## 同\n\n- 一样\n");
+
+        let report = copy_and_overwrite_to_with(
+            dir.path(),
+            "mother",
+            "target",
+            |from, to| std::fs::copy(from, to),
+            atomic_write,
+        );
+
+        assert_eq!(report["written"].as_array().unwrap().len(), 0);
+        assert_eq!(report["unchanged"].as_array().unwrap().len(), 1);
+        assert!(backup_paths(&dir, "target").is_empty());
+    }
+
+    #[test]
+    fn copy_and_overwrite_to_backup_failure_blocks_write() {
+        let dir = TempDir::new("mirror-copy-backup-fail");
+        dir.write("mother", MEMORY_FILE, "## 新\n\n- 新内容\n");
+        dir.write("target", MEMORY_FILE, "## 旧\n\n- 旧内容\n");
+
+        let report = copy_and_overwrite_to_with(
+            dir.path(),
+            "mother",
+            "target",
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected backup failure",
+                ))
+            },
+            atomic_write,
+        );
+
+        assert_eq!(report["written"].as_array().unwrap().len(), 0);
+        assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            dir.read("target", MEMORY_FILE).as_deref(),
+            Some("## 旧\n\n- 旧内容\n")
+        );
+    }
+
+    #[test]
+    fn copy_and_overwrite_to_reports_missing_proof_and_keeps_backup() {
+        let dir = TempDir::new("mirror-copy-no-proof");
+        dir.write("mother", MEMORY_FILE, "## 母本\n\n- 完整内容\n");
+        dir.write("target", MEMORY_FILE, "## 旧\n\n- 原文\n");
+
+        // 注入「返回 Ok 但落盘内容不符」：模拟写入被截断后的读回不一致。
+        let report = copy_and_overwrite_to_with(
+            dir.path(),
+            "mother",
+            "target",
+            |from, to| std::fs::copy(from, to),
+            |path, _content| std::fs::write(path, "## 母本\n\n- 完整"),
+        );
+
+        // 读回不一致 → 不算写入成功：绝不凭写入返回值宣布成功。
+        assert_eq!(report["written"].as_array().unwrap().len(), 0);
+        let errors = report["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0]["error"].as_str().unwrap(),
+            format!("写入 {MEMORY_FILE} 后读回不一致，已保留备份，禁止反向写回")
+        );
+        // 备份保留原文；目标现场保持不一致状态，绝不反向写回。
+        let backups = backup_paths(&dir, "target");
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&backups[0]).unwrap(),
+            "## 旧\n\n- 原文\n"
+        );
+        assert_eq!(
+            dir.read("target", MEMORY_FILE).as_deref(),
+            Some("## 母本\n\n- 完整")
+        );
     }
 }

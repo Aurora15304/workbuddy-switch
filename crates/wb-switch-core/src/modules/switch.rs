@@ -367,7 +367,13 @@ pub fn switch_account(
             let target_uid = acc.get("uid").and_then(Value::as_str).unwrap_or_default();
             let paths = SessionPaths::for_variant(variant);
             mirror_report = Some(mirror_report_json(mirror::mirror_apply_at(
-                &paths, variant, target_uid, &acc, plan,
+                &paths,
+                variant,
+                target_uid,
+                &acc,
+                // 人格目录只挂在数据根下（与档位无关），生产恒取真实数据根。
+                &crate::modules::config::wb_data_root(),
+                plan,
             )));
         }
     } else {
