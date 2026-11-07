@@ -58,3 +58,6 @@ npm/platform/*/bin/
 
 # 本地打包用的临时 tauri 配置（置空 beforeBuildCommand）
 tauri.build.tmp.json
+
+# 本地 format-patch 归档（施工单要求本地 commit 后导出，不纳入版本控制）
+.patches/

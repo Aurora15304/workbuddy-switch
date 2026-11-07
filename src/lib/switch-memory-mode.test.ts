@@ -1,15 +1,18 @@
 import { describe, expect, it } from "vitest";
 
-import type { AccountMeta, MemoryMergeReport } from "@/lib/types";
+import type { AccountMeta, DeleteSyncPreview, MemoryMergeReport } from "@/lib/types";
 import {
+  canSubmitDeleteSync,
   canSubmitMemory,
   DEFAULT_MEMORY_MODE,
+  initialDeleteSyncSelection,
   initialMemorySelection,
   memoryAssetLabel,
   memorySummaryWarning,
   memoryToasts,
   resolveMemorySources,
   showsSourcePicker,
+  toDeleteSwitchArgs,
   toMemorySwitchArgs,
   type MemoryMode,
 } from "./switch-memory-mode";
@@ -330,5 +333,83 @@ describe("memoryToasts — 报告 → toast 按请求 mode 分文案", () => {
   it("报告里的 mode 字段不覆盖请求 mode（老宿主/异常回填时仍按用户所选出文案）", () => {
     const r = report({ mode: "overwrite", sources: [{ label: "母本", chars: 1 }] });
     expect(memoryToasts("merge", r)[0].title).toMatch(/已合并/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 删除传导：与工作记忆三选一完全独立的显式通道
+// ---------------------------------------------------------------------------
+
+function deletePreview(motherUid: string): DeleteSyncPreview {
+  return {
+    motherUid,
+    motherLabel: "母本账号",
+    previewToken: "tok-delete-1",
+    expectedDigest: "digest-1",
+    targets: [{ sessionId: "s-1", title: "将被删除的记录", kind: "record", recordCount: 3, fullDigest: "d1" }],
+    sessionCount: 0,
+    recordCount: 3,
+    backupDir: null,
+  };
+}
+
+describe("删除传导 — 母本必须显式选择，defaultUid 禁止代入", () => {
+  it("initialDeleteSyncSelection 恒为「未选母本 + 未确认」，与记忆母本默认值无关", () => {
+    const selection = initialDeleteSyncSelection();
+    expect(selection).toEqual({ motherUid: null, acknowledged: false, confirmed: false });
+    // 重新打开必须拿到同样的干净初值（不共享引用）。
+    selection.motherUid = "u1";
+    expect(initialDeleteSyncSelection().motherUid).toBeNull();
+  });
+
+  it("记忆母本的 defaultUid 存在时，删除传导仍不可提交（绝不隐式代入）", () => {
+    const sources = resolveMemorySources(
+      [account({ id: "id-1", uid: "u1", nickname: "一号" })],
+      ["u1"],
+    );
+    expect(sources.defaultUid).toBe("u1");
+    const preview = deletePreview("u1");
+    expect(canSubmitDeleteSync(initialDeleteSyncSelection(), preview)).toBe(false);
+    expect(toDeleteSwitchArgs(initialDeleteSyncSelection(), preview)).toEqual({});
+  });
+
+  it("只有显式选了母本 + 已知会先备份 + 二次确认 + 预览未过期才可提交", () => {
+    const preview = deletePreview("u2");
+    const base = initialDeleteSyncSelection();
+    expect(canSubmitDeleteSync({ ...base, motherUid: "u2" }, preview)).toBe(false);
+    expect(canSubmitDeleteSync({ ...base, motherUid: "u2", acknowledged: true }, preview)).toBe(false);
+    expect(
+      canSubmitDeleteSync({ ...base, motherUid: "u2", acknowledged: true, confirmed: true }, preview),
+    ).toBe(true);
+  });
+
+  it("预览母本与所选母本 uid 不一致（uid 变化）一律拒绝，绝不复用旧凭证", () => {
+    const selection = { motherUid: "u2", acknowledged: true, confirmed: true };
+    expect(canSubmitDeleteSync(selection, deletePreview("u1"))).toBe(false);
+    expect(toDeleteSwitchArgs(selection, deletePreview("u1"))).toEqual({});
+  });
+
+  it("没有预览 / 空清单 / 无凭证时不提交", () => {
+    const selection = { motherUid: "u2", acknowledged: true, confirmed: true };
+    expect(canSubmitDeleteSync(selection, null)).toBe(false);
+    const empty = { ...deletePreview("u2"), targets: [], previewToken: "" };
+    expect(canSubmitDeleteSync(selection, empty)).toBe(false);
+  });
+
+  it("toDeleteSwitchArgs 只输出冻结的四字段 plan，不夹带 syncSelections / memoryMode", () => {
+    const preview = deletePreview("u2");
+    const args = toDeleteSwitchArgs(
+      { motherUid: "u2", acknowledged: true, confirmed: true },
+      preview,
+    );
+    expect(args.deletePlan).toEqual({
+      motherUid: "u2",
+      targets: preview.targets,
+      expectedDigest: "digest-1",
+      previewToken: "tok-delete-1",
+    });
+    expect(args).not.toHaveProperty("syncSelections");
+    expect(args).not.toHaveProperty("memoryMode");
+    expect(args).not.toHaveProperty("memorySourceUid");
   });
 });

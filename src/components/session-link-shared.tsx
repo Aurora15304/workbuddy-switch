@@ -128,47 +128,47 @@ export function isActionable(group: SessionLinkPreviewGroup): boolean {
 }
 
 /**
- * 全选口径：正文可快进，或仅同步归档（把目标收起来）。
+ * 全选口径：字面全勾——所有可勾选项（isActionable）都进全选。
  *
- * 纯归档项必须进全选——它没有正文模式，逐条勾选在批量归档（一次上百个）时不可用，
- * 导致源账号的归档状态在目标账号里一直对不上。
- *
- * 两个动作排除在外，都必须逐条显式授权：
- * - 覆盖（overwrite）：唯一会改写目标正文的动作；
- * - 取消归档（unarchive）：会把大量历史会话一次性放回目标账号主列表，事后难复原。
+ * 覆盖（overwrite）与取消归档（unarchive）不再排除：用户拍板「一键全选」就是字面上的
+ * 全部勾选。影响面靠提交前的「汇总复核 + 二次确认」兜住，不靠静默漏勾表达。
  */
 export function isDirectlySyncable(group: SessionLinkPreviewGroup): boolean {
-  // 取消归档会让目标账号的主列表一次性涌入大量历史会话（updatedAt 全被顶到最近），
-  // 事后很难逐条恢复归档；按「影响面大的动作逐条授权」处理，与 overwrite 同侧：
-  // 它可勾选，但不进全选。
-  return (
-    isActionable(group) &&
-    primaryMode(group) !== "overwrite" &&
-    !unarchiveOnly(group)
-  );
+  return isActionable(group);
+}
+
+/** 全选汇总：复核弹层用的三个数字，全部由预览组派生，不另存状态。 */
+export function summarizeSelectAll(groups: SessionLinkPreviewGroup[]): {
+  total: number;
+  overwrite: number;
+  unarchive: number;
+} {
+  const selected = groups.filter(isDirectlySyncable);
+  return {
+    total: selected.length,
+    overwrite: selected.filter((group) => primaryMode(group) === "overwrite").length,
+    unarchive: selected.filter(unarchiveOnly).length,
+  };
+}
+
+/** 全选二次确认的复核文案：逐字点明覆盖与取消归档的影响面。 */
+export function selectAllSummaryText(groups: SessionLinkPreviewGroup[]): string {
+  const { total, overwrite, unarchive } = summarizeSelectAll(groups);
+  return `将同步 ${total} 项，其中 ${overwrite} 项会覆盖目标正文、${unarchive} 项会取消归档并把会话放回主列表`;
 }
 
 /**
- * 决定切号弹窗初始化时该关联会话是否默认预先勾选（#165 方案 3）。
+ * 决定切号弹窗初始化时是否预先勾选：默认全关，无条件 false。
  *
- * 规则：
- * 1. 项本身必须可勾选且有凭据（isActionable）；
- * 2. 满足下列其一即可预先勾选：
- *    - 后端显式指定默认勾选（如 fastForward 正文快进）；
- *    - 用户开启了自动同步归档偏好（autoArchive），且该项为纯归档项（具备 archiveAction 且 primaryMode === null）。
- *
- * 绝对边界：Diverge（覆盖模式，primaryMode === "overwrite"）无论是否具备归档资格，绝不自动预选！
- * 取消归档（unarchive）同样绝不预选：源账号刚恢复，不代表目标账号也该跟着解档。
+ * 后端 `defaultChecked` 与 autoArchive 偏好两条自动预选通道均已取消——切号默认不做
+ * 任何会话同步，避免「切号后删掉的内容又被复制回来」。默认全关是无条件决策，不读
+ * 任何 group 状态或偏好；参数仅保留以维持调用签名与契约测试锚点。
  */
 export function shouldDefaultSelect(
-  group: SessionLinkPreviewGroup,
-  autoArchive: boolean,
+  _group: SessionLinkPreviewGroup,
+  _autoArchive: boolean,
 ): boolean {
-  return (
-    isActionable(group) &&
-    (group.defaultChecked ||
-      (autoArchive && archiveOnly(group) && primaryMode(group) === null))
-  );
+  return false;
 }
 
 /**
@@ -288,7 +288,7 @@ export function SessionLinkCard({
           {overwrite && (
             <p className="flex items-start gap-1 text-xs text-amber-700 dark:text-amber-400">
               <CircleAlert className="mt-px size-3.5 shrink-0" />
-              <span>{`目标独有 ${group.extraB} 条记录将被替换，无法通过本工具撤销。`}</span>
+              <span>{`目标独有 ${group.extraB} 条记录将被替换；覆盖前会先备份，成功后可一键还原。`}</span>
             </p>
           )}
         </div>

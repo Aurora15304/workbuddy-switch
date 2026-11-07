@@ -64,13 +64,15 @@ describe("isActionable", () => {
     expect(isActionable(group({ archiveAction: "unarchive" }))).toBe(false);
   });
 
-  it("取消归档可勾选，但不进全选（影响面大的动作逐条授权）", () => {
+  it("字面全勾：取消归档与覆盖都进全选", () => {
     const unarchive = group({ archiveAction: "unarchive", previewToken: "t" });
     expect(isActionable(unarchive)).toBe(true);
-    expect(isDirectlySyncable(unarchive)).toBe(false);
-    // 归档方向仍进全选，否则批量归档退化成逐条点。
+    expect(isDirectlySyncable(unarchive)).toBe(true);
     expect(
       isDirectlySyncable(group({ archiveAction: "statusOnly", previewToken: "t" })),
+    ).toBe(true);
+    expect(
+      isDirectlySyncable(group({ availableModes: ["overwrite"], previewToken: "t" })),
     ).toBe(true);
   });
 
@@ -90,7 +92,7 @@ describe("archiveOnly / unarchiveOnly 互斥", () => {
     expect(unarchiveOnly(archived)).toBe(false);
   });
 
-  it("unarchive 只算取消归档，不算归档（因此不会进自动预选）", () => {
+  it("unarchive 只算取消归档，不算归档", () => {
     const unarchived = group({ archiveAction: "unarchive" });
     expect(archiveOnly(unarchived)).toBe(false);
     expect(unarchiveOnly(unarchived)).toBe(true);
@@ -160,51 +162,74 @@ describe("buildSelections", () => {
     const target = group({ availableModes: [], previewToken: "t" });
     expect(buildSelections([target], new Set(["g-1"]))).toEqual([]);
   });
+
+  it("删除传导是独立通道：全选产出的 selections 不含任何删除计划字段", () => {
+    const groups = [
+      group({ groupId: "ff", availableModes: ["fastForward"], previewToken: "t1" }),
+      group({ groupId: "ow", availableModes: ["overwrite"], previewToken: "t3" }),
+    ];
+    const checked = new Set(groups.filter(isActionable).map((item) => item.groupId));
+    const selections = buildSelections(groups, checked);
+    expect(selections).toHaveLength(2);
+    for (const item of selections) {
+      // 删除传导绝不复用 syncSelections / buildSelections 通道。
+      expect(Object.keys(item).sort()).toEqual(["groupId", "mode", "previewToken"]);
+      expect(item).not.toHaveProperty("deletePlan");
+      expect(item).not.toHaveProperty("targets");
+      expect(item).not.toHaveProperty("motherUid");
+      expect(item).not.toHaveProperty("expectedDigest");
+    }
+  });
 });
 
-describe("模式优先级与全选口径不变", () => {
+describe("模式优先级与全选口径（字面全勾）", () => {
   it("primaryMode 在模式为空时仍返回 null", () => {
     expect(primaryMode(group({ archiveAction: "statusOnly" }))).toBeNull();
     expect(primaryMode(group({ availableModes: ["overwrite"] }))).toBe("overwrite");
   });
 
-  it("全选包含正文快进与仅同步归档，覆盖仍须单独勾选", () => {
+  it("全选字面全勾：正文快进、纯归档、覆盖、取消归档都进全选", () => {
     expect(isDirectlySyncable(group({ availableModes: ["fastForward"], previewToken: "t" }))).toBe(
       true,
     );
-    // 纯归档项没有正文模式，逐条勾选在批量归档时不可用，必须能被全选覆盖。
     expect(
       isDirectlySyncable(group({ availableModes: [], archiveAction: "statusOnly", previewToken: "t" })),
     ).toBe(true);
     expect(isDirectlySyncable(group({ availableModes: ["overwrite"], previewToken: "t" }))).toBe(
-      false,
+      true,
     );
+    expect(
+      isDirectlySyncable(group({ availableModes: [], archiveAction: "unarchive", previewToken: "t" })),
+    ).toBe(true);
   });
 
-  it("全选不会收录没有凭据或没有动作的项", () => {
+  it("字面全勾仍不收录没有凭据或没有动作的项", () => {
     expect(
       isDirectlySyncable(group({ availableModes: [], archiveAction: "statusOnly" })),
     ).toBe(false);
     expect(isDirectlySyncable(group({ availableModes: [] }))).toBe(false);
   });
 
-  it("全选排除取消归档项（会把大量历史会话一次性放回主列表）", () => {
+  it("全选收录取消归档项（会把历史会话放回主列表，提交前必须二次确认）", () => {
     expect(
       isDirectlySyncable(group({ availableModes: [], archiveAction: "unarchive", previewToken: "t" })),
-    ).toBe(false);
+    ).toBe(true);
   });
 
-  it("全选后提交的是正文快进 + 仅归档，覆盖仍被排除", () => {
+  it("全选后逐条提交快进 + 覆盖 + 仅归档 + 取消归档，清单不折叠", () => {
     const groups = [
       group({ groupId: "ff", availableModes: ["fastForward"], previewToken: "t1" }),
       group({ groupId: "arch", archiveAction: "statusOnly", previewToken: "t2" }),
       group({ groupId: "ow", availableModes: ["overwrite"], previewToken: "t3" }),
+      group({ groupId: "unarch", archiveAction: "unarchive", previewToken: "t4" }),
     ];
     const checked = new Set(groups.filter(isDirectlySyncable).map((item) => item.groupId));
-    expect(checked).toEqual(new Set(["ff", "arch"]));
+    expect(checked).toEqual(new Set(["ff", "arch", "ow", "unarch"]));
     expect(buildSelections(groups, checked)).toEqual([
       { groupId: "ff", previewToken: "t1", mode: "fastForward" },
       { groupId: "arch", previewToken: "t2", mode: "statusOnly" },
+      { groupId: "ow", previewToken: "t3", mode: "overwrite" },
+      { groupId: "unarch", previewToken: "t4", mode: "statusOnly" },
     ]);
   });
 });
@@ -268,7 +293,7 @@ describe("summarySentence", () => {
   });
 });
 
-describe("shouldDefaultSelect (#165 方案 3)", () => {
+describe("shouldDefaultSelect — 默认全关", () => {
   it("偏好关闭时：纯归档项默认不勾选", () => {
     const pureArchive = group({
       archiveAction: "statusOnly",
@@ -279,89 +304,88 @@ describe("shouldDefaultSelect (#165 方案 3)", () => {
     expect(shouldDefaultSelect(pureArchive, false)).toBe(false);
   });
 
-  it("偏好关闭时：后端显式 defaultChecked（如快进）仍默认勾选", () => {
+  it("后端显式 defaultChecked=true 也不再默认勾选（默认全关）", () => {
     const ff = group({
       availableModes: ["fastForward"],
       previewToken: "tok-1",
       defaultChecked: true,
     });
-    expect(shouldDefaultSelect(ff, false)).toBe(true);
+    expect(shouldDefaultSelect(ff, false)).toBe(false);
   });
 
-  it("偏好开启时：纯归档项（无正文模式）自动预选", () => {
+  it("偏好开启时：纯归档项也不再自动预选（autoArchive 已取消）", () => {
     const pureArchive = group({
       archiveAction: "statusOnly",
       previewToken: "tok-1",
       availableModes: [],
-      defaultChecked: false,
+      defaultChecked: true,
     });
-    expect(shouldDefaultSelect(pureArchive, true)).toBe(true);
+    expect(shouldDefaultSelect(pureArchive, true)).toBe(false);
   });
 
-  it("偏好开启时：无凭据的纯归档项绝不预选（非 actionable）", () => {
+  it("偏好开启时：无凭据的纯归档项不预选（非 actionable）", () => {
     const unActionable = group({
       archiveAction: "statusOnly",
       previewToken: undefined,
       availableModes: [],
-      defaultChecked: false,
+      defaultChecked: true,
     });
     expect(shouldDefaultSelect(unActionable, true)).toBe(false);
   });
 
-  it("防覆盖铁律：Diverge 冲突项附带 statusOnly 时，绝不因偏好自动预选（必须用户手动勾选）", () => {
+  it("防覆盖铁律：Diverge 冲突项附带 statusOnly 时绝不自动预选", () => {
     const divergeGroup = group({
       verdict: "diverge",
       availableModes: ["overwrite"],
       archiveAction: "statusOnly",
       previewToken: "tok-1",
-      defaultChecked: false,
+      defaultChecked: true,
     });
-    // primaryMode 不为 null（为 overwrite），严禁自动勾选，避免意外触发正文覆盖
     expect(shouldDefaultSelect(divergeGroup, true)).toBe(false);
   });
 
-  it("偏好开启时：取消归档项绝不预选（即使 autoArchive 开启、无正文模式）", () => {
+  it("取消归档项绝不预选", () => {
     const pureUnarchive = group({
       archiveAction: "unarchive",
       previewToken: "tok-1",
       availableModes: [],
-      defaultChecked: false,
+      defaultChecked: true,
     });
     expect(shouldDefaultSelect(pureUnarchive, true)).toBe(false);
     expect(shouldDefaultSelect(pureUnarchive, false)).toBe(false);
   });
 
-  it("偏好开启时：正文快进附带取消归档时沿用自身 defaultChecked", () => {
+  it("正文快进附带取消归档时也不预选", () => {
     const ff = group({
       availableModes: ["fastForward"],
       archiveAction: "unarchive",
       previewToken: "tok-1",
       defaultChecked: true,
     });
-    expect(shouldDefaultSelect(ff, true)).toBe(true);
+    expect(shouldDefaultSelect(ff, true)).toBe(false);
   });
 
-  it("防覆盖铁律：Diverge 冲突项附带 unarchive 时同样绝不自动预选", () => {
+  it("Diverge 冲突项附带 unarchive 时同样不预选", () => {
     const divergeGroup = group({
       verdict: "diverge",
       availableModes: ["overwrite"],
       archiveAction: "unarchive",
       previewToken: "tok-1",
-      defaultChecked: false,
+      defaultChecked: true,
     });
     expect(shouldDefaultSelect(divergeGroup, true)).toBe(false);
   });
 
-  it("偏好开启时：无归档动作的普通未改动项不预选", () => {
+  it("无归档动作的普通未改动项不预选", () => {
     const unchanged = group({
       previewToken: "tok-1",
       availableModes: [],
-      defaultChecked: false,
+      defaultChecked: true,
     });
     expect(shouldDefaultSelect(unchanged, true)).toBe(false);
   });
 
-  it("偏好开启时：正文快进项沿用自身 defaultChecked", () => {
+  it("正文快进项沿用默认全关：defaultChecked 真/假都不预选", () => {
     const ffChecked = group({
       availableModes: ["fastForward"],
       previewToken: "tok-1",
@@ -372,8 +396,7 @@ describe("shouldDefaultSelect (#165 方案 3)", () => {
       previewToken: "tok-1",
       defaultChecked: false,
     });
-    expect(shouldDefaultSelect(ffChecked, true)).toBe(true);
+    expect(shouldDefaultSelect(ffChecked, true)).toBe(false);
     expect(shouldDefaultSelect(ffUnchecked, true)).toBe(false);
   });
 });
-

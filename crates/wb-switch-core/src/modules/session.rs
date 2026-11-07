@@ -2471,7 +2471,8 @@ fn preview_group_item(
         archive.action = None;
     }
     let archive_action = archive.action.clone();
-    // 状态同步作为可选操作，默认不勾选（防误操作），由用户主动勾选授权；正文动作沿用自身默认值。
+    // 默认全关：状态同步与正文动作都不预选，由用户主动勾选 / 一键全选授权。
+    // decision.default_checked 在决策源已恒为 false，这里只是把同一口径写进预览 JSON。
     let default_checked = decision.default_checked;
     // Keep ordinary sync unavailable for Ahead, but bind its verified snapshot so the
     // session-group "use this copy" flow can explicitly request UnifyOverwrite.
@@ -7882,14 +7883,14 @@ mod tests {
         assert_eq!(first["groups"][0]["source"]["sessionId"], "sess-1");
         assert_eq!(first["groups"][0]["target"]["sessionId"], new_id.as_str());
 
-        // 源追加 3 条 → fastForward（extraA=3），给出可执行的 previewToken。
+        // 源追加 3 条 → fastForward（extraA=3），给出可执行的 previewToken，但默认全关不预选。
         append_records(&env.body_path(WbVariant::Cn, "sess-1"), "sess-1", 2, 3);
         let second = preview();
         let item = &second["groups"][0];
         assert_eq!(item["verdict"], "fastForward");
         assert_eq!(item["extraA"], 3);
         assert_eq!(item["extraB"], 0);
-        assert_eq!(item["defaultChecked"], true);
+        assert_eq!(item["defaultChecked"], false, "默认全关：快进不预选");
         assert_eq!(item["recordCount"]["source"], 5);
         assert_eq!(item["recordCount"]["target"], 2);
         assert!(item["previewToken"]
@@ -8216,7 +8217,7 @@ mod tests {
         assert_eq!(group["title"], "标题一");
         assert_eq!(group["cwd"], "/ws/a");
         assert_eq!(group["verdict"], "fastForward");
-        assert_eq!(group["defaultChecked"], true);
+        assert_eq!(group["defaultChecked"], false, "默认全关：快进不预选");
         assert_eq!(group["extraA"], 3);
         assert_eq!(group["extraB"], 0);
         assert_eq!(group["common"], 2);
@@ -8679,11 +8680,11 @@ mod tests {
         )
         .unwrap();
 
-        // 预览：没有可验证基线也照常判快进，并发放可勾选凭据。
+        // 预览：没有可验证基线也照常判快进，并发放可勾选凭据，但默认全关不预选。
         let preview = preview(&env, "uid-b");
         let item = &preview["groups"][0];
         assert_eq!(item["verdict"], "fastForward", "{preview}");
-        assert_eq!(item["defaultChecked"], true, "{preview}");
+        assert_eq!(item["defaultChecked"], false, "默认全关：无基线快进不预选 {preview}");
         assert_eq!(item["availableModes"], json!(["fastForward"]), "{preview}");
         assert!(item["recordCount"]["baseline"].is_null(), "{preview}");
         assert!(

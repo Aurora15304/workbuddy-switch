@@ -384,7 +384,7 @@ mod tests {
         let groups = preview["groups"].as_array().unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0]["verdict"], "fastForward");
-        assert_eq!(groups[0]["defaultChecked"], true);
+        assert_eq!(groups[0]["defaultChecked"], false, "默认全关：快进不预选");
         assert_eq!(groups[0]["availableModes"], json!(["fastForward"]));
         assert_eq!(groups[0]["recordCount"]["source"], 4);
         assert_eq!(groups[0]["recordCount"]["target"], 2);

@@ -2,21 +2,29 @@ import { useEffect, useLayoutEffect, useState } from "react";
 import { Link2, RotateCw } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   buildSelections,
   isActionable,
-  isDirectlySyncable,
   LinksSkeleton,
   LIST_MIN_H,
+  selectAllSummaryText,
   SessionLinkCard,
-  shouldDefaultSelect,
   STATUS_MIN_H,
   type SessionLinksMeta,
 } from "@/components/session-link-shared";
 import * as api from "@/lib/api";
-import { isDefaultArchiveSyncEnabled } from "@/lib/sync-prefs";
 import { displayName } from "@/lib/account-display";
 import { cn } from "@/lib/utils";
 import { accountVariant } from "@/lib/variant";
@@ -45,10 +53,10 @@ interface Props {
 /**
  * 切号弹窗「关联会话」tab 的内容：说明卡 + 会话列表（判定徽标 + 一句摘要 + 折叠详情）。
  *
- * - 默认勾选与可选模式全部来自后端：`defaultChecked` 为 true 才预先勾选；
- *   `availableModes` 为空时只有后端给出的 `archiveAction`（归档 / 取消归档）可勾选，
- *   其中取消归档绝不预选。
- * - `diverge` 默认不勾，需用户显式选择覆盖；覆盖风险常驻行内，不依赖展开或勾选。
+ * - 默认全关：打开时勾选集合恒为空，后端 `defaultChecked` 与 autoArchive 偏好都不再
+ *   自动预选（避免「切号后删掉的内容又被复制回来」）。
+ * - 一键全选是字面全勾：所有 `isActionable` 项（含覆盖与取消归档）都进全选，
+ *   但必须先经「汇总复核 + 二次确认」才提交，影响面逐字写明。
  * - 错误与存储不可用由父组件在 tab 之上常驻提示，本组件只保留对应的空态与重试入口。
  * - 展示件与勾选逻辑与 VS Code 插件侧共用（`session-link-shared.tsx`）。
  */
@@ -58,10 +66,12 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
   const [preview, setPreview] = useState<SessionLinksPreview | null>(null);
   /** 预览逐组进度；`total` 由后端给，没有分母就不画进度条（不猜百分比）。 */
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
-  /** 用户逐项勾选状态；仅在可勾选项上生效。 */
+  /** 用户逐项勾选状态；仅在可勾选项上生效。打开时恒为空（默认全关）。 */
   const [checked, setChecked] = useState<Set<string>>(new Set());
   /** 手动重试计数：用于「重新检查」。 */
   const [reloadToken, setReloadToken] = useState(0);
+  /** 全选的汇总复核弹层：确认前绝不写入勾选结果。 */
+  const [selectAllOpen, setSelectAllOpen] = useState(false);
 
   const accountId = account?.id;
   const variant = accountVariant(account);
@@ -75,21 +85,16 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
     setPreview(null);
     setProgress(null);
     setChecked(new Set());
+    setSelectAllOpen(false);
     onChange({ selections: [], groups: [] });
     api
       .sessionLinksPreview(accountId, variant)
       .then((res) => {
         if (cancelled) return;
         setPreview(res);
-        // 默认勾选：后端 defaultChecked（如快进），加用户开启偏好时的纯归档同步（#165 方案 3）。
-        const autoArchive = isDefaultArchiveSyncEnabled();
-        const defaults = new Set(
-          res.groups
-            .filter((group) => shouldDefaultSelect(group, autoArchive))
-            .map((g) => g.groupId),
-        );
-        setChecked(defaults);
-        onChange({ selections: buildSelections(res.groups, defaults), groups: res.groups });
+        // 默认全关：不再按后端 defaultChecked 或 autoArchive 偏好预选任何项。
+        setChecked(new Set());
+        onChange({ selections: [], groups: res.groups });
       })
       .catch((e) => {
         if (cancelled) return;
@@ -167,18 +172,28 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
     };
   }, [open, preview, error]);
 
-  const syncable = groups.filter(isDirectlySyncable);
-  const selectedCount = groups.filter((group) => isActionable(group) && checked.has(group.groupId)).length;
-  const selectedSyncableCount = syncable.filter((group) => checked.has(group.groupId)).length;
-  const allSyncableSelected = syncable.length > 0 && selectedSyncableCount === syncable.length;
+  // 字面全勾：所有可勾选项都进全选（含覆盖与取消归档）。
+  const actionable = groups.filter(isActionable);
+  const selectedCount = actionable.filter((group) => checked.has(group.groupId)).length;
+  const allSelected = actionable.length > 0 && selectedCount === actionable.length;
 
-  /** 全选/取消全选：涵盖正文快进与纯状态同步（归档 / 取消归档）；覆盖项必须单独勾选。 */
-  function toggleAllSyncable() {
+  /** 汇总复核通过后才真正提交勾选；取消全选不需要复核。 */
+  function commitSelectAll() {
     const updated = new Set(checked);
-    if (allSyncableSelected) syncable.forEach((group) => updated.delete(group.groupId));
-    else syncable.forEach((group) => updated.add(group.groupId));
+    actionable.forEach((group) => updated.add(group.groupId));
     setChecked(updated);
     onChange({ selections: buildSelections(groups, updated), groups });
+  }
+
+  function toggleAll() {
+    if (allSelected) {
+      const updated = new Set(checked);
+      actionable.forEach((group) => updated.delete(group.groupId));
+      setChecked(updated);
+      onChange({ selections: buildSelections(groups, updated), groups });
+      return;
+    }
+    setSelectAllOpen(true);
   }
 
   function toggleGroup(group: SessionLinkPreviewGroup, next: boolean) {
@@ -191,11 +206,34 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
 
   if (unsupported) return null;
 
+  const selectAllSummary = selectAllSummaryText(groups);
+
   const pending = loading || (!preview && !error);
   const storeUnavailable = preview?.storeStatus === "unavailable";
 
   return (
     <section className="space-y-3" aria-label="关联会话">
+      <AlertDialog open={selectAllOpen} onOpenChange={setSelectAllOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认一键全选？</AlertDialogTitle>
+            <AlertDialogDescription>{selectAllSummary}。执行前每项仍会重新校验预览凭据，内容已变化会跳过而不是覆盖。</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={disabled}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={disabled}
+              onClick={() => {
+                commitSelectAll();
+                setSelectAllOpen(false);
+              }}
+            >
+              确认全选
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       <div className="flex items-start gap-3 rounded-md border bg-muted/30 px-3 py-3">
         <span className="flex size-8 shrink-0 items-center justify-center rounded-md border bg-background text-muted-foreground">
           <Link2 className="size-4" />
@@ -287,9 +325,9 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
         <div className="space-y-2">
           <div className="flex items-center gap-2.5 px-1">
             <Checkbox
-              checked={allSyncableSelected ? true : selectedSyncableCount > 0 ? "indeterminate" : false}
-              disabled={disabled || syncable.length === 0}
-              onCheckedChange={() => toggleAllSyncable()}
+              checked={allSelected ? true : selectedCount > 0 ? "indeterminate" : false}
+              disabled={disabled || actionable.length === 0}
+              onCheckedChange={() => toggleAll()}
               aria-label="全选可同步的会话"
             />
             <span className="min-w-0 flex-1 text-sm font-medium">全选可同步的会话</span>
@@ -315,7 +353,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
             ))}
           </div>
           <p className="px-1 text-xs text-muted-foreground">
-            全选包含正文同步与归档状态同步（归档 / 取消归档），覆盖需单独勾选。
+            全选是字面全勾：包含正文快进、覆盖、归档与取消归档；点击后会先弹出汇总复核，确认才生效。
           </p>
         </div>
       )}

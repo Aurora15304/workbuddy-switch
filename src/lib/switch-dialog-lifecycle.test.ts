@@ -7,6 +7,12 @@ import {
   type ProgressFrame,
   type ProgressPollerDeps,
 } from "./switch-dialog-lifecycle";
+import {
+  canSubmitDeleteSync,
+  initialSwitchExtras,
+  type DeleteSyncSelection,
+} from "./switch-memory-mode";
+import type { DeleteSyncPreview } from "./types";
 
 /** 让所有已排队的 microtask（含 .then / .catch 链）跑完。 */
 const flushMicrotasks = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -76,6 +82,61 @@ describe("resolveSwitchProgressMessage — 切号进度帧归一化", () => {
       expect(resolveSwitchProgressMessage(c.frame, c.isCurrent)).toBe(c.expected);
     });
   }
+});
+
+describe("弹窗打开 / 重开 — initialSwitchExtras 单一初值源", () => {
+  it("初值与重开值深度一致：默认全关（记忆 off / 人设关 / 专家团关）", () => {
+    const opened = initialSwitchExtras();
+    const reopened = initialSwitchExtras();
+    expect(reopened).toEqual(opened);
+    expect(reopened.memoryMode).toBe("off");
+    expect(reopened.memorySourceUid).toBeNull();
+    expect(reopened.mergeExperts).toBe(false);
+    expect(reopened.syncPersona).toBe(false);
+    expect(reopened.personaMode).toBe("safe");
+  });
+
+  it("每次重开删除传导母本都回到 null，且状态对象互不共享", () => {
+    const opened = initialSwitchExtras();
+    const reopened = initialSwitchExtras();
+    expect(opened.deleteSync).toEqual({
+      motherUid: null,
+      acknowledged: false,
+      confirmed: false,
+    });
+    expect(reopened.deleteSync).toEqual(opened.deleteSync);
+    expect(reopened.deleteSync).not.toBe(opened.deleteSync);
+  });
+
+  it("上次的破坏性选择不会静默延续到重开：改动不污染下一次初值", () => {
+    const opened = initialSwitchExtras();
+    opened.syncPersona = true;
+    opened.mergeExperts = true;
+    opened.deleteSync.motherUid = "u-prev";
+    opened.deleteSync.confirmed = true;
+    const reopened = initialSwitchExtras();
+    expect(reopened.syncPersona).toBe(false);
+    expect(reopened.mergeExperts).toBe(false);
+    expect(reopened.deleteSync.motherUid).toBeNull();
+    expect(reopened.deleteSync.confirmed).toBe(false);
+  });
+
+  it("重开后的干净删除选择，即便配着旧预览也绝不能提交", () => {
+    const reopened: DeleteSyncSelection = initialSwitchExtras().deleteSync;
+    const stalePreview: DeleteSyncPreview = {
+      motherUid: "u-prev",
+      motherLabel: "上次的母本",
+      previewToken: "tok-stale",
+      expectedDigest: "digest",
+      targets: [
+        { sessionId: "s", title: "会话", kind: "session", recordCount: 1, fullDigest: "d" },
+      ],
+      sessionCount: 1,
+      recordCount: 1,
+      backupDir: null,
+    };
+    expect(canSubmitDeleteSync(reopened, stalePreview)).toBe(false);
+  });
 });
 
 describe("shouldBlockDismiss — busy 期间拦截关闭", () => {

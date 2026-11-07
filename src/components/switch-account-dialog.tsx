@@ -22,6 +22,16 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { DialogAutoHeight } from "@/components/ui/dialog-auto-height";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -36,26 +46,33 @@ import {
 import { accountVariant, variantAppName } from "@/lib/variant";
 import { useAccountsStore } from "@/stores/accounts";
 import {
+  canSubmitDeleteSync,
   canSubmitMemory,
-  DEFAULT_MEMORY_MODE,
-  initialMemorySelection,
+  initialDeleteSyncSelection,
+  initialSwitchExtras,
   memoryAssetLabel,
   memorySummaryWarning,
   memoryToasts,
   resolveMemorySources,
   showsSourcePicker,
+  toDeleteSwitchArgs,
   toMemorySwitchArgs,
+  type DeleteSyncSelection,
   type MemoryMode,
   type MemoryToastLevel,
 } from "@/lib/switch-memory-mode";
 import type {
   AccountMeta,
+  DeleteSyncPreview,
   Session,
   SessionLinkPreviewGroup,
   SessionSyncSelection,
   SidecarOutcome,
   TemporaryFileInfo,
 } from "@/lib/types";
+
+/** 打开 / 重开共用的单一初值源：破坏性项一律不预选。 */
+const INITIAL_EXTRAS = initialSwitchExtras();
 
 interface Props {
   open: boolean;
@@ -135,15 +152,24 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   /** 关联会话区块上报的状态：tab 徽标与常驻提示用。 */
   const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
   /** 工作记忆三选一：不同步（默认）/ 合并 / 用母本复制覆盖。破坏性项永不默认选中。 */
-  const [memoryMode, setMemoryMode] = useState<MemoryMode>(DEFAULT_MEMORY_MODE);
+  const [memoryMode, setMemoryMode] = useState<MemoryMode>(INITIAL_EXTRAS.memoryMode);
   /** 用户手动选过的母本 uid；null = 跟随渲染期算出的默认母本（当前登录账号）。 */
-  const [memorySourceUid, setMemorySourceUid] = useState<string | null>(null);
+  const [memorySourceUid, setMemorySourceUid] = useState<string | null>(INITIAL_EXTRAS.memorySourceUid);
   /** 专家团：把本机各账号已添加的专家团汇总成一份写回每个账号（只增不减）。 */
-  const [mergeExperts, setMergeExperts] = useState(false);
-  /** 人设：把最完整的一份 SOUL / IDENTITY / USER 同步到所有账号（默认开）。 */
-  const [syncPersona, setSyncPersona] = useState(true);
+  const [mergeExperts, setMergeExperts] = useState(INITIAL_EXTRAS.mergeExperts);
+  /** 人设：把最完整的一份 SOUL / IDENTITY / USER 同步到所有账号（默认全关）。 */
+  const [syncPersona, setSyncPersona] = useState(INITIAL_EXTRAS.syncPersona);
   /** 人设覆盖策略：默认只替换仍是客户端默认模板的目标，手改过的保留。 */
-  const [personaMode, setPersonaMode] = useState<"safe" | "overwrite">("safe");
+  const [personaMode, setPersonaMode] = useState<"safe" | "overwrite">(INITIAL_EXTRAS.personaMode);
+  /** 删除传导：显式母本 + 已知会先备份 + 二次确认，独立通道。 */
+  const [deleteSync, setDeleteSync] = useState<DeleteSyncSelection>(initialDeleteSyncSelection);
+  const [deletePreview, setDeletePreview] = useState<DeleteSyncPreview | null>(null);
+  const [deletePreviewBusy, setDeletePreviewBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+  /** 删除传导的二次确认弹层：复述母本名 + 删除数 + 勾选「我已知会先备份」。 */
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  /** 成功后的一次性还原入口：明文备份绝对路径。 */
+  const [deleteBackup, setDeleteBackup] = useState<string | null>(null);
 
   // 账号库与当前登录态：母本下拉的选项与默认值都由此派生，不额外发请求。
   const accounts = useAccountsStore((s) => s.accounts);
@@ -228,15 +254,20 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setSyncSelections([]);
     setSyncGroups([]);
     setLinksMeta(null);
-    // 打开重置：工作记忆回到「不同步」+ 跟随默认母本（initialMemorySelection）。
-    const memorySelection = initialMemorySelection();
-    setMemoryMode(memorySelection.mode);
-    setMemorySourceUid(memorySelection.sourceUid);
-    setMergeExperts(false);
-    // 人设每次打开都回到「同步 + 只补空白」：上次选的「全部换成同一份」不能
-    // 静默延续到下一次切号，否则会连续覆盖所有人设。
-    setSyncPersona(true);
-    setPersonaMode("safe");
+    // 打开重置：与初始 useState 共用同一个纯函数，保证「初值 == 重开值」，
+    // 默认全关（人设关闭）+ 删除传导母本置 null，绝不把上次的破坏性选择静默延续。
+    const extras = initialSwitchExtras();
+    setMemoryMode(extras.memoryMode);
+    setMemorySourceUid(extras.memorySourceUid);
+    setMergeExperts(extras.mergeExperts);
+    setSyncPersona(extras.syncPersona);
+    setPersonaMode(extras.personaMode);
+    setDeleteSync(extras.deleteSync);
+    setDeletePreview(null);
+    setDeletePreviewBusy(false);
+    setDeleteError("");
+    setDeleteConfirmOpen(false);
+    setDeleteBackup(null);
     setTab("links");
     setLoadingSessions(true);
     void api.listSessions(variant)
@@ -283,6 +314,61 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     });
   }
 
+  /** 删除传导母本标签：二次确认弹层据此复述，避免只显示一串 uid。 */
+  const deleteMotherLabel =
+    memorySources.options.find((option) => option.uid === deleteSync.motherUid)?.label ??
+    deletePreview?.motherLabel ??
+    "母本账号";
+
+  /** 显式选择删除传导母本：换母本即作废旧预览与全部确认，凭证绝不跨母本续用。 */
+  function chooseDeleteMother(uid: string) {
+    setDeleteSync({ motherUid: uid, acknowledged: false, confirmed: false });
+    setDeletePreview(null);
+    setDeleteError("");
+    setDeleteConfirmOpen(false);
+  }
+
+  /** 独立只读预览：差集清单绑定 motherUid，执行时由后端复核凭证。 */
+  async function loadDeletePreview() {
+    const motherUid = deleteSync.motherUid;
+    if (!motherUid || !accountId) return;
+    setDeletePreviewBusy(true);
+    setDeleteError("");
+    setDeletePreview(null);
+    setDeleteSync((prev) => ({ ...prev, confirmed: false }));
+    try {
+      const res = await api.deleteSyncPreview({ motherUid, targetAccountId: accountId, variant });
+      // 预览与母本强绑定：换了母本才返回的迟到结果一律丢弃。
+      if (res.motherUid !== motherUid) return;
+      setDeletePreview(res);
+    } catch (e) {
+      setDeleteError(api.asError(e));
+    } finally {
+      setDeletePreviewBusy(false);
+    }
+  }
+
+  /** 二次确认通过：复述母本名 + 删除数后才置 confirmed，doSwitch 据此产出独立 deletePlan。 */
+  function confirmDeleteSync() {
+    setDeleteSync((prev) => ({ ...prev, confirmed: true }));
+    setDeleteConfirmOpen(false);
+  }
+
+  /** 还原入口：toast 一次性 action 与 tab 内常驻入口共用同一实现。 */
+  function restoreDeleteBackup(backup: string) {
+    void api
+      .restoreDeleteSyncBackup({ backup })
+      .then((r) => {
+        if (r.ok) {
+          toast.success("已还原删除传导前的备份");
+          setDeleteBackup(null);
+        } else {
+          toast.error("还原失败", { description: r.error ?? "备份可能已不存在" });
+        }
+      })
+      .catch((e) => toast.error("还原失败", { description: api.asError(e) }));
+  }
+
   async function doSwitch() {
     if (!account) return;
     // 破坏性操作守卫：覆盖模式没选出母本时不发请求，也不静默降级成合并。
@@ -302,6 +388,8 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         mergeExperts: mergeExperts || undefined,
         syncPersona: syncPersona || undefined,
         personaMode: syncPersona ? personaMode : undefined,
+        // 独立通道：只有显式母本 + 已知会先备份 + 二次确认 + 预览凭证绑定同一母本才产出。
+        ...toDeleteSwitchArgs(deleteSync, deletePreview),
       });
       const nickname = displayName(account);
       const parts: string[] = [];
@@ -330,6 +418,38 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
             backedUp ? "，原有清单已备份" : ""
           }`,
         );
+      }
+      // 删除传导：成功提示里一次性「还原」按钮 + 明文备份绝对路径（不建常驻列表）。
+      // 备份成功但落盘失败必须保留为可还原项，绝不按「成功清理」回收。
+      const deleteReport = res.deleteSync;
+      if (deleteReport) {
+        const removed = `已按母本删除 ${deleteReport.deletedSessions} 个会话 / ${deleteReport.deletedRecords} 条记录`;
+        parts.push(removed);
+        if (deleteReport.needsRecovery) {
+          toast.error("删除传导未全部完成，备份已保留", {
+            description: `${deleteReport.backup ? `备份：${deleteReport.backup}；` : ""}已登记为可还原项，下次切号会先恢复，绝不按成功清理回收。`,
+          });
+        } else if (deleteReport.backup) {
+          const backup = deleteReport.backup;
+          setDeleteBackup(backup);
+          toast.success(removed, {
+            description: `覆盖前已先备份，明文路径：${backup}。如需撤销可点「还原」。`,
+            action: { label: "还原", onClick: () => restoreDeleteBackup(backup) },
+          });
+        }
+        for (const warning of deleteReport.warnings) {
+          toast.warning("删除传导已落盘但持久化证明缺失", { description: warning });
+        }
+        if (deleteReport.errors.length > 0) {
+          toast.error("部分删除传导未完成", {
+            description: deleteReport.errors.map((item) => `${item.sessionId}：${item.error}`).join("；"),
+          });
+        }
+        if (deleteReport.skipped.length > 0) {
+          toast.warning("部分删除传导已跳过", {
+            description: deleteReport.skipped.map((item) => `${item.sessionId}：${item.reason}`).join("；"),
+          });
+        }
       }
       // 成功清理：临时备份已回收，不再展示可还原路径；待清理项单独提示，不写进成功文案。
       toast.success(`已切换至「${nickname}」`, {
@@ -782,6 +902,155 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           </div>
         </div>
       </label>
+
+      {/* 删除传导：显式独立通道。默认全关，绝不并入一键全选 / 工作记忆 / 人设 / 归档。 */}
+      <div className="space-y-2 rounded-md border border-destructive/40 px-3 py-2.5">
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-sm font-medium">删除传导</div>
+          <span className="text-[11px] text-muted-foreground">默认关闭 · 独立通道</span>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          以选定母本为准：母本里删掉的会话 / 记录，切号时在目标账号也删除。必须显式选母本、先预览差集、再二次确认；
+          执行前逐条复核并先备份，成功后可一键还原。不影响人设、专家团与归档状态。
+        </p>
+
+        {/* 母本必须显式选择：value 只绑定 deleteSync.motherUid，绝不代入 defaultUid。 */}
+        <div className="space-y-1.5">
+          <label className="text-xs font-medium" htmlFor="delete-mother-uid">母本账号（必须显式选择）</label>
+          <Select
+            value={deleteSync.motherUid ?? ""}
+            onValueChange={chooseDeleteMother}
+            disabled={busy || memorySources.options.length === 0}
+          >
+            <SelectTrigger
+              id="delete-mother-uid"
+              size="sm"
+              className="w-full min-w-0 bg-background text-xs"
+              aria-label="删除传导母本账号"
+            >
+              <SelectValue
+                placeholder={
+                  memorySources.options.length === 0
+                    ? "账号库里没有可用作母本的账号"
+                    : "选择母本账号（不会自动带入默认账号）"
+                }
+              />
+            </SelectTrigger>
+            <SelectContent>
+              {memorySources.options.map((option) => (
+                <SelectItem key={option.uid} value={option.uid} className="text-xs">
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={busy || !deleteSync.motherUid || deletePreviewBusy}
+          onClick={() => void loadDeletePreview()}
+        >
+          {deletePreviewBusy ? <Loader2 className="animate-spin" /> : <CircleAlert />}
+          {deletePreviewBusy ? "正在核对差集…" : "预览将删除的内容"}
+        </Button>
+
+        {deleteError && (
+          <Alert variant="destructive" className="min-w-0">
+            <AlertDescription className="min-w-0 break-all">{deleteError}</AlertDescription>
+          </Alert>
+        )}
+
+        {deletePreview && (
+          <div className="space-y-2 rounded-md border bg-muted/30 px-2.5 py-2">
+            <div className="text-xs font-medium">
+              {`母本「${deleteMotherLabel}」为准，将删除 ${deletePreview.sessionCount} 个会话 / ${deletePreview.recordCount} 条记录`}
+            </div>
+            {/* 逐条差集清单：不折叠，每项写明删除粒度与条数。 */}
+            <ul className="max-h-40 space-y-1 overflow-y-auto text-xs">
+              {deletePreview.targets.map((target) => (
+                <li
+                  key={`${target.kind}:${target.sessionId}`}
+                  className="flex items-start justify-between gap-2"
+                >
+                  <span className="min-w-0 break-all">{target.title || target.sessionId}</span>
+                  <span className="shrink-0 text-muted-foreground tabular-nums">
+                    {target.kind === "session"
+                      ? `整条会话 · ${target.recordCount} 条`
+                      : `删 ${target.recordCount} 条独有记录`}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <label className="flex cursor-pointer items-start gap-2">
+              <Checkbox
+                checked={deleteSync.acknowledged}
+                disabled={busy}
+                onCheckedChange={(value) =>
+                  setDeleteSync((prev) => ({
+                    ...prev,
+                    acknowledged: value === true,
+                    confirmed: false,
+                  }))
+                }
+                className="mt-0.5"
+              />
+              <span className="text-xs">我已知会先备份，覆盖前保留原文，成功后可一键还原</span>
+            </label>
+            <Button
+              variant="destructive"
+              size="sm"
+              disabled={
+                busy ||
+                !canSubmitDeleteSync({ ...deleteSync, confirmed: true }, deletePreview)
+              }
+              onClick={() => setDeleteConfirmOpen(true)}
+            >
+              二次确认删除传导
+            </Button>
+            {deleteSync.confirmed && (
+              <p className="text-xs font-medium text-destructive">
+                {`已确认：本次切号将按母本删除 ${deletePreview.sessionCount} 个会话 / ${deletePreview.recordCount} 条记录。`}
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* 常驻还原入口：明文备份绝对路径，不建列表、不伪装成成功。 */}
+        {deleteBackup && (
+          <div className="space-y-1 rounded-md border border-amber-500/50 px-2.5 py-2">
+            <div className="text-xs font-medium">上次删除传导的备份（可还原）</div>
+            <p className="break-all text-[11px] text-muted-foreground">{deleteBackup}</p>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              onClick={() => restoreDeleteBackup(deleteBackup)}
+            >
+              还原这次删除
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {/* 二次确认弹层：复述母本名 + 删除数，确认才置 confirmed（doSwitch 据此产出 deletePlan）。 */}
+      <AlertDialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认删除传导？</AlertDialogTitle>
+            <AlertDialogDescription>
+              {`母本「${deleteMotherLabel}」为准，将删除 ${deletePreview?.sessionCount ?? 0} 个会话 / ${deletePreview?.recordCount ?? 0} 条记录。执行前每项仍会重新校验预览凭据与现场摘要，内容已变化会跳过而不是删除；覆盖前先备份，成功后可一键还原。`}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
+            <AlertDialogAction disabled={busy} onClick={confirmDeleteSync}>
+              确认删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 

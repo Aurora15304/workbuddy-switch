@@ -513,7 +513,9 @@ impl SyncDecision {
             extra_a: counts.0,
             extra_b: counts.1,
             common: counts.2,
-            default_checked: verdict == SyncVerdict::FastForward,
+            // 默认全关：任何判定都不预选，避免「切号后删掉的内容又被复制回来」。
+            // 一键全选由前端按 isActionable 字面全勾，不依赖这里的默认值。
+            default_checked: false,
             reason,
         }
     }
@@ -2615,7 +2617,7 @@ mod tests {
         }
     }
 
-    /// 快进样例：共同基线 X、B = X、A = X + 3 条有序记录 → 默认勾选，extraB = 0。
+    /// 快进样例：共同基线 X、B = X、A = X + 3 条有序记录 → 默认全关，extraB = 0。
     /// 该场景由「B 是 A 的严格有序前缀」直接命中（不依赖基线，对齐 git fast-forward）。
     #[test]
     fn verdict_fast_forward_when_target_keeps_baseline_and_source_appends() {
@@ -2627,7 +2629,7 @@ mod tests {
             &BaselineState::Ready(baseline_from(&base)),
         );
         assert_eq!(decision.verdict, SyncVerdict::FastForward);
-        assert!(decision.default_checked, "只有快进默认勾选");
+        assert!(!decision.default_checked, "默认全关：快进也不预选");
         assert_eq!(decision.extra_a, 3);
         assert_eq!(decision.extra_b, 0);
         assert_eq!(decision.common, 5);
@@ -2652,7 +2654,7 @@ mod tests {
         ] {
             let decision = decide_sync(&content_from(&source), &content_from(&target), &baseline);
             assert_eq!(decision.verdict, SyncVerdict::FastForward, "{baseline:?}");
-            assert!(decision.default_checked, "只有快进默认勾选");
+            assert!(!decision.default_checked, "默认全关：无基线快进也不预选");
             assert_eq!(
                 decision.verdict.available_modes(),
                 vec![SyncMode::FastForward]
@@ -2677,7 +2679,7 @@ mod tests {
             &BaselineState::Ready(baseline_from(&baseline)),
         );
         assert_eq!(decision.verdict, SyncVerdict::FastForward);
-        assert!(decision.default_checked);
+        assert!(!decision.default_checked, "默认全关：中间链快进也不预选");
         assert_eq!(decision.extra_a, 3, "来源比目标多的 3 条才是本次要追加的");
         assert_eq!(decision.extra_b, 0);
         assert_eq!(decision.common, 6);
@@ -2979,7 +2981,7 @@ mod tests {
             &BaselineState::Ready(baseline_from(&base)),
         );
         assert_eq!(decision.verdict, SyncVerdict::FastForward);
-        assert!(decision.default_checked);
+        assert!(!decision.default_checked, "默认全关：大比例有序追加也不预选");
         assert_eq!(decision.extra_a, 200);
         assert_eq!(decision.extra_b, 0);
         assert_eq!(decision.common, 5, "共同记录只占 2%，仍应判快进");

@@ -302,6 +302,60 @@ export interface SessionSyncSelection {
   mode: SessionSyncMode;
 }
 
+// ---------------------------------------------------------------------------
+// 删除传导（显式独立通道，绝不复用 syncSelections / buildSelections / MemorySyncMode）
+// ---------------------------------------------------------------------------
+
+/** 差集预览里逐条列出的「将被删除」条目；清单不折叠。 */
+export interface DeleteSyncTarget {
+  sessionId: string;
+  title: string;
+  /** `record` = 删该会话里的独有记录；`session` = 整条会话删除。 */
+  kind: "record" | "session";
+  /** 将删除的记录条数。 */
+  recordCount: number;
+  /** 预览时目标正文的原始摘要，落盘前复核现场，不符零写入。 */
+  fullDigest: string;
+}
+
+/** 独立只读预览结果：凭证绑定 motherUid，伪造/失效/uid 变化一律 REASON_PREVIEW_STALE。 */
+export interface DeleteSyncPreview {
+  motherUid: string;
+  motherLabel: string;
+  previewToken: string;
+  /** 预览时算出的现场总摘要，落盘前复核。 */
+  expectedDigest: string;
+  /** 逐条清单，界面不得折叠。 */
+  targets: DeleteSyncTarget[];
+  /** 将删除的会话数 / 记录数（与 targets 逐条一致）。 */
+  sessionCount: number;
+  recordCount: number;
+  /** 执行前预登记的备份目录（预览阶段为 null）。 */
+  backupDir: string | null;
+}
+
+/** 冻结的执行计划：作为 switchAccount 的独立参数并入 switch_account 主干。 */
+export interface DeleteSyncPlan {
+  motherUid: string;
+  targets: DeleteSyncTarget[];
+  expectedDigest: string;
+  previewToken: string;
+}
+
+/** 删除传导执行报告：备份路径明文、中间态可还原、绝不伪装成成功。 */
+export interface DeleteSyncReport {
+  deletedSessions: number;
+  deletedRecords: number;
+  /** 备份绝对路径（明文展示，供一键还原）。 */
+  backup: string | null;
+  /** 备份成功但落盘失败：备份保留并登记为可还原项。 */
+  needsRecovery: boolean;
+  /** 已落盘但持久化证明缺失等警告，绝不据此反向写回。 */
+  warnings: string[];
+  skipped: { sessionId: string; reason: string }[];
+  errors: { sessionId: string; error: string }[];
+}
+
 /** 已同步的关联组（保留目标 sessionId 与标题）。 */
 export interface SessionSyncResultItem {
   groupId: string;
@@ -501,6 +555,8 @@ export interface SwitchResult {
   expertsMerge?: ExpertsMergeReport;
   /** 本次的人设同步报告（未勾选同步时不返回）。 */
   personaSync?: PersonaSyncReport;
+  /** 本次的删除传导报告（未提交显式删除计划时不返回）。 */
+  deleteSync?: DeleteSyncReport;
 }
 
 /**
