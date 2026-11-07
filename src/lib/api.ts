@@ -19,9 +19,9 @@ import type {
   CheckinResult,
   CreditExpiry,
   CreditStatistics,
-  DeleteSyncPlan,
-  DeleteSyncPreview,
-  DeleteSyncReport,
+  MirrorPlan,
+  MirrorPreview,
+  MirrorReport,
   DisplayField,
   TokenStatistics,
   ErrorLogKind,
@@ -75,7 +75,7 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 
 const DEMO_READ_COMMANDS = new Set([
   "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_vscode_ext_status", "get_jetbrains_status", "list_vscode_sessions", "list_codebuddy_ide_sessions", "list_codebuddy_intl_ide_sessions", "vscode_session_links_preview", "codebuddy_ide_session_links_preview", "codebuddy_intl_ide_session_links_preview", "list_account_sessions", "session_links_preview_cross", "list_session_groups", "get_session_group", "preview_session_group_pair", "get_checkin_status",
-  "delete_sync_preview",
+  "mirror_preview",
   "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
   "get_token_statistics",
   "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
@@ -156,8 +156,8 @@ const ROUTES: Record<string, Route> = {
   preview_import_accounts: { method: "POST", path: "/api/import/preview" },
   import_accounts: { method: "POST", path: "/api/import" },
   switch_account: { method: "POST", path: "/api/switch" },
-  delete_sync_preview: { method: "POST", path: "/api/delete-sync/preview" },
-  restore_delete_sync_backup: { method: "POST", path: "/api/delete-sync/restore" },
+  mirror_preview: { method: "POST", path: "/api/mirror/preview" },
+  restore_mirror_backup: { method: "POST", path: "/api/mirror/restore" },
   list_sessions: { method: "GET", path: "/api/sessions" },
   list_account_sessions: { method: "GET", path: "/api/sessions/account" },
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },
@@ -628,31 +628,31 @@ export function switchAccount(args: {
    */
   personaMode?: "safe" | "overwrite";
   /**
-   * 独立显式删除计划：与 syncSelections / memoryMode 完全无关的通道。
+   * 独立显式镜像计划：与 syncSelections / memoryMode 完全无关的通道。
    * 执行并入 `switch_account` 主干以继承 try_auth() 跨进程锁，绝不另开写端点。
    */
-  deletePlan?: DeleteSyncPlan;
+  mirrorPlan?: MirrorPlan;
 }): Promise<SwitchResult> {
   return call("switch_account", args as unknown as Record<string, unknown>);
 }
 
 /**
- * 只读预览「以母本为准」的删除差集：逐条列出将被删除的会话 / 记录，不折叠。
+ * 只读预览整份镜像：以当前登录账号为母本，逐条列出目标账号将被软删的会话，不折叠。
  * 返回的 previewToken 绑定 motherUid，执行时由后端复核（伪造 / 失效 / uid 变化一律拒绝）。
  */
-export function deleteSyncPreview(args: {
+export function mirrorPreview(args: {
   motherUid: string;
   targetAccountId: string;
   variant?: WbVariant;
-}): Promise<DeleteSyncPreview> {
-  return call("delete_sync_preview", args as unknown as Record<string, unknown>);
+}): Promise<MirrorPreview> {
+  return call("mirror_preview", args as unknown as Record<string, unknown>);
 }
 
-/** 一键还原删除传导备份：成功提示里的一次性入口，绝不建常驻列表。 */
-export function restoreDeleteSyncBackup(args: {
+/** 一键还原镜像切换备份：成功提示里的一次性入口，绝不建常驻列表。 */
+export function restoreMirrorBackup(args: {
   backup: string;
-}): Promise<{ ok: boolean; restored: number; report?: DeleteSyncReport; error?: string }> {
-  return call("restore_delete_sync_backup", args as unknown as Record<string, unknown>);
+}): Promise<{ ok: boolean; restored: number; report?: MirrorReport; error?: string }> {
+  return call("restore_mirror_backup", args as unknown as Record<string, unknown>);
 }
 
 /** 切换进度（webui 轮询用；桌面端走事件，此函数无副作用）。 */

@@ -1,8 +1,8 @@
 import { displayName } from "@/lib/account-display";
 import type {
   AccountMeta,
-  DeleteSyncPlan,
-  DeleteSyncPreview,
+  MirrorPlan,
+  MirrorPreview,
   MemoryMergeReport,
 } from "@/lib/types";
 
@@ -229,10 +229,10 @@ export interface SwitchExtras {
   mergeExperts: boolean;
   syncPersona: boolean;
   personaMode: "safe" | "overwrite";
-  deleteSync: DeleteSyncSelection;
+  mirror: MirrorSelection;
 }
 
-/** 默认全关：人设 / 专家团 / 记忆 / 删除传导全部不预选，删除母本必须显式选择。 */
+/** 默认全关：人设 / 专家团 / 记忆 / 镜像切换全部不预选，母本 uid 由登录态确定。 */
 export function initialSwitchExtras(): SwitchExtras {
   const memory = initialMemorySelection();
   return {
@@ -241,17 +241,17 @@ export function initialSwitchExtras(): SwitchExtras {
     mergeExperts: false,
     syncPersona: false,
     personaMode: "safe",
-    deleteSync: initialDeleteSyncSelection(),
+    mirror: initialMirrorSelection(),
   };
 }
 
 // ---------------------------------------------------------------------------
-// 删除传导：显式母本 + 已知会先备份 + 二次确认，独立于工作记忆三选一
+// 镜像切换：母本 = 当前登录账号 + 已知会先备份 + 二次确认，独立于工作记忆三选一
 // ---------------------------------------------------------------------------
 
-/** 删除传导的用户选择状态。`motherUid` 绝不从工作记忆的 `defaultUid` 派生。 */
-export interface DeleteSyncSelection {
-  /** 显式选中的母本 uid；null = 未选择，禁止提交。 */
+/** 镜像切换的用户选择状态。母本 uid 由登录态确定，绝不从 `defaultUid` 派生。 */
+export interface MirrorSelection {
+  /** 母本 uid（当前登录账号）；null = 预览未返回，禁止提交。 */
   motherUid: string | null;
   /** 勾选「我已知会先备份」。 */
   acknowledged: boolean;
@@ -259,18 +259,18 @@ export interface DeleteSyncSelection {
   confirmed: boolean;
 }
 
-/** 每次打开弹窗的干净初值：母本必须显式选，且必须重新确认。 */
-export function initialDeleteSyncSelection(): DeleteSyncSelection {
+/** 每次打开弹窗的干净初值：默认全关，破坏性选择绝不静默延续。 */
+export function initialMirrorSelection(): MirrorSelection {
   return { motherUid: null, acknowledged: false, confirmed: false };
 }
 
 /**
- * 提交门禁：母本显式选择 + 已知会先备份 + 二次确认 + 预览凭证有效且绑定同一母本。
- * `defaultUid` 不在参数里——从源头杜绝「默认母本代入删除传导」。
+ * 提交门禁：母本 uid 已绑定 + 已知会先备份 + 二次确认 + 预览凭证有效且绑定同一母本。
+ * `defaultUid` 不在参数里——从源头杜绝「默认母本代入镜像切换」。
  */
-export function canSubmitDeleteSync(
-  selection: DeleteSyncSelection,
-  preview: DeleteSyncPreview | null,
+export function canSubmitMirror(
+  selection: MirrorSelection,
+  preview: MirrorPreview | null,
 ): boolean {
   if (!selection.motherUid || !selection.acknowledged || !selection.confirmed) return false;
   if (!preview || !preview.previewToken.trim() || preview.targets.length === 0) return false;
@@ -278,14 +278,14 @@ export function canSubmitDeleteSync(
   return true;
 }
 
-/** 边界一次性归一化：只输出冻结的四字段 DeleteSyncPlan，不夹带任何别的通道。 */
-export function toDeleteSwitchArgs(
-  selection: DeleteSyncSelection,
-  preview: DeleteSyncPreview | null,
-): { deletePlan?: DeleteSyncPlan } {
-  if (!canSubmitDeleteSync(selection, preview) || !preview) return {};
+/** 边界一次性归一化：只输出冻结的四字段 MirrorPlan，不夹带任何别的通道。 */
+export function toMirrorSwitchArgs(
+  selection: MirrorSelection,
+  preview: MirrorPreview | null,
+): { mirrorPlan?: MirrorPlan } {
+  if (!canSubmitMirror(selection, preview) || !preview) return {};
   return {
-    deletePlan: {
+    mirrorPlan: {
       motherUid: preview.motherUid,
       targets: preview.targets,
       expectedDigest: preview.expectedDigest,

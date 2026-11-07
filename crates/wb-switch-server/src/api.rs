@@ -25,9 +25,10 @@ use serde_json::{json, Value};
 use wb_switch_core::modules::{
     account, archive, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
-    export_import, jetbrains, limits, memory, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, rotate, session, session_groups, switch, token_stats, travel, update,
-    variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
+    export_import, jetbrains, limits, memory, mirror, notifications, oauth, process,
+    rate_limit_events, rate_limit_hook, refresh, rotate, session, session_groups, switch,
+    token_stats, travel, update, variant::WbVariant, vscode_ext, vscode_session,
+    vscode_session_sync,
 };
 
 /// 归档接口的请求体上限。
@@ -224,6 +225,7 @@ pub fn router() -> Router {
             "/api/session-links/preview",
             post(api_session_links_preview),
         )
+        .route("/api/mirror/preview", post(api_mirror_preview))
         .route(
             "/api/session-links/progress",
             get(api_session_links_progress),
@@ -1336,6 +1338,39 @@ async fn api_session_links_preview(Json(body): Json<Value>) -> Response {
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
         Err(error) => json_err(
             format!("读取关联会话预览失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/mirror/preview —— 只读预览整份镜像清单（Wave 2 批次①）。
+///
+/// 以「当前登录账号」为母本，逐条列出目标账号将被软删的会话；零会话/记忆数据写入。
+/// 母本 uid 一律由登录态文件判定，**绝不接受前端传入的 motherUid**（该字段仅用于界面回显）。
+/// 与桌面端 `mirror_preview` 参数逐字对称：只读 `targetAccountId` + 可选 `variant`。
+async fn api_mirror_preview(Json(body): Json<Value>) -> Response {
+    let target_account_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if target_account_id.trim().is_empty() {
+        return json_err("缺少 targetAccountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let Some(target) = account::find_account(&target_account_id) else {
+        return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let variant = match body.get("variant").and_then(Value::as_str) {
+        Some(raw) => WbVariant::parse(Some(raw)),
+        None => account::variant_of(&target),
+    };
+    let result =
+        tokio::task::spawn_blocking(move || mirror::mirror_preview(variant, &target)).await;
+    match result {
+        Ok(Ok(report)) => json_ok(report),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("读取镜像预览失败: {error}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }

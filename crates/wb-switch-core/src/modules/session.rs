@@ -2102,6 +2102,7 @@ fn live_preview_binding(
         source_status: archive.source_status.clone(),
         target_status: archive.target_status.clone(),
         archive_action: archive.action.clone(),
+        mother_uid: None,
     }
 }
 

@@ -303,49 +303,59 @@ export interface SessionSyncSelection {
 }
 
 // ---------------------------------------------------------------------------
-// 删除传导（显式独立通道，绝不复用 syncSelections / buildSelections / MemorySyncMode）
+// 镜像切换（显式独立通道，绝不复用 syncSelections / buildSelections / MemorySyncMode）
 // ---------------------------------------------------------------------------
 
-/** 差集预览里逐条列出的「将被删除」条目；清单不折叠。 */
-export interface DeleteSyncTarget {
+/**
+ * 镜像预览里逐条列出的「目标账号将被软删」会话；清单不折叠。
+ * 身份以 `LinkMember.uid` 精确匹配，绝不按标题全局去重（11-06 误删教训）。
+ */
+export interface MirrorTarget {
   sessionId: string;
   title: string;
-  /** `record` = 删该会话里的独有记录；`session` = 整条会话删除。 */
-  kind: "record" | "session";
-  /** 将删除的记录条数。 */
-  recordCount: number;
-  /** 预览时目标正文的原始摘要，落盘前复核现场，不符零写入。 */
+  /** 目标会话归属的 user_id；清单只从目标 uid 的行生成。 */
+  userId: string;
+  /** 所属关联组 id；未建立 LinkGroup 的私有会话为空串。 */
+  groupId: string;
+  /** 预览时目标会话行的 updated_at，落盘前现场复核。 */
+  updatedAt: number;
+  /** 预览时目标会话的规范化摘要，落盘前逐条重算，不符零写入。 */
   fullDigest: string;
+  /** 会话级软删；沿用旧 kind:"session" 语义，镜像不引入记录级删除。 */
+  kind: "session";
 }
 
-/** 独立只读预览结果：凭证绑定 motherUid，伪造/失效/uid 变化一律 REASON_PREVIEW_STALE。 */
-export interface DeleteSyncPreview {
+/** 独立只读预览结果：凭证绑定 motherUid（当前登录账号），变化一律 REASON_PREVIEW_STALE。 */
+export interface MirrorPreview {
   motherUid: string;
   motherLabel: string;
   previewToken: string;
-  /** 预览时算出的现场总摘要，落盘前复核。 */
+  /** 待删会话集合规范化摘要（sessionId 有序 + 各自 fullDigest + updatedAt + deletedAt 均为 NULL）。 */
   expectedDigest: string;
-  /** 逐条清单，界面不得折叠。 */
-  targets: DeleteSyncTarget[];
-  /** 将删除的会话数 / 记录数（与 targets 逐条一致）。 */
+  /** 逐条待软删清单，界面不得折叠。 */
+  targets: MirrorTarget[];
+  /** 将软删的会话数（与 targets.length 逐条一致）。 */
   sessionCount: number;
-  recordCount: number;
+  /** 将从母本复制的会话数（母本有、目标没有，按 LinkGroup 判重）。 */
+  copiedCount: number;
   /** 执行前预登记的备份目录（预览阶段为 null）。 */
   backupDir: string | null;
 }
 
-/** 冻结的执行计划：作为 switchAccount 的独立参数并入 switch_account 主干。 */
-export interface DeleteSyncPlan {
+/** 冻结的执行计划：作为 switchAccount 的独立参数并入 switch_account 主干，继承 try_auth() 锁。 */
+export interface MirrorPlan {
   motherUid: string;
-  targets: DeleteSyncTarget[];
+  targets: MirrorTarget[];
   expectedDigest: string;
   previewToken: string;
 }
 
-/** 删除传导执行报告：备份路径明文、中间态可还原、绝不伪装成成功。 */
-export interface DeleteSyncReport {
+/** 镜像切换执行报告：备份路径明文、中间态可还原、绝不伪装成成功。 */
+export interface MirrorReport {
+  /** 本次软删的会话数。 */
   deletedSessions: number;
-  deletedRecords: number;
+  /** 本次从母本复制的会话数。 */
+  copiedSessions: number;
   /** 备份绝对路径（明文展示，供一键还原）。 */
   backup: string | null;
   /** 备份成功但落盘失败：备份保留并登记为可还原项。 */
@@ -555,8 +565,8 @@ export interface SwitchResult {
   expertsMerge?: ExpertsMergeReport;
   /** 本次的人设同步报告（未勾选同步时不返回）。 */
   personaSync?: PersonaSyncReport;
-  /** 本次的删除传导报告（未提交显式删除计划时不返回）。 */
-  deleteSync?: DeleteSyncReport;
+  /** 本次的镜像切换报告（未提交镜像计划时不返回）。 */
+  mirror?: MirrorReport;
 }
 
 /**

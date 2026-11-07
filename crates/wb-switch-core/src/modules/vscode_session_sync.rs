@@ -661,6 +661,7 @@ fn live_preview_binding(
         source_status: None,
         target_status: None,
         archive_action: None,
+        mother_uid: None,
     }
 }
 

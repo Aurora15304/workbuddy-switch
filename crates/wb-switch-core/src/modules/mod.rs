@@ -24,6 +24,7 @@ pub mod limits;
 #[cfg(target_os = "linux")]
 pub mod linux_keyring;
 pub mod memory;
+pub mod mirror;
 pub mod notifications;
 pub mod oauth;
 pub mod official_usage;

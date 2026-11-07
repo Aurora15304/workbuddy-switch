@@ -46,24 +46,24 @@ import {
 import { accountVariant, variantAppName } from "@/lib/variant";
 import { useAccountsStore } from "@/stores/accounts";
 import {
-  canSubmitDeleteSync,
+  canSubmitMirror,
   canSubmitMemory,
-  initialDeleteSyncSelection,
+  initialMirrorSelection,
   initialSwitchExtras,
   memoryAssetLabel,
   memorySummaryWarning,
   memoryToasts,
   resolveMemorySources,
   showsSourcePicker,
-  toDeleteSwitchArgs,
+  toMirrorSwitchArgs,
   toMemorySwitchArgs,
-  type DeleteSyncSelection,
+  type MirrorSelection,
   type MemoryMode,
   type MemoryToastLevel,
 } from "@/lib/switch-memory-mode";
 import type {
   AccountMeta,
-  DeleteSyncPreview,
+  MirrorPreview,
   Session,
   SessionLinkPreviewGroup,
   SessionSyncSelection,
@@ -161,15 +161,15 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [syncPersona, setSyncPersona] = useState(INITIAL_EXTRAS.syncPersona);
   /** 人设覆盖策略：默认只替换仍是客户端默认模板的目标，手改过的保留。 */
   const [personaMode, setPersonaMode] = useState<"safe" | "overwrite">(INITIAL_EXTRAS.personaMode);
-  /** 删除传导：显式母本 + 已知会先备份 + 二次确认，独立通道。 */
-  const [deleteSync, setDeleteSync] = useState<DeleteSyncSelection>(initialDeleteSyncSelection);
-  const [deletePreview, setDeletePreview] = useState<DeleteSyncPreview | null>(null);
-  const [deletePreviewBusy, setDeletePreviewBusy] = useState(false);
-  const [deleteError, setDeleteError] = useState("");
-  /** 删除传导的二次确认弹层：复述母本名 + 删除数 + 勾选「我已知会先备份」。 */
-  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  /** 镜像切换：显式母本 + 已知会先备份 + 二次确认，独立通道。 */
+  const [mirror, setMirror] = useState<MirrorSelection>(initialMirrorSelection);
+  const [mirrorPreview, setMirrorPreview] = useState<MirrorPreview | null>(null);
+  const [mirrorPreviewBusy, setMirrorPreviewBusy] = useState(false);
+  const [mirrorError, setMirrorError] = useState("");
+  /** 镜像切换的二次确认弹层：复述母本名 + 影响数 + 勾选「我已知会先备份」。 */
+  const [mirrorConfirmOpen, setMirrorConfirmOpen] = useState(false);
   /** 成功后的一次性还原入口：明文备份绝对路径。 */
-  const [deleteBackup, setDeleteBackup] = useState<string | null>(null);
+  const [mirrorBackup, setMirrorBackup] = useState<string | null>(null);
 
   // 账号库与当前登录态：母本下拉的选项与默认值都由此派生，不额外发请求。
   const accounts = useAccountsStore((s) => s.accounts);
@@ -255,19 +255,19 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setSyncGroups([]);
     setLinksMeta(null);
     // 打开重置：与初始 useState 共用同一个纯函数，保证「初值 == 重开值」，
-    // 默认全关（人设关闭）+ 删除传导母本置 null，绝不把上次的破坏性选择静默延续。
+    // 默认全关（人设关闭）+ 镜像切换母本置 null，绝不把上次的破坏性选择静默延续。
     const extras = initialSwitchExtras();
     setMemoryMode(extras.memoryMode);
     setMemorySourceUid(extras.memorySourceUid);
     setMergeExperts(extras.mergeExperts);
     setSyncPersona(extras.syncPersona);
     setPersonaMode(extras.personaMode);
-    setDeleteSync(extras.deleteSync);
-    setDeletePreview(null);
-    setDeletePreviewBusy(false);
-    setDeleteError("");
-    setDeleteConfirmOpen(false);
-    setDeleteBackup(null);
+    setMirror(extras.mirror);
+    setMirrorPreview(null);
+    setMirrorPreviewBusy(false);
+    setMirrorError("");
+    setMirrorConfirmOpen(false);
+    setMirrorBackup(null);
     setTab("links");
     setLoadingSessions(true);
     void api.listSessions(variant)
@@ -314,54 +314,54 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     });
   }
 
-  /** 删除传导母本标签：二次确认弹层据此复述，避免只显示一串 uid。 */
-  const deleteMotherLabel =
-    memorySources.options.find((option) => option.uid === deleteSync.motherUid)?.label ??
-    deletePreview?.motherLabel ??
+  /** 母本（当前登录账号）标签：二次确认弹层据此复述，避免只显示一串 uid。 */
+  const mirrorMotherLabel =
+    memorySources.options.find((option) => option.uid === mirror.motherUid)?.label ??
+    mirrorPreview?.motherLabel ??
     "母本账号";
 
-  /** 显式选择删除传导母本：换母本即作废旧预览与全部确认，凭证绝不跨母本续用。 */
-  function chooseDeleteMother(uid: string) {
-    setDeleteSync({ motherUid: uid, acknowledged: false, confirmed: false });
-    setDeletePreview(null);
-    setDeleteError("");
-    setDeleteConfirmOpen(false);
+  /** 变更母本：作废旧预览与全部确认，凭证绝不跨母本续用。 */
+  function chooseMirrorMother(uid: string) {
+    setMirror({ motherUid: uid, acknowledged: false, confirmed: false });
+    setMirrorPreview(null);
+    setMirrorError("");
+    setMirrorConfirmOpen(false);
   }
 
-  /** 独立只读预览：差集清单绑定 motherUid，执行时由后端复核凭证。 */
-  async function loadDeletePreview() {
-    const motherUid = deleteSync.motherUid;
+  /** 独立只读预览：整份镜像清单绑定 motherUid，执行时由后端复核凭证。 */
+  async function loadMirrorPreview() {
+    const motherUid = mirror.motherUid;
     if (!motherUid || !accountId) return;
-    setDeletePreviewBusy(true);
-    setDeleteError("");
-    setDeletePreview(null);
-    setDeleteSync((prev) => ({ ...prev, confirmed: false }));
+    setMirrorPreviewBusy(true);
+    setMirrorError("");
+    setMirrorPreview(null);
+    setMirror((prev) => ({ ...prev, confirmed: false }));
     try {
-      const res = await api.deleteSyncPreview({ motherUid, targetAccountId: accountId, variant });
+      const res = await api.mirrorPreview({ motherUid, targetAccountId: accountId, variant });
       // 预览与母本强绑定：换了母本才返回的迟到结果一律丢弃。
       if (res.motherUid !== motherUid) return;
-      setDeletePreview(res);
+      setMirrorPreview(res);
     } catch (e) {
-      setDeleteError(api.asError(e));
+      setMirrorError(api.asError(e));
     } finally {
-      setDeletePreviewBusy(false);
+      setMirrorPreviewBusy(false);
     }
   }
 
-  /** 二次确认通过：复述母本名 + 删除数后才置 confirmed，doSwitch 据此产出独立 deletePlan。 */
-  function confirmDeleteSync() {
-    setDeleteSync((prev) => ({ ...prev, confirmed: true }));
-    setDeleteConfirmOpen(false);
+  /** 二次确认通过：复述母本名 + 影响数后才置 confirmed，doSwitch 据此产出独立 mirrorPlan。 */
+  function confirmMirror() {
+    setMirror((prev) => ({ ...prev, confirmed: true }));
+    setMirrorConfirmOpen(false);
   }
 
   /** 还原入口：toast 一次性 action 与 tab 内常驻入口共用同一实现。 */
-  function restoreDeleteBackup(backup: string) {
+  function restoreMirrorBackup(backup: string) {
     void api
-      .restoreDeleteSyncBackup({ backup })
+      .restoreMirrorBackup({ backup })
       .then((r) => {
         if (r.ok) {
-          toast.success("已还原删除传导前的备份");
-          setDeleteBackup(null);
+          toast.success("已还原镜像切换前的备份");
+          setMirrorBackup(null);
         } else {
           toast.error("还原失败", { description: r.error ?? "备份可能已不存在" });
         }
@@ -389,7 +389,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         syncPersona: syncPersona || undefined,
         personaMode: syncPersona ? personaMode : undefined,
         // 独立通道：只有显式母本 + 已知会先备份 + 二次确认 + 预览凭证绑定同一母本才产出。
-        ...toDeleteSwitchArgs(deleteSync, deletePreview),
+        ...toMirrorSwitchArgs(mirror, mirrorPreview),
       });
       const nickname = displayName(account);
       const parts: string[] = [];
@@ -419,35 +419,35 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           }`,
         );
       }
-      // 删除传导：成功提示里一次性「还原」按钮 + 明文备份绝对路径（不建常驻列表）。
+      // 镜像切换：成功提示里一次性「还原」按钮 + 明文备份绝对路径（不建常驻列表）。
       // 备份成功但落盘失败必须保留为可还原项，绝不按「成功清理」回收。
-      const deleteReport = res.deleteSync;
-      if (deleteReport) {
-        const removed = `已按母本删除 ${deleteReport.deletedSessions} 个会话 / ${deleteReport.deletedRecords} 条记录`;
+      const mirrorReport = res.mirror;
+      if (mirrorReport) {
+        const removed = `整份镜像完成：软删 ${mirrorReport.deletedSessions} 个会话、复制 ${mirrorReport.copiedSessions} 个会话`;
         parts.push(removed);
-        if (deleteReport.needsRecovery) {
-          toast.error("删除传导未全部完成，备份已保留", {
-            description: `${deleteReport.backup ? `备份：${deleteReport.backup}；` : ""}已登记为可还原项，下次切号会先恢复，绝不按成功清理回收。`,
+        if (mirrorReport.needsRecovery) {
+          toast.error("镜像切换未全部完成，备份已保留", {
+            description: `${mirrorReport.backup ? `备份：${mirrorReport.backup}；` : ""}已登记为可还原项，下次切号会先恢复，绝不按成功清理回收。`,
           });
-        } else if (deleteReport.backup) {
-          const backup = deleteReport.backup;
-          setDeleteBackup(backup);
+        } else if (mirrorReport.backup) {
+          const backup = mirrorReport.backup;
+          setMirrorBackup(backup);
           toast.success(removed, {
             description: `覆盖前已先备份，明文路径：${backup}。如需撤销可点「还原」。`,
-            action: { label: "还原", onClick: () => restoreDeleteBackup(backup) },
+            action: { label: "还原", onClick: () => restoreMirrorBackup(backup) },
           });
         }
-        for (const warning of deleteReport.warnings) {
-          toast.warning("删除传导已落盘但持久化证明缺失", { description: warning });
+        for (const warning of mirrorReport.warnings) {
+          toast.warning("镜像切换已落盘但持久化证明缺失", { description: warning });
         }
-        if (deleteReport.errors.length > 0) {
-          toast.error("部分删除传导未完成", {
-            description: deleteReport.errors.map((item) => `${item.sessionId}：${item.error}`).join("；"),
+        if (mirrorReport.errors.length > 0) {
+          toast.error("部分镜像切换未完成", {
+            description: mirrorReport.errors.map((item) => `${item.sessionId}：${item.error}`).join("；"),
           });
         }
-        if (deleteReport.skipped.length > 0) {
-          toast.warning("部分删除传导已跳过", {
-            description: deleteReport.skipped.map((item) => `${item.sessionId}：${item.reason}`).join("；"),
+        if (mirrorReport.skipped.length > 0) {
+          toast.warning("部分镜像切换已跳过", {
+            description: mirrorReport.skipped.map((item) => `${item.sessionId}：${item.reason}`).join("；"),
           });
         }
       }
@@ -903,36 +903,35 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         </div>
       </label>
 
-      {/* 删除传导：显式独立通道。默认全关，绝不并入一键全选 / 工作记忆 / 人设 / 归档。 */}
+      {/* 镜像切换：显式独立通道。默认全关，绝不并入一键全选 / 工作记忆 / 人设 / 归档。 */}
       <div className="space-y-2 rounded-md border border-destructive/40 px-3 py-2.5">
         <div className="flex items-center justify-between gap-2">
-          <div className="text-sm font-medium">删除传导</div>
+          <div className="text-sm font-medium">镜像切换</div>
           <span className="text-[11px] text-muted-foreground">默认关闭 · 独立通道</span>
         </div>
         <p className="text-xs text-muted-foreground">
-          以选定母本为准：母本里删掉的会话 / 记录，切号时在目标账号也删除。必须显式选母本、先预览差集、再二次确认；
-          执行前逐条复核并先备份，成功后可一键还原。不影响人设、专家团与归档状态。
+          以当前登录账号为母本，把目标账号的会话集合整份对齐：目标多出的会话软删（可还原），母本多出的会话复制，MEMORY.md 整份覆盖。默认关闭，须先预览逐条清单、再二次确认；执行前逐条复核并先备份，成功后可一键还原。不影响人设、专家团与归档状态。
         </p>
 
-        {/* 母本必须显式选择：value 只绑定 deleteSync.motherUid，绝不代入 defaultUid。 */}
+        {/* 母本 = 当前登录账号：value 只绑定 mirror.motherUid，绝不代入 defaultUid。 */}
         <div className="space-y-1.5">
-          <label className="text-xs font-medium" htmlFor="delete-mother-uid">母本账号（必须显式选择）</label>
+          <label className="text-xs font-medium" htmlFor="mirror-mother-uid">母本账号（当前登录账号）</label>
           <Select
-            value={deleteSync.motherUid ?? ""}
-            onValueChange={chooseDeleteMother}
+            value={mirror.motherUid ?? ""}
+            onValueChange={chooseMirrorMother}
             disabled={busy || memorySources.options.length === 0}
           >
             <SelectTrigger
-              id="delete-mother-uid"
+              id="mirror-mother-uid"
               size="sm"
               className="w-full min-w-0 bg-background text-xs"
-              aria-label="删除传导母本账号"
+              aria-label="镜像切换母本账号"
             >
               <SelectValue
                 placeholder={
                   memorySources.options.length === 0
                     ? "账号库里没有可用作母本的账号"
-                    : "选择母本账号（不会自动带入默认账号）"
+                    : "确认母本账号（当前登录账号）"
                 }
               />
             </SelectTrigger>
@@ -949,46 +948,44 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         <Button
           variant="outline"
           size="sm"
-          disabled={busy || !deleteSync.motherUid || deletePreviewBusy}
-          onClick={() => void loadDeletePreview()}
+          disabled={busy || !mirror.motherUid || mirrorPreviewBusy}
+          onClick={() => void loadMirrorPreview()}
         >
-          {deletePreviewBusy ? <Loader2 className="animate-spin" /> : <CircleAlert />}
-          {deletePreviewBusy ? "正在核对差集…" : "预览将删除的内容"}
+          {mirrorPreviewBusy ? <Loader2 className="animate-spin" /> : <CircleAlert />}
+          {mirrorPreviewBusy ? "正在核对整份镜像…" : "预览镜像将改变的会话"}
         </Button>
 
-        {deleteError && (
+        {mirrorError && (
           <Alert variant="destructive" className="min-w-0">
-            <AlertDescription className="min-w-0 break-all">{deleteError}</AlertDescription>
+            <AlertDescription className="min-w-0 break-all">{mirrorError}</AlertDescription>
           </Alert>
         )}
 
-        {deletePreview && (
+        {mirrorPreview && (
           <div className="space-y-2 rounded-md border bg-muted/30 px-2.5 py-2">
             <div className="text-xs font-medium">
-              {`母本「${deleteMotherLabel}」为准，将删除 ${deletePreview.sessionCount} 个会话 / ${deletePreview.recordCount} 条记录`}
+              {`母本「${mirrorMotherLabel}」为准，将软删 ${mirrorPreview.sessionCount} 个会话、复制 ${mirrorPreview.copiedCount} 个会话`}
             </div>
-            {/* 逐条差集清单：不折叠，每项写明删除粒度与条数。 */}
+            {/* 逐条待软删清单：不折叠，含私有会话；母本会话不进此清单。 */}
             <ul className="max-h-40 space-y-1 overflow-y-auto text-xs">
-              {deletePreview.targets.map((target) => (
+              {mirrorPreview.targets.map((target) => (
                 <li
-                  key={`${target.kind}:${target.sessionId}`}
+                  key={`mirror:${target.sessionId}`}
                   className="flex items-start justify-between gap-2"
                 >
                   <span className="min-w-0 break-all">{target.title || target.sessionId}</span>
                   <span className="shrink-0 text-muted-foreground tabular-nums">
-                    {target.kind === "session"
-                      ? `整条会话 · ${target.recordCount} 条`
-                      : `删 ${target.recordCount} 条独有记录`}
+                    {target.groupId ? "关联会话 · 软删" : "私有会话 · 软删"}
                   </span>
                 </li>
               ))}
             </ul>
             <label className="flex cursor-pointer items-start gap-2">
               <Checkbox
-                checked={deleteSync.acknowledged}
+                checked={mirror.acknowledged}
                 disabled={busy}
                 onCheckedChange={(value) =>
-                  setDeleteSync((prev) => ({
+                  setMirror((prev) => ({
                     ...prev,
                     acknowledged: value === true,
                     confirmed: false,
@@ -1003,50 +1000,50 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
               size="sm"
               disabled={
                 busy ||
-                !canSubmitDeleteSync({ ...deleteSync, confirmed: true }, deletePreview)
+                !canSubmitMirror({ ...mirror, confirmed: true }, mirrorPreview)
               }
-              onClick={() => setDeleteConfirmOpen(true)}
+              onClick={() => setMirrorConfirmOpen(true)}
             >
-              二次确认删除传导
+              二次确认镜像切换
             </Button>
-            {deleteSync.confirmed && (
+            {mirror.confirmed && (
               <p className="text-xs font-medium text-destructive">
-                {`已确认：本次切号将按母本删除 ${deletePreview.sessionCount} 个会话 / ${deletePreview.recordCount} 条记录。`}
+                {`已确认：本次切号将整份镜像，软删 ${mirrorPreview.sessionCount} 个会话、复制 ${mirrorPreview.copiedCount} 个会话。`}
               </p>
             )}
           </div>
         )}
 
         {/* 常驻还原入口：明文备份绝对路径，不建列表、不伪装成成功。 */}
-        {deleteBackup && (
+        {mirrorBackup && (
           <div className="space-y-1 rounded-md border border-amber-500/50 px-2.5 py-2">
-            <div className="text-xs font-medium">上次删除传导的备份（可还原）</div>
-            <p className="break-all text-[11px] text-muted-foreground">{deleteBackup}</p>
+            <div className="text-xs font-medium">上次镜像切换的备份（可还原）</div>
+            <p className="break-all text-[11px] text-muted-foreground">{mirrorBackup}</p>
             <Button
               variant="outline"
               size="sm"
               disabled={busy}
-              onClick={() => restoreDeleteBackup(deleteBackup)}
+              onClick={() => restoreMirrorBackup(mirrorBackup)}
             >
-              还原这次删除
+              还原这次镜像
             </Button>
           </div>
         )}
       </div>
 
-      {/* 二次确认弹层：复述母本名 + 删除数，确认才置 confirmed（doSwitch 据此产出 deletePlan）。 */}
-      <AlertDialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
+      {/* 二次确认弹层：复述母本名 + 影响数，确认才置 confirmed（doSwitch 据此产出 mirrorPlan）。 */}
+      <AlertDialog open={mirrorConfirmOpen} onOpenChange={setMirrorConfirmOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>确认删除传导？</AlertDialogTitle>
+            <AlertDialogTitle>确认镜像切换？</AlertDialogTitle>
             <AlertDialogDescription>
-              {`母本「${deleteMotherLabel}」为准，将删除 ${deletePreview?.sessionCount ?? 0} 个会话 / ${deletePreview?.recordCount ?? 0} 条记录。执行前每项仍会重新校验预览凭据与现场摘要，内容已变化会跳过而不是删除；覆盖前先备份，成功后可一键还原。`}
+              {`母本「${mirrorMotherLabel}」为准，将软删 ${mirrorPreview?.sessionCount ?? 0} 个会话、复制 ${mirrorPreview?.copiedCount ?? 0} 个会话。执行前每项仍会重新校验预览凭据与现场摘要，内容已变化会跳过而不是软删；覆盖前先备份，成功后可一键还原。`}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
-            <AlertDialogAction disabled={busy} onClick={confirmDeleteSync}>
-              确认删除
+            <AlertDialogAction disabled={busy} onClick={confirmMirror}>
+              确认镜像
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

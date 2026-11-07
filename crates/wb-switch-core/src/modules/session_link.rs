@@ -1374,6 +1374,10 @@ pub struct PreviewBinding {
     /// 预览生成时即固定，不随用户后来是否勾选变化；执行时以绑定为准。
     #[serde(default)]
     pub archive_action: Option<String>,
+    /// 镜像切换：母本 uid（当前登录账号）。None = 普通逐组同步预览。
+    /// 镜像预览凭据绑定为 Some，执行前由 `verify_preview` 与 `mirror::verify_mirror_binding` 复核。
+    #[serde(default)]
+    pub mother_uid: Option<String>,
 }
 
 /// 服务端保存的预览凭据。
@@ -1547,6 +1551,9 @@ pub fn verify_preview(preview: &PreviewToken, live: &PreviewBinding) -> Vec<Stri
     }
     if expected.archive_action != live.archive_action {
         stale.push("可执行的归档同步已变化，请重新检查".to_string());
+    }
+    if expected.mother_uid != live.mother_uid {
+        stale.push("母本账号已变化，请重新预览".to_string());
     }
     stale
 }
@@ -3166,6 +3173,7 @@ mod tests {
             source_status: None,
             target_status: None,
             archive_action: None,
+            mother_uid: None,
         }
     }
 

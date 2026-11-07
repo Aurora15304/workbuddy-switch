@@ -163,7 +163,7 @@ describe("buildSelections", () => {
     expect(buildSelections([target], new Set(["g-1"]))).toEqual([]);
   });
 
-  it("删除传导是独立通道：全选产出的 selections 不含任何删除计划字段", () => {
+  it("镜像切换是独立通道：全选产出的 selections 不含任何删除计划字段", () => {
     const groups = [
       group({ groupId: "ff", availableModes: ["fastForward"], previewToken: "t1" }),
       group({ groupId: "ow", availableModes: ["overwrite"], previewToken: "t3" }),
@@ -172,9 +172,9 @@ describe("buildSelections", () => {
     const selections = buildSelections(groups, checked);
     expect(selections).toHaveLength(2);
     for (const item of selections) {
-      // 删除传导绝不复用 syncSelections / buildSelections 通道。
+      // 镜像切换绝不复用 syncSelections / buildSelections 通道。
       expect(Object.keys(item).sort()).toEqual(["groupId", "mode", "previewToken"]);
-      expect(item).not.toHaveProperty("deletePlan");
+      expect(item).not.toHaveProperty("mirrorPlan");
       expect(item).not.toHaveProperty("targets");
       expect(item).not.toHaveProperty("motherUid");
       expect(item).not.toHaveProperty("expectedDigest");

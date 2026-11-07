@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  deleteSyncPreview,
+  mirrorPreview,
   getCreditExpiry,
   getStatus,
-  restoreDeleteSyncBackup,
+  restoreMirrorBackup,
   switchAccount,
 } from "./api";
-import type { DeleteSyncPlan } from "./types";
+import type { MirrorPlan } from "./types";
 
 /**
  * webui（浏览器）模式下的 HTTP 请求地址构造。
@@ -97,50 +97,50 @@ describe("webui httpCall URL 构造", () => {
   });
 });
 
-/** 删除传导是独立通道：deletePlan 逐字透传，绝不夹带任何别的写入通道。 */
-const DELETE_PLAN: DeleteSyncPlan = {
+/** 镜像切换是独立通道：mirrorPlan 逐字透传，绝不夹带任何别的写入通道。 */
+const MIRROR_PLAN: MirrorPlan = {
   motherUid: "u2",
   targets: [
-    { sessionId: "s-1", title: "会话一", kind: "session", recordCount: 3, fullDigest: "d-1" },
+    { sessionId: "s-1", title: "会话一", userId: "u-target", groupId: "g-1", updatedAt: 1000, fullDigest: "d-1", kind: "session" },
   ],
   expectedDigest: "digest-1",
   previewToken: "tok-delete-1",
 };
 
-describe("switchAccount — deletePlan 独立参数形状", () => {
-  it("deletePlan 作为独立参数透传到 /api/switch，不夹带 syncSelections / memoryMode", async () => {
+describe("switchAccount — mirrorPlan 独立参数形状", () => {
+  it("mirrorPlan 作为独立参数透传到 /api/switch，不夹带 syncSelections / memoryMode", async () => {
     const fetchMock = stubFetch();
 
-    await switchAccount({ accountId: "a-1", deletePlan: DELETE_PLAN });
+    await switchAccount({ accountId: "a-1", mirrorPlan: MIRROR_PLAN });
 
     const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("/api/switch");
     expect(init.method).toBe("POST");
     const body = JSON.parse(init.body as string) as Record<string, unknown>;
-    expect(body.deletePlan).toEqual(DELETE_PLAN);
-    // 独立通道铁律：删除传导绝不复用这两条既有通道承载。
+    expect(body.mirrorPlan).toEqual(MIRROR_PLAN);
+    // 独立通道铁律：镜像切换绝不复用这两条既有通道承载。
     expect(body).not.toHaveProperty("syncSelections");
     expect(body).not.toHaveProperty("memoryMode");
   });
 
-  it("未启用删除传导时不带 deletePlan 字段", async () => {
+  it("未启用镜像切换时不带 mirrorPlan 字段", async () => {
     const fetchMock = stubFetch();
 
     await switchAccount({ accountId: "a-1", syncSelections: [] });
 
     const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     const body = JSON.parse(init.body as string) as Record<string, unknown>;
-    expect(body).not.toHaveProperty("deletePlan");
+    expect(body).not.toHaveProperty("mirrorPlan");
   });
 
-  it("deleteSyncPreview / restoreDeleteSyncBackup 走独立只读预览 / 还原路由", async () => {
+  it("mirrorPreview / restoreMirrorBackup 走独立只读预览 / 还原路由", async () => {
     const fetchMock = stubFetch();
 
-    await deleteSyncPreview({ motherUid: "u2", targetAccountId: "a-1" });
-    await restoreDeleteSyncBackup({ backup: "/abs/backup/dir" });
+    await mirrorPreview({ motherUid: "u2", targetAccountId: "a-1" });
+    await restoreMirrorBackup({ backup: "/abs/backup/dir" });
 
     const [previewUrl, previewInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
-    expect(previewUrl).toBe("/api/delete-sync/preview");
+    expect(previewUrl).toBe("/api/mirror/preview");
     expect(previewInit.method).toBe("POST");
     expect(JSON.parse(previewInit.body as string)).toEqual({
       motherUid: "u2",
@@ -148,7 +148,7 @@ describe("switchAccount — deletePlan 独立参数形状", () => {
     });
 
     const [restoreUrl, restoreInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
-    expect(restoreUrl).toBe("/api/delete-sync/restore");
+    expect(restoreUrl).toBe("/api/mirror/restore");
     expect(restoreInit.method).toBe("POST");
     expect(JSON.parse(restoreInit.body as string)).toEqual({ backup: "/abs/backup/dir" });
   });

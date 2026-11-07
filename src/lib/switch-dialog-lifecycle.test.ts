@@ -8,11 +8,11 @@ import {
   type ProgressPollerDeps,
 } from "./switch-dialog-lifecycle";
 import {
-  canSubmitDeleteSync,
+  canSubmitMirror,
   initialSwitchExtras,
-  type DeleteSyncSelection,
+  type MirrorSelection,
 } from "./switch-memory-mode";
-import type { DeleteSyncPreview } from "./types";
+import type { MirrorPreview } from "./types";
 
 /** 让所有已排队的 microtask（含 .then / .catch 链）跑完。 */
 const flushMicrotasks = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -96,46 +96,46 @@ describe("弹窗打开 / 重开 — initialSwitchExtras 单一初值源", () => 
     expect(reopened.personaMode).toBe("safe");
   });
 
-  it("每次重开删除传导母本都回到 null，且状态对象互不共享", () => {
+  it("每次重开镜像切换母本都回到 null，且状态对象互不共享", () => {
     const opened = initialSwitchExtras();
     const reopened = initialSwitchExtras();
-    expect(opened.deleteSync).toEqual({
+    expect(opened.mirror).toEqual({
       motherUid: null,
       acknowledged: false,
       confirmed: false,
     });
-    expect(reopened.deleteSync).toEqual(opened.deleteSync);
-    expect(reopened.deleteSync).not.toBe(opened.deleteSync);
+    expect(reopened.mirror).toEqual(opened.mirror);
+    expect(reopened.mirror).not.toBe(opened.mirror);
   });
 
   it("上次的破坏性选择不会静默延续到重开：改动不污染下一次初值", () => {
     const opened = initialSwitchExtras();
     opened.syncPersona = true;
     opened.mergeExperts = true;
-    opened.deleteSync.motherUid = "u-prev";
-    opened.deleteSync.confirmed = true;
+    opened.mirror.motherUid = "u-prev";
+    opened.mirror.confirmed = true;
     const reopened = initialSwitchExtras();
     expect(reopened.syncPersona).toBe(false);
     expect(reopened.mergeExperts).toBe(false);
-    expect(reopened.deleteSync.motherUid).toBeNull();
-    expect(reopened.deleteSync.confirmed).toBe(false);
+    expect(reopened.mirror.motherUid).toBeNull();
+    expect(reopened.mirror.confirmed).toBe(false);
   });
 
-  it("重开后的干净删除选择，即便配着旧预览也绝不能提交", () => {
-    const reopened: DeleteSyncSelection = initialSwitchExtras().deleteSync;
-    const stalePreview: DeleteSyncPreview = {
+  it("重开后的干净镜像选择，即便配着旧预览也绝不能提交", () => {
+    const reopened: MirrorSelection = initialSwitchExtras().mirror;
+    const stalePreview: MirrorPreview = {
       motherUid: "u-prev",
       motherLabel: "上次的母本",
       previewToken: "tok-stale",
       expectedDigest: "digest",
       targets: [
-        { sessionId: "s", title: "会话", kind: "session", recordCount: 1, fullDigest: "d" },
+        { sessionId: "s", title: "会话", userId: "u-target", groupId: "g-1", updatedAt: 1000, fullDigest: "d", kind: "session" },
       ],
       sessionCount: 1,
-      recordCount: 1,
+      copiedCount: 0,
       backupDir: null,
     };
-    expect(canSubmitDeleteSync(reopened, stalePreview)).toBe(false);
+    expect(canSubmitMirror(reopened, stalePreview)).toBe(false);
   });
 });
 
