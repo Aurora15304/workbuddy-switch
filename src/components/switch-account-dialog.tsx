@@ -444,9 +444,10 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         } else {
           const message = r.error ?? "备份可能已不存在";
           toast.error("还原失败", { description: message });
-          // 路径已失效（备份被清理 / 不在允许目录）时清掉这条点不动的入口；
-          // 但「已有任务在跑」这类临时冲突不能清，否则用户稍后想还原就找不到了。
-          if (!message.includes("进行中") && !message.includes("请稍候")) {
+          // 只有"路径已失效"这类终态才清掉入口。锁冲突（另一个进程正在切号，
+          // 文案是「请稍后重试」）必须保留——清掉唯一入口等于丢回滚路径，
+          // 留一条死入口只是碍眼，代价小得多。
+          if (/不存在|不可读|读取失败|解析失败|不在允许|已损坏|不受支持/.test(message)) {
             forgetMirrorBackup();
             setMirrorBackup(null);
           }

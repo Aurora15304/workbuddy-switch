@@ -12,7 +12,7 @@
 //! 安装。Windows NSIS 安装器要求应用退出后才能完成安装，下载即安装等于强制自动重启；
 //! macOS 安装可能触发 `/Applications` 写授权，放在用户主动动作时语义才自然。
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -101,6 +101,27 @@ static PROGRESS_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// 没有总量（服务端不回 Content-Length）时，是否已经写过「正在下载…」文案。
 static NO_TOTAL_TOOLTIP_SET: AtomicBool = AtomicBool::new(false);
+
+/// 自动下载连续失败次数。**只统计 `auto=true` 的下载**，手动点击会归零。
+///
+/// 为什么必须单独计数：`update_check` 只拉 1 KB 清单，能通不代表包能下
+/// （镜像/直连对二进制与 JSON 的策略可能不同）。只看检查失败的退避，会在
+/// 「清单通、下载一直失败」的机器上每 30 分钟重试一次并弹出两条通知。
+static AUTO_DOWNLOAD_FAILURES: AtomicU32 = AtomicU32::new(0);
+/// 最近一次自动下载失败的时间（Unix 秒，与 core 的 `now_secs` 同为 i64），用于计算退避窗口。
+static AUTO_DOWNLOAD_FAILED_AT: AtomicI64 = AtomicI64::new(0);
+
+/// 自动下载是否仍在退避窗口内（失败后不立刻重试，也不发通知）。
+fn auto_download_backoff_active() -> bool {
+    let failures = AUTO_DOWNLOAD_FAILURES.load(Ordering::Acquire);
+    if failures == 0 {
+        return false;
+    }
+    let failed_at = AUTO_DOWNLOAD_FAILED_AT.load(Ordering::Acquire);
+    let elapsed = now_secs().saturating_sub(failed_at);
+    // 系统时间被回拨时 elapsed 可能为负：按"仍在退避"处理，避免立刻重试。
+    elapsed < check_delay(failures).as_secs() as i64
+}
 
 // ---------------------------------------------------------------------------
 // 互斥
@@ -321,6 +342,11 @@ pub async fn check<R: Runtime>(app: &AppHandle<R>, proxy: Option<&str>, force: b
 /// 下载在后台任务里进行（含重新 check 一次以拿到 `Update` 句柄），因此托盘与前端
 /// 都不需要等网络；重复调用由 `BUSY` 拒绝。
 pub fn start_download<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    start_download_inner(app, false)
+}
+
+/// 下载入口的共用实现。`auto=true` 表示由定时检查触发：失败计入退避计数。
+fn start_download_inner<R: Runtime>(app: &AppHandle<R>, auto: bool) -> Result<(), String> {
     if crate::is_screenshot_demo() {
         return Err(DEMO_DOWNLOAD_MESSAGE.to_string());
     }
@@ -328,13 +354,18 @@ pub fn start_download<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         eprintln!("[更新] 已有任务在跑，跳过本次下载");
         return Err(BUSY_MESSAGE.to_string());
     };
-    eprintln!("[更新] 启动下载任务");
+    // 手动点击等同"用户主动重试"：清掉自动重试的失败计数，退避立即结束。
+    if !auto {
+        AUTO_DOWNLOAD_FAILURES.store(0, Ordering::Release);
+    }
+    eprintln!("[更新] 启动下载任务（auto={auto}）");
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _busy = busy;
         match download_package(&app).await {
             // 下载完成：包先暂存，等用户点「重启以完成升级」时才安装。
             Ok(Some(package)) => {
+                AUTO_DOWNLOAD_FAILURES.store(0, Ordering::Release);
                 let version = package.version.clone();
                 eprintln!("[更新] 下载完成 v{version}（{} 字节）", package.bytes.len());
                 store_package(package);
@@ -348,6 +379,7 @@ pub fn start_download<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             }
             // 更新源已无可用包（版本已追平）。
             Ok(None) => {
+                AUTO_DOWNLOAD_FAILURES.store(0, Ordering::Release);
                 eprintln!("[更新] 更新源无可用更新包，转为已是最新");
                 set_phase(
                     &app,
@@ -356,6 +388,11 @@ pub fn start_download<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
                 reset_tooltip(&app);
             }
             Err(message) => {
+                if auto {
+                    let failures = AUTO_DOWNLOAD_FAILURES.fetch_add(1, Ordering::AcqRel) + 1;
+                    AUTO_DOWNLOAD_FAILED_AT.store(now_secs(), Ordering::Release);
+                    eprintln!("[更新] 自动下载连续失败 {failures} 次，进入退避");
+                }
                 eprintln!("[更新] 下载失败：{message}");
                 set_phase(&app, fail(message.clone()));
                 reset_tooltip(&app);
@@ -449,7 +486,7 @@ pub fn spawn_periodic_check(app: AppHandle) {
     });
 }
 
-/// 下一轮检查的等待时长：正常 30 分钟；连续失败按 30/60/120/240 分钟退避，上限 6 小时。
+/// 下一轮检查的等待时长：正常 30 分钟；连续失败按 30/60/120/240/360 分钟退避，上限 6 小时。
 ///
 /// 没有退避时，一台断网的机器会每 30 分钟做一次注定失败的请求；一旦哪天出错路径
 /// 带上通知，就变成周期性骚扰。成功一次即归零（调用方负责重置计数）。
@@ -457,7 +494,8 @@ fn check_delay(consecutive_failures: u32) -> Duration {
     if consecutive_failures == 0 {
         return CHECK_INTERVAL;
     }
-    let doublings = consecutive_failures.min(4) - 1;
+    // 1/2/4/8/16 倍增，再夹到 6 小时上限；`.min(5)` 保证移位不超过 16 倍。
+    let doublings = consecutive_failures.min(5) - 1;
     let minutes = 30u64.saturating_mul(1u64 << doublings).min(6 * 60);
     Duration::from_secs(minutes * 60)
 }
@@ -470,6 +508,12 @@ async fn maybe_auto_download<R: Runtime>(app: &AppHandle<R>, result: &Value) {
         return;
     }
     if !update::auto_download_enabled() {
+        return;
+    }
+    // 下载连续失败后先退避：清单能拉通不代表包能下（镜像对 JSON 与二进制策略可能不同）。
+    // 没有这道闸，"检查通、下载一直失败"的机器会每 30 分钟重试一次并弹两条通知。
+    if auto_download_backoff_active() {
+        eprintln!("[更新] 自动下载处于退避期，跳过本次");
         return;
     }
     let has_update = result
@@ -496,7 +540,7 @@ async fn maybe_auto_download<R: Runtime>(app: &AppHandle<R>, result: &Value) {
     if snapshot().phase != UpdatePhase::Available {
         return;
     }
-    match start_download(app) {
+    match start_download_inner(app, true) {
         Ok(()) => {
             eprintln!("[更新] v{latest} 自动后台下载已启动");
             notify(
@@ -596,7 +640,8 @@ fn build_updater<R: Runtime>(
         .map_err(|error| format!("初始化更新器失败：{error}"))
 }
 
-/// 依次尝试「内置镜像 → GitHub 直连」，每个候选都验签，任一成功即返回。
+/// 按 [`update_download::rank_candidates`] 的实测速度排序，依次尝试、每个都验签，
+/// 任一成功即返回；排序只是"先试谁"，不是跳过验签的理由。
 ///
 /// 镜像只负责「把字节搬快」，可信度由 `verify_signature` 兜底：任何一个镜像返回
 /// 脏数据或半截文件都会在这里被拒，然后自动换下一个通道。
