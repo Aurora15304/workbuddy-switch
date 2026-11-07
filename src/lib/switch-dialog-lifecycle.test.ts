@@ -103,6 +103,7 @@ describe("弹窗打开 / 重开 — initialSwitchExtras 单一初值源", () => 
       motherUid: null,
       acknowledged: false,
       confirmed: false,
+      enabled: false,
     });
     expect(reopened.mirror).toEqual(opened.mirror);
     expect(reopened.mirror).not.toBe(opened.mirror);
@@ -114,11 +115,13 @@ describe("弹窗打开 / 重开 — initialSwitchExtras 单一初值源", () => 
     opened.mergeExperts = true;
     opened.mirror.motherUid = "u-prev";
     opened.mirror.confirmed = true;
+    opened.mirror.enabled = true;
     const reopened = initialSwitchExtras();
     expect(reopened.syncPersona).toBe(false);
     expect(reopened.mergeExperts).toBe(false);
     expect(reopened.mirror.motherUid).toBeNull();
     expect(reopened.mirror.confirmed).toBe(false);
+    expect(reopened.mirror.enabled).toBe(false);
   });
 
   it("重开后的干净镜像选择，即便配着旧预览也绝不能提交", () => {

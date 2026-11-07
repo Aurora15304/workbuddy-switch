@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { AccountMeta, MirrorPreview, MemoryMergeReport } from "@/lib/types";
 import {
+  assetSyncSuppressedByMirror,
   canSubmitMirror,
   canSubmitMemory,
   DEFAULT_MEMORY_MODE,
@@ -354,9 +355,14 @@ function mirrorPreviewFixture(motherUid: string): MirrorPreview {
 }
 
 describe("镜像切换 — 母本 uid 由登录态确定，defaultUid 禁止代入", () => {
-  it("initialMirrorSelection 恒为「未绑定母本 + 未确认」，与记忆母本默认值无关", () => {
+  it("initialMirrorSelection 恒为「未绑定母本 + 未启用 + 未确认」，与记忆母本默认值无关", () => {
     const selection = initialMirrorSelection();
-    expect(selection).toEqual({ motherUid: null, acknowledged: false, confirmed: false });
+    expect(selection).toEqual({
+      motherUid: null,
+      acknowledged: false,
+      confirmed: false,
+      enabled: false,
+    });
     // 重新打开必须拿到同样的干净初值（不共享引用）。
     selection.motherUid = "u1";
     expect(initialMirrorSelection().motherUid).toBeNull();
@@ -373,24 +379,31 @@ describe("镜像切换 — 母本 uid 由登录态确定，defaultUid 禁止代�
     expect(toMirrorSwitchArgs(initialMirrorSelection(), preview)).toEqual({});
   });
 
-  it("只有绑定母本 + 已知会先备份 + 二次确认 + 预览有效才可提交", () => {
+  it("未启用镜像时，母本、备份确认与二次确认齐全也不可提交", () => {
     const preview = mirrorPreviewFixture("u2");
     const base = initialMirrorSelection();
     expect(canSubmitMirror({ ...base, motherUid: "u2" }, preview)).toBe(false);
     expect(canSubmitMirror({ ...base, motherUid: "u2", acknowledged: true }, preview)).toBe(false);
     expect(
       canSubmitMirror({ ...base, motherUid: "u2", acknowledged: true, confirmed: true }, preview),
+    ).toBe(false);
+    // 显式启用后，同一组条件才放行。
+    expect(
+      canSubmitMirror(
+        { ...base, motherUid: "u2", acknowledged: true, confirmed: true, enabled: true },
+        preview,
+      ),
     ).toBe(true);
   });
 
   it("预览母本与所选母本 uid 不一致（uid 变化）一律拒绝，绝不复用旧凭证", () => {
-    const selection = { motherUid: "u2", acknowledged: true, confirmed: true };
+    const selection = { motherUid: "u2", acknowledged: true, confirmed: true, enabled: true };
     expect(canSubmitMirror(selection, mirrorPreviewFixture("u1"))).toBe(false);
     expect(toMirrorSwitchArgs(selection, mirrorPreviewFixture("u1"))).toEqual({});
   });
 
   it("没有预览 / 空清单 / 无凭证时不提交", () => {
-    const selection = { motherUid: "u2", acknowledged: true, confirmed: true };
+    const selection = { motherUid: "u2", acknowledged: true, confirmed: true, enabled: true };
     expect(canSubmitMirror(selection, null)).toBe(false);
     const empty = { ...mirrorPreviewFixture("u2"), targets: [], previewToken: "" };
     expect(canSubmitMirror(selection, empty)).toBe(false);
@@ -399,7 +412,7 @@ describe("镜像切换 — 母本 uid 由登录态确定，defaultUid 禁止代�
   it("toMirrorSwitchArgs 只输出冻结的三字段 plan（不含 motherUid），不夹带别的通道", () => {
     const preview = mirrorPreviewFixture("u2");
     const args = toMirrorSwitchArgs(
-      { motherUid: "u2", acknowledged: true, confirmed: true },
+      { motherUid: "u2", acknowledged: true, confirmed: true, enabled: true },
       preview,
     );
     // 母本由后端取自登录态：前端只输出 targets/expectedDigest/previewToken。
@@ -412,5 +425,21 @@ describe("镜像切换 — 母本 uid 由登录态确定，defaultUid 禁止代�
     expect(args).not.toHaveProperty("syncSelections");
     expect(args).not.toHaveProperty("memoryMode");
     expect(args).not.toHaveProperty("memorySourceUid");
+  });
+
+  it("镜像启用后附加同步三项与一键全选全部置灰；未启用时全部放行", () => {
+    const base = initialMirrorSelection();
+    expect(assetSyncSuppressedByMirror(base)).toEqual({
+      memory: false,
+      persona: false,
+      experts: false,
+      sessionSelectAll: false,
+    });
+    expect(assetSyncSuppressedByMirror({ ...base, enabled: true })).toEqual({
+      memory: true,
+      persona: true,
+      experts: true,
+      sessionSelectAll: true,
+    });
   });
 });

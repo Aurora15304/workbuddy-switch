@@ -1,4 +1,5 @@
 import { displayName } from "@/lib/account-display";
+import { hasMirrorRiskAcknowledged } from "@/lib/mirror-risk-ack";
 import type {
   AccountMeta,
   MirrorPlan,
@@ -253,15 +254,27 @@ export function initialSwitchExtras(): SwitchExtras {
 export interface MirrorSelection {
   /** 母本 uid（当前登录账号）；null = 预览未返回，禁止提交。 */
   motherUid: string | null;
-  /** 勾选「我已知会先备份」。 */
+  /** 勾选「我已知会先备份」。首次使用时要求确认，之后由 localStorage 记住免勾。 */
   acknowledged: boolean;
   /** 二次确认（复述母本名 + 删除数）已通过。 */
   confirmed: boolean;
+  /** 用户是否启用镜像切换。启用后附加同步三项与一键全选必须置灰（语义互斥）。 */
+  enabled: boolean;
 }
 
-/** 每次打开弹窗的干净初值：默认全关，破坏性选择绝不静默延续。 */
+/**
+ * 每次打开弹窗的干净初值：默认全关，破坏性选择绝不静默延续。
+ *
+ * `acknowledged` 的初值取「本地是否已确认过风险」：首次使用为空（要用户勾一次），
+ * 之后记住（免勾）。风险确认本身仍要靠预览后的复述与二次确认兜底。
+ */
 export function initialMirrorSelection(): MirrorSelection {
-  return { motherUid: null, acknowledged: false, confirmed: false };
+  return {
+    motherUid: null,
+    acknowledged: hasMirrorRiskAcknowledged(),
+    confirmed: false,
+    enabled: false,
+  };
 }
 
 /**
@@ -272,10 +285,27 @@ export function canSubmitMirror(
   selection: MirrorSelection,
   preview: MirrorPreview | null,
 ): boolean {
+  if (!selection.enabled) return false;
   if (!selection.motherUid || !selection.acknowledged || !selection.confirmed) return false;
   if (!preview || !preview.previewToken.trim() || preview.targets.length === 0) return false;
   if (preview.motherUid !== selection.motherUid) return false;
   return true;
+}
+
+/**
+ * 镜像启用后必须同时关闭的通道：附加同步三项（工作记忆 / 人设 / 专家团）与一键全选。
+ *
+ * 语义互斥：整份镜像已经把会话集合与记忆整份对齐，再叠加逐项同步会双重写入；
+ * 后端也会因「现场摘要与预览不符」让镜像必然失败，用户却只看到切号成功。
+ */
+export function assetSyncSuppressedByMirror(mirror: MirrorSelection): {
+  memory: boolean;
+  persona: boolean;
+  experts: boolean;
+  sessionSelectAll: boolean;
+} {
+  const on = mirror.enabled;
+  return { memory: on, persona: on, experts: on, sessionSelectAll: on };
 }
 
 /**

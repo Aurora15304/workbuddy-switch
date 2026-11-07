@@ -46,6 +46,7 @@ import {
 import { accountVariant, variantAppName } from "@/lib/variant";
 import { useAccountsStore } from "@/stores/accounts";
 import {
+  assetSyncSuppressedByMirror,
   canSubmitMirror,
   canSubmitMemory,
   initialMirrorSelection,
@@ -61,6 +62,10 @@ import {
   type MemoryMode,
   type MemoryToastLevel,
 } from "@/lib/switch-memory-mode";
+import {
+  hasMirrorRiskAcknowledged,
+  rememberMirrorRiskAcknowledged,
+} from "@/lib/mirror-risk-ack";
 import type {
   AccountMeta,
   MirrorPreview,
@@ -168,8 +173,13 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [mirrorError, setMirrorError] = useState("");
   /** 镜像切换的二次确认弹层：复述母本名 + 影响数 + 勾选「我已知会先备份」。 */
   const [mirrorConfirmOpen, setMirrorConfirmOpen] = useState(false);
+  /** 首次启用镜像的风险确认弹层：确认一次后本机记住，之后不再重复询问。 */
+  const [mirrorRiskOpen, setMirrorRiskOpen] = useState(false);
   /** 成功后的一次性还原入口：明文备份绝对路径。 */
   const [mirrorBackup, setMirrorBackup] = useState<string | null>(null);
+
+  /** 镜像启用后必须关闭的通道：附加同步三项与一键全选（语义互斥，防双重写入）。 */
+  const mirrorBlocks = assetSyncSuppressedByMirror(mirror);
 
   // 账号库与当前登录态：母本下拉的选项与默认值都由此派生，不额外发请求。
   const accounts = useAccountsStore((s) => s.accounts);
@@ -248,7 +258,13 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   useEffect(() => {
     if (!open) return;
     if (mirror.motherUid === loginUid) return;
-    setMirror({ motherUid: loginUid, acknowledged: false, confirmed: false });
+    setMirror({
+      motherUid: loginUid,
+      // 风险确认一旦在本机确认过就不再追问；其余破坏性选择一律回到未确认。
+      acknowledged: hasMirrorRiskAcknowledged(),
+      confirmed: false,
+      enabled: false,
+    });
     setMirrorPreview(null);
     setMirrorError("");
     setMirrorConfirmOpen(false);
@@ -357,6 +373,40 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     } finally {
       setMirrorPreviewBusy(false);
     }
+  }
+
+  /** 镜像启用时清空已勾的附加同步：语义互斥，避免与整份镜像双重写入。 */
+  function disableAssetSync() {
+    setMemoryMode("off");
+    setSyncPersona(false);
+    setMergeExperts(false);
+  }
+
+  /**
+   * 启用 / 停用镜像切换。
+   *
+   * 首次启用要求先确认风险（本机记住，之后免勾）；已记住则直接启用。
+   * 停用时一并作废二次确认——破坏性选择绝不静默延续到下一次切号。
+   */
+  function toggleMirrorEnabled(next: boolean) {
+    if (!next) {
+      setMirror((prev) => ({ ...prev, enabled: false, confirmed: false }));
+      return;
+    }
+    if (hasMirrorRiskAcknowledged()) {
+      setMirror((prev) => ({ ...prev, enabled: true, acknowledged: true, confirmed: false }));
+      disableAssetSync();
+      return;
+    }
+    // 首次使用：先开风险确认弹层，确认后才真正启用。
+    setMirrorRiskOpen(true);
+  }
+
+  /** 首次风险确认通过：记住「用户已知风险」，并真正启用镜像。 */
+  function confirmMirrorRisk() {
+    rememberMirrorRiskAcknowledged();
+    setMirror((prev) => ({ ...prev, enabled: true, acknowledged: true, confirmed: false }));
+    disableAssetSync();
   }
 
   /** 二次确认通过：复述母本名 + 影响数后才置 confirmed，doSwitch 据此产出独立 mirrorPlan。 */
@@ -765,7 +815,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         <div className="text-sm font-medium">工作记忆</div>
         <RadioGroup
           value={memoryMode}
-          disabled={busy}
+          disabled={busy || mirrorBlocks.memory}
           onValueChange={(value) => setMemoryMode(value as MemoryMode)}
           className="gap-2"
         >
@@ -859,7 +909,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         <label className="flex cursor-pointer items-start gap-2">
           <Checkbox
             checked={syncPersona}
-            disabled={busy}
+            disabled={busy || mirrorBlocks.persona}
             onCheckedChange={(value) => setSyncPersona(value === true)}
             className="mt-0.5"
           />
@@ -873,7 +923,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         {syncPersona && (
           <RadioGroup
             value={personaMode}
-            disabled={busy}
+            disabled={busy || mirrorBlocks.persona}
             onValueChange={(value) => setPersonaMode(value as "safe" | "overwrite")}
             className="ml-6 gap-2 border-l border-border pl-3"
           >
@@ -902,7 +952,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       <label className="flex cursor-pointer items-start gap-2 rounded-md border border-border px-3 py-2.5">
         <Checkbox
           checked={mergeExperts}
-          disabled={busy}
+          disabled={busy || mirrorBlocks.experts}
           onCheckedChange={(value) => setMergeExperts(value === true)}
           className="mt-0.5"
         />
@@ -917,12 +967,28 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       {/* 镜像切换：显式独立通道。默认全关，绝不并入一键全选 / 工作记忆 / 人设 / 归档。 */}
       <div className="space-y-2 rounded-md border border-destructive/40 px-3 py-2.5">
         <div className="flex items-center justify-between gap-2">
-          <div className="text-sm font-medium">镜像切换</div>
+          <div className="text-sm font-medium">镜像切换（bata）</div>
           <span className="text-[11px] text-muted-foreground">默认关闭 · 独立通道</span>
         </div>
         <p className="text-xs text-muted-foreground">
           以当前登录账号为母本，把目标账号的会话集合整份对齐：目标多出的会话软删（可还原），母本多出的会话复制，MEMORY.md 整份覆盖。默认关闭，须先预览逐条清单、再二次确认；执行前逐条复核并先备份，成功后可一键还原。不影响人设、专家团与归档状态。
         </p>
+
+        {/* 启用勾选：镜像与附加同步互斥——勾上后下面三个开关与一键全选一律置灰。 */}
+        <label className="flex cursor-pointer items-start gap-2">
+          <Checkbox
+            checked={mirror.enabled}
+            disabled={busy}
+            onCheckedChange={(value) => toggleMirrorEnabled(value === true)}
+            className="mt-0.5"
+          />
+          <div className="min-w-0 space-y-0.5">
+            <div className="text-xs font-medium">启用镜像切换</div>
+            <div className="text-xs text-muted-foreground">
+              启用后，附加同步（工作记忆 / 人设 / 专家团）与一键全选会置灰，避免两套写入互相打架。首次启用要确认一次风险，之后本机不再重复询问。
+            </div>
+          </div>
+        </label>
 
         {/* 母本恒为当前登录账号（后端同源 current_user_uid_at）：只读展示，用户不可手选。 */}
         <div className="space-y-1.5">
@@ -951,7 +1017,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         <Button
           variant="outline"
           size="sm"
-          disabled={busy || !mirror.motherUid || mirrorPreviewBusy}
+          disabled={busy || !mirror.enabled || !mirror.motherUid || mirrorPreviewBusy}
           onClick={() => void loadMirrorPreview()}
         >
           {mirrorPreviewBusy ? <Loader2 className="animate-spin" /> : <CircleAlert />}
@@ -1047,6 +1113,24 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
             <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
             <AlertDialogAction disabled={busy} onClick={confirmMirror}>
               确认镜像
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* 首次启用镜像的风险确认：确认一次后本机记住，之后不再重复询问。 */}
+      <AlertDialog open={mirrorRiskOpen} onOpenChange={setMirrorRiskOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认启用镜像切换？</AlertDialogTitle>
+            <AlertDialogDescription>
+              镜像切换以当前登录账号为母本，把目标账号整份对齐：目标多出的会话会被软删（可还原），母本多出的会话会被复制，工作记忆整份覆盖。启用后附加同步与一键全选会置灰。确认一次之后本机不再重复询问，但每次真正执行仍要预览清单并二次确认。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
+            <AlertDialogAction disabled={busy} onClick={confirmMirrorRisk}>
+              我已知风险，启用
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -1219,7 +1303,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
                 <SessionSyncSection
                   open={open}
                   account={account}
-                  disabled={busy}
+                  disabled={busy || mirrorBlocks.sessionSelectAll}
                   onChange={(state) => {
                     setSyncSelections(state.selections);
                     setSyncGroups(state.groups);

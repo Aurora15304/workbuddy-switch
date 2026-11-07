@@ -237,6 +237,12 @@ pub fn switch_account(
     if let Some(error) = reject_mirror_without_restart(restart, mirror_plan.is_some()) {
         return Err(error);
     }
+    // 镜像与「复制 / 同步会话」语义互斥：镜像会把目标账号的会话整份对齐，而逐项同步会
+    // 先改目标库，现场摘要随即与预览不符 → 镜像必然失败，用户却只看到「切号成功」。
+    // 这里在任何写入之前直接拒绝，不做静默降级。
+    if mirror_plan.is_some() && (!copy_session_ids.is_empty() || !sync_selections.is_empty()) {
+        return Err("镜像切换与复制/同步会话互斥：一次切号只能选其中一种".to_string());
+    }
     let progress = |message: &str| {
         eprintln!("[switch] progress: {message}");
         if let Some(p) = progress_fn {
