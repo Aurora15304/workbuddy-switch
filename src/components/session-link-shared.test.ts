@@ -5,6 +5,7 @@ import {
   buildSelections,
   isActionable,
   isDirectlySyncable,
+  partitionDeleted,
   primaryMode,
   shouldDefaultSelect,
   summarySentence,
@@ -235,6 +236,12 @@ describe("模式优先级与全选口径（字面全勾）", () => {
 });
 
 describe("summarySentence", () => {
+  it("本侧副本已删时说明是哪一侧没了，不再说「暂时无法确认两边内容」", () => {
+    expect(summarySentence(group({ verdict: "unknown", sourceDeleted: true }), "账号B")).toBe(
+      "当前账号里这个会话已删除，本次不会同步",
+    );
+  });
+
   it("只归档（identical）说明仅同步归档、保留正文", () => {
     expect(summarySentence(group({ verdict: "identical", archiveAction: "statusOnly" }), "账号B")).toBe(
       "仅同步归档，保留正文",
@@ -398,5 +405,39 @@ describe("shouldDefaultSelect — 默认全关", () => {
     });
     expect(shouldDefaultSelect(ffChecked, true)).toBe(false);
     expect(shouldDefaultSelect(ffUnchecked, true)).toBe(false);
+  });
+});
+
+describe("partitionDeleted", () => {
+  it("本侧已删的组单独归到 deleted，其余留在主列表", () => {
+    const live = group({ groupId: "g-live", availableModes: ["fastForward"], previewToken: "t" });
+    const dead = group({ groupId: "g-dead", verdict: "unknown", sourceDeleted: true });
+    const { live: kept, deleted } = partitionDeleted([live, dead]);
+
+    expect(kept.map((item) => item.groupId)).toEqual(["g-live"]);
+    expect(deleted.map((item) => item.groupId)).toEqual(["g-dead"]);
+  });
+
+  it("没有任何已删项时主列表原样保留、deleted 为空", () => {
+    const items = [group({ groupId: "g-1" }), group({ groupId: "g-2" })];
+    const result = partitionDeleted(items);
+
+    expect(result.live).toHaveLength(2);
+    expect(result.deleted).toHaveLength(0);
+  });
+
+  it("已删项永远不可勾选：即使后端误发了模式与凭据", () => {
+    const dead = group({
+      groupId: "g-dead",
+      verdict: "unknown",
+      sourceDeleted: true,
+      availableModes: ["fastForward"],
+      previewToken: "t",
+    });
+    const { live, deleted } = partitionDeleted([dead]);
+
+    expect(live).toHaveLength(0);
+    expect(isActionable(deleted[0])).toBe(false);
+    expect(isDirectlySyncable(deleted[0])).toBe(false);
   });
 });

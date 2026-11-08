@@ -43,6 +43,8 @@ cd "$REPO_DIR"
 
 case "${1:-}" in
   check)
+    # 接线自检先跑：命令定义了却没注册，`cargo check` 一样能过，只有点下去才炸。
+    node scripts/check-command-wiring.mjs
     cargo check -p wb-switch-core --all-targets
     ;;
   test)

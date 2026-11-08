@@ -228,6 +228,10 @@ pub fn router() -> Router {
         .route("/api/mirror/preview", post(api_mirror_preview))
         .route("/api/mirror/restore", post(api_mirror_restore))
         .route(
+            "/api/sessions/deleted-sync",
+            get(api_deleted_sync_preview),
+        )
+        .route(
             "/api/session-links/progress",
             get(api_session_links_progress),
         )
@@ -1439,6 +1443,26 @@ async fn api_mirror_restore(Json(body): Json<Value>) -> Response {
         }
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
         Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// GET /api/sessions/deleted-sync —— 扫描「别处已删、这里还在」的会话（只读，不写任何数据）。
+///
+/// 与桌面端 `deleted_sync_preview` 逐字对称：无入参，档位固定为国内版（与桌面命令一致）。
+async fn api_deleted_sync_preview() -> Response {
+    let result = tokio::task::spawn_blocking(|| {
+        let paths = session::SessionPaths::for_variant(WbVariant::Cn);
+        let preview = mirror::deleted_sync_preview_at(&paths)?;
+        serde_json::to_value(preview).map_err(|error| error.to_string())
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("扫描已删除会话失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 

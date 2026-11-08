@@ -256,6 +256,11 @@ export interface SessionLinkPreviewGroup {
   groupId: string;
   title: string;
   cwd: string;
+  /**
+   * 当前账号这份副本已被软删除（标题仍从库里读出来，避免列表变成一堆「(无标题)」）。
+   * 这类组没有任何可同步内容：列表里标明「本侧已删除」并折叠置底，不参与全选。
+   */
+  sourceDeleted?: boolean;
   verdict: SessionSyncVerdict;
   /** 来源独有记录数（多重集差集，仅用于向用户解释）。 */
   extraA: number;

@@ -160,6 +160,7 @@ const ROUTES: Record<string, Route> = {
   switch_account: { method: "POST", path: "/api/switch" },
   mirror_preview: { method: "POST", path: "/api/mirror/preview" },
   restore_mirror_backup: { method: "POST", path: "/api/mirror/restore" },
+  deleted_sync_preview: { method: "GET", path: "/api/sessions/deleted-sync" },
   list_sessions: { method: "GET", path: "/api/sessions" },
   list_account_sessions: { method: "GET", path: "/api/sessions/account" },
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },

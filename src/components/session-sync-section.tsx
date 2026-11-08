@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useState } from "react";
-import { Link2, RotateCw } from "lucide-react";
+import { ChevronRight, Link2, RotateCw } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 
 import {
@@ -19,6 +19,7 @@ import {
   isActionable,
   LinksSkeleton,
   LIST_MIN_H,
+  partitionDeleted,
   selectAllSummaryText,
   SessionLinkCard,
   STATUS_MIN_H,
@@ -72,6 +73,8 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
   const [reloadToken, setReloadToken] = useState(0);
   /** 全选的汇总复核弹层：确认前绝不写入勾选结果。 */
   const [selectAllOpen, setSelectAllOpen] = useState(false);
+  /** 「本侧已删除」的组默认折叠：它们没有任何可同步内容，不该占满整屏。 */
+  const [showDeleted, setShowDeleted] = useState(false);
 
   const accountId = account?.id;
   const variant = accountVariant(account);
@@ -86,6 +89,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
     setProgress(null);
     setChecked(new Set());
     setSelectAllOpen(false);
+    setShowDeleted(false);
     onChange({ selections: [], groups: [] });
     api
       .sessionLinksPreview(accountId, variant)
@@ -172,8 +176,10 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
     };
   }, [open, preview, error]);
 
+  // 本侧副本已删的组单独折叠：它们没有任何可同步内容，留在主列表里只是噪声。
+  const { live, deleted } = partitionDeleted(groups);
   // 字面全勾：所有可勾选项都进全选（含覆盖与取消归档）。
-  const actionable = groups.filter(isActionable);
+  const actionable = live.filter(isActionable);
   const selectedCount = actionable.filter((group) => checked.has(group.groupId)).length;
   const allSelected = actionable.length > 0 && selectedCount === actionable.length;
 
@@ -332,7 +338,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
             />
             <span className="min-w-0 flex-1 text-sm font-medium">全选可同步的会话</span>
             <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
-              {`已选 ${selectedCount} / ${groups.length}`}
+              {`已选 ${selectedCount} / ${live.length}`}
             </span>
           </div>
           <div
@@ -341,7 +347,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
               LIST_MIN_H,
             )}
           >
-            {groups.map((group) => (
+            {live.map((group) => (
               <SessionLinkCard
                 key={group.groupId}
                 group={group}
@@ -352,6 +358,41 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
               />
             ))}
           </div>
+          {deleted.length > 0 && (
+            <div className="rounded-md border">
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 px-3 py-2 text-left"
+                aria-expanded={showDeleted}
+                onClick={() => setShowDeleted((value) => !value)}
+              >
+                <ChevronRight
+                  className={cn(
+                    "size-3.5 shrink-0 text-muted-foreground transition-transform",
+                    showDeleted && "rotate-90",
+                  )}
+                />
+                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                  {`当前账号已删除的会话（${deleted.length}）`}
+                </span>
+                <span className="shrink-0 text-[11px] text-muted-foreground">无可同步内容</span>
+              </button>
+              {showDeleted && (
+                <div className="max-h-[min(16rem,34vh)] divide-y overflow-y-auto border-t">
+                  {deleted.map((group) => (
+                    <SessionLinkCard
+                      key={group.groupId}
+                      group={group}
+                      targetLabel={targetLabel}
+                      checked={false}
+                      disabled
+                      onToggle={() => undefined}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           <p className="px-1 text-xs text-muted-foreground">
             全选是字面全勾：包含正文快进、覆盖、归档与取消归档；点击后会先弹出汇总复核，确认才生效。
           </p>

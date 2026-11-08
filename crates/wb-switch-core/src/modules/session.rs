@@ -1928,6 +1928,43 @@ fn session_row_info(paths: &SessionPaths, cid: &str) -> Option<(String, String)>
     })
 }
 
+/// 会话行的展示名与目录，**包含已软删除的行**。
+///
+/// 用于「本侧副本已删」的关联组：软删行里的 `title` / `custom_title` 仍在，读出来
+/// 就能显示真实标题，而不是回退成 `(无标题)`。第三个返回值表示该行是否已软删除
+/// （行根本不存在时为 `None`，不冒充「已删除」）。
+fn session_row_info_including_deleted(
+    paths: &SessionPaths,
+    cid: &str,
+) -> Option<(String, String, bool)> {
+    let db = paths.workbuddy_db();
+    let conn = open_db(&db, true)?;
+    if !table_exists(&conn, "sessions") {
+        return None;
+    }
+    let sql = if column_exists(&conn, "sessions", "custom_title") {
+        "SELECT title, custom_title, cwd, deleted_at FROM sessions WHERE id = ?1"
+    } else {
+        "SELECT title, NULL, cwd, deleted_at FROM sessions WHERE id = ?1"
+    };
+    conn.query_row(sql, [cid], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+        ))
+    })
+    .ok()
+    .map(|(title, custom_title, cwd, deleted_at)| {
+        (
+            session_display_title(title, custom_title),
+            cwd.unwrap_or_default(),
+            deleted_at.is_some(),
+        )
+    })
+}
+
 /// 会话行是否仍归属该成员账号（行被删除或改归属即成员失效，design §5）。
 fn member_row_owned_by(paths: &SessionPaths, member: &LinkMember) -> bool {
     session_row_owner(paths, &member.session_id).is_some_and(|owner| owner == member.uid)
@@ -2399,12 +2436,14 @@ fn preview_group_item(
     let source_any = group.members.iter().find(|member| member.uid == source_uid);
     let target_any = group.members.iter().find(|member| member.uid == target_uid);
     // 组展示名取来源会话（同步保留目标的 sessionId、标题与自定义标题）。
-    let (title, cwd) = source_any
+    // 已软删的来源副本也读标题：库里标题还在，回退成「(无标题)」会让列表变成一堆
+    // 无法辨认的行；`sourceDeleted` 单独标记，由前端标明「本侧已删除」并折叠置底。
+    let (title, cwd, source_deleted) = source_any
         .and_then(|member| {
             let paths = member_paths(group, member);
-            session_row_info(&paths, &member.session_id)
+            session_row_info_including_deleted(&paths, &member.session_id)
         })
-        .unwrap_or_else(|| ("(无标题)".to_string(), String::new()));
+        .unwrap_or_else(|| ("(无标题)".to_string(), String::new(), false));
     let source_summary = member_summary(source_any);
     let target_summary = member_summary(target_any);
 
@@ -2417,6 +2456,7 @@ fn preview_group_item(
             "groupId": group.id,
             "title": title,
             "cwd": cwd,
+            "sourceDeleted": source_deleted,
             "verdict": SyncVerdict::Unknown.as_str(),
             "extraA": 0,
             "extraB": 0,
@@ -2486,6 +2526,7 @@ fn preview_group_item(
         "groupId": group.id,
         "title": title,
         "cwd": cwd,
+        "sourceDeleted": source_deleted,
         "verdict": decision.verdict.as_str(),
         "extraA": decision.extra_a,
         "extraB": decision.extra_b,
@@ -5006,6 +5047,16 @@ mod tests {
                 .unwrap();
         }
 
+        /// 软删会话行（用户在 App 里删掉会话后，行还在、`deleted_at` 非空）。
+        fn soft_delete_row(&self, id: &str) {
+            let conn = Connection::open(self.paths.workbuddy_db()).unwrap();
+            conn.execute(
+                "UPDATE sessions SET deleted_at = 1700000000000 WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        }
+
         /// 设置会话状态（模拟用户归档/取消归档、App 写入活跃态）。
         fn set_status(&self, id: &str, status: &str) {
             let conn = Connection::open(self.paths.workbuddy_db()).unwrap();
@@ -5146,6 +5197,31 @@ mod tests {
             json!({"type": "user", "sessionId": cid, "text": "你好"}),
             json!({"type": "assistant", "sessionId": cid, "text": "hi"})
         )
+    }
+
+    /// 软删行也读得出标题，且能被标成「本侧已删除」。
+    ///
+    /// 回归口径：列表里曾经把这种组显示成「(无标题) / 无法确认」，用户要在 200+ 条里
+    /// 一屏屏翻才找得到真会话；标题其实一直在库里，只是查询多加了 `deleted_at IS NULL`。
+    #[test]
+    fn session_row_info_reads_soft_deleted_title_and_flags_it() {
+        let env = ready_env("row-info-soft-deleted");
+        let paths = env.paths();
+        assert_eq!(
+            session_row_info_including_deleted(&paths, "sess-1"),
+            Some(("标题一".to_string(), "/ws/a".to_string(), false))
+        );
+
+        env.soft_delete_row("sess-1");
+        assert_eq!(
+            session_row_info_including_deleted(&paths, "sess-1"),
+            Some(("标题一".to_string(), "/ws/a".to_string(), true)),
+            "软删行的标题必须读得出来，并带上已删除标记"
+        );
+        // 严格读取（可同步判定的依据）对同一行仍然是「不存在」。
+        assert_eq!(session_row_info(&paths, "sess-1"), None);
+        // 行根本不存在时不能冒充「已删除」。
+        assert_eq!(session_row_info_including_deleted(&paths, "sess-missing"), None);
     }
 
     /// 一个可用的国内版环境：源账号 uid-a 有一个带正文的会话 sess-1。

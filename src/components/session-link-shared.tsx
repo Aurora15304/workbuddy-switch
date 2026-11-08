@@ -123,6 +123,8 @@ export function unarchiveOnly(group: SessionLinkPreviewGroup): boolean {
  * 会话永远传导不到目标的归档状态。
  */
 export function isActionable(group: SessionLinkPreviewGroup): boolean {
+  // 本侧副本已删：没有可写的正文，即便后端误发凭据也不允许勾选。
+  if (group.sourceDeleted) return false;
   if (!group.previewToken) return false;
   return primaryMode(group) !== null || archiveDirection(group) !== null;
 }
@@ -202,8 +204,28 @@ const ARCHIVE_SENTENCE: Record<ArchiveDirection, { only: string; along: string }
   unarchive: { only: "仅取消归档，保留正文", along: "目标会话一并取消归档" },
 };
 
+/**
+ * 按「本侧副本是否已被软删除」分组。
+ *
+ * 已删项没有任何可同步内容（后端判定恒为 unknown），留在主列表里只会变成一屏
+ * 「（无标题）/ 无法确认」的噪声；列表里单独折叠置底，也不参与全选与已选计数。
+ */
+export function partitionDeleted(groups: SessionLinkPreviewGroup[]): {
+  live: SessionLinkPreviewGroup[];
+  deleted: SessionLinkPreviewGroup[];
+} {
+  const live: SessionLinkPreviewGroup[] = [];
+  const deleted: SessionLinkPreviewGroup[] = [];
+  for (const group of groups) (group.sourceDeleted ? deleted : live).push(group);
+  return { live, deleted };
+}
+
 /** 卡片摘要句：一句人话说清发生了什么；条数与原始原因收进「查看详情」。 */
 export function summarySentence(group: SessionLinkPreviewGroup, targetLabel: string): string {
+  // 本侧副本已删：不是「暂时无法确认」，而是确定没有可同步内容，必须说清是哪一侧没了。
+  if (group.sourceDeleted) {
+    return "当前账号里这个会话已删除，本次不会同步";
+  }
   const direction = archiveDirection(group);
   // 纯状态项：正文判定会说「无需同步/本次不同步」，但本次确实要改状态，必须说清。
   if (direction && primaryMode(group) === null) {
@@ -270,8 +292,11 @@ export function SessionLinkCard({
             <span className="min-w-0 flex-1 truncate text-sm font-medium" title={group.title}>
               {title}
             </span>
-            <Badge variant={VERDICT_BADGE[group.verdict]} className="shrink-0 text-[10px]">
-              {VERDICT_LABEL[group.verdict]}
+            <Badge
+              variant={group.sourceDeleted ? "outline" : VERDICT_BADGE[group.verdict]}
+              className="shrink-0 text-[10px]"
+            >
+              {group.sourceDeleted ? "本侧已删除" : VERDICT_LABEL[group.verdict]}
             </Badge>
             <CollapsibleTrigger asChild>
               <Button
